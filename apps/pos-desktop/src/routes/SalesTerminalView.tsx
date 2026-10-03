@@ -34,11 +34,31 @@ import type { CatalogEntry, CatalogIndex } from '../features/catalog/domain/cata
 import { CatalogGrid } from '../features/catalog/ui/CatalogGrid';
 import { DEMO_SNAPSHOT } from '../features/catalog/ui/demoCatalog';
 import type { Money } from '../features/payments/domain/money';
-import { addItem, calculateSubtotal, createCart, totalUnits } from '../features/sales/domain/cart';
+import { addItem, calculateOrderTotals, createCart, totalUnits } from '../features/sales/domain/cart';
 import type { Cart } from '../features/sales/domain/cart';
 import { nextCartLineId } from '../features/sales/domain/lineId';
+import { DEFAULT_VAT_RATE_BP } from '../features/sales/domain/tax';
 import { CartView } from '../features/sales/ui/CartView';
 import type { CartCatalogueItem } from '../features/sales/ui/CartView';
+import { toWireInput } from '../features/sales/infrastructure/tauriOfflineOrders';
+import type { CheckoutFigures } from '../features/sales/infrastructure/tauriOfflineOrders';
+
+/**
+ * How the checkout reaches the database.
+ *
+ * Injected rather than imported, which is what keeps this screen testable.
+ * `SalesTerminalView` renders and collects the basket; the ADAPTER that opens
+ * SQLCipher is `infrastructure/tauriOfflineOrders.ts`, and a test passes a
+ * double instead. A screen that called `invoke` itself would be untestable
+ * without a Tauri runtime — and the offline-first guarantee this product sells
+ * would then only be verified by launching a desktop app.
+ *
+ * Defaulted to the real adapter so the app works; overridable so the tests
+ * never touch native code.
+ */
+export type CheckoutRepository = {
+  save(input: ReturnType<typeof toWireInput>): Promise<{ readonly receiptNumber: string }>;
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // One menu on screen, not two
@@ -72,6 +92,17 @@ const EMPTY_CATALOGUE: readonly CartCatalogueItem[] = Object.freeze([]);
 // and lies about what it is recording.
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * The outcome of pressing ชำระเงิน, as the screen reports it.
+ *
+ * `ok: false` carries a message rather than throwing, because the cashier needs
+ * to be told what went wrong and a rejected promise in a render handler is not a
+ * way to do that. The screen is the only place that decides how an error looks.
+ */
+export type CheckoutResult =
+  | { readonly ok: true; readonly receiptNumber: string }
+  | { readonly ok: false; readonly message: string };
+
 /** Render a `Money` as Thai baht, e.g. ฿45.50. Display only — no arithmetic. */
 function formatBaht(amount: Money): string {
   return `฿${amount.toString()}`;
@@ -81,7 +112,34 @@ function formatBaht(amount: Money): string {
 // Component
 // ─────────────────────────────────────────────────────────────────────────────
 
-export function SalesTerminalView(): JSX.Element {
+export interface SalesTerminalViewProps {
+  /**
+   * Where a confirmed checkout is committed. Defaults to the real Tauri
+   * adapter; tests pass an in-memory double.
+   */
+  readonly repository?: CheckoutRepository;
+}
+
+export function SalesTerminalView({ repository }: SalesTerminalViewProps = {}): JSX.Element {
+  // Resolved once per mount. The lazy default keeps `@tauri-apps/api` out of
+  // the module graph of any test that renders this screen WITHOUT a prop — the
+  // import would resolve, but calling `invoke` outside a Tauri runtime would
+  // throw, so the default must never be *used* without the prop.
+  const repo = useMemo<CheckoutRepository>(
+    () =>
+      repository ?? {
+        async save(input) {
+          // Imported at the point of use, so a test rendering this screen with a
+          // double never loads the native bridge at all.
+          const { saveOfflineOrder } = await import(
+            '../features/sales/infrastructure/tauriOfflineOrders'
+          );
+          const out = await saveOfflineOrder(input);
+          return { receiptNumber: out.localReceiptNumber };
+        },
+      },
+    [repository],
+  );
   // The screen owns the basket, because the screen owns checkout state — which
   // order this is, who is paying, whether it has been submitted. `CartView` is
   // handed the cart rather than left to keep one of its own: a panel holding a
@@ -113,10 +171,111 @@ export function SalesTerminalView(): JSX.Element {
   }, []);
 
   // Everything the header says about the basket is a domain answer as well:
-  // `totalUnits` counts what is in it and `calculateSubtotal` sums it. Neither
-  // is derived from the other, and neither is worked out in the markup below.
+  // `totalUnits` counts what is in it and the totals come from one domain call.
   const units = useMemo(() => totalUnits(cart), [cart]);
-  const subtotal = useMemo(() => calculateSubtotal(cart), [cart]);
+  const totals = useMemo(
+    () => calculateOrderTotals(cart, DEFAULT_VAT_RATE_BP),
+    [cart],
+  );
+  const subtotal = totals.subtotal;
+
+  // ── Checkout ──────────────────────────────────────────────────────────────
+  //
+  // The figures handed to the adapter are the DOMAIN's, not this screen's.
+  // `calculateOrderTotals` is the one function that decides what ฿45.50 contains;
+  // recomputing a total here would be a second copy of the VAT rule, and the SQL
+  // `CHECK` in 0001_init.sql is a third. The screen's job is to press a button and
+  // report what came back.
+
+  const [checkout, setCheckout] = useState<CheckoutResult | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+
+  const handleCheckout = useCallback(async () => {
+    if (submitting) return; // a double press must not write two orders
+
+    if (cart.items.length === 0) return;
+
+    setSubmitting(true);
+    setCheckout(null);
+
+    try {
+      const figures: CheckoutFigures = {
+        subtotalSatang: totals.subtotal.satang,
+        taxableSatang: totals.net.satang,
+        taxSatang: totals.tax.satang,
+        serviceChargeSatang: totals.serviceCharge.satang,
+        roundingAdjustmentSatang: 0n,
+        totalSatang: totals.total.satang,
+      };
+
+      const payload = toWireInput({
+        order: {
+          id: nextCartLineId(),
+          branchId: 'branch-siam',
+          terminalId: 'terminal-01',
+          staffUserId: 'staff-01',
+          orderType: 'dine_in',
+          status: 'submitted',
+          source: null,
+          currency: null,
+          // `vat_rate_bp` is the ONE satang-shaped value that is NOT a string in
+          // the Rust struct: it is `Option<i64>` with a 0..10000 bound, so it fits
+          // a double exactly and serialises as a JSON number. Every MONEY field
+          // is a string; a rate is a percentage, not an amount.
+          vatRateBp: Number(DEFAULT_VAT_RATE_BP),
+          discountSatang: 0n,
+          idempotencyKey: `idem-${nextCartLineId()}`,
+          localReceiptNumber: `R-${units.toString()}`,
+          createdAt: new Date().toISOString(),
+        },
+        lines: cart.items.map((item) => ({
+          id: item.id,
+          variantId: item.variant.id,
+          productId: null,
+          sku: item.variant.sku,
+          nameTh: item.variant.name_th,
+          // `exactOptionalPropertyTypes` is on, so an optional field may be
+          // `null` but NOT `undefined`. `name_en` is optional on the contract
+          // type, so `?? null` converts "absent" into the explicit null the Rust
+          // `Option<String>` expects.
+          nameEn: item.variant.name_en ?? null,
+          quantity: item.quantity.toString(),
+          unitPriceSatang: item.unitPrice.satang,
+          lineDiscountSatang: 0n,
+          lineTaxSatang: 0n, // VAT is per order — the schema rejects anything else
+          lineTotalSatang: item.unitPrice.multiply(item.quantity).satang,
+          createdAt: new Date().toISOString(),
+        })),
+        outbox: {
+          id: nextCartLineId(),
+          aggregateType: null,
+          eventType: null,
+          action: null,
+          payload: JSON.stringify({ order_id: 'pending' }),
+          idempotencyKey: `idem-outbox-${nextCartLineId()}`,
+          createdAt: new Date().toISOString(),
+        },
+        figures,
+      });
+
+      const saved = await repo.save(payload);
+
+      // The basket clears ONLY after the native transaction committed. Clearing
+      // it before would mean a cashier who taps twice has no basket and no
+      // order — the sale is simply gone, and the till has no record of it.
+      setCart(createCart());
+      setCheckout({ ok: true, receiptNumber: saved.receiptNumber });
+    } catch (error) {
+      // The cart is left intact on purpose: nothing was committed, so the
+      // cashier still has the sale in front of them to retry.
+      setCheckout({
+        ok: false,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      setSubmitting(false);
+    }
+  }, [cart, repo, submitting, totals, units]);
 
   // ── Render ────────────────────────────────────────────────────────────────
 
@@ -148,6 +307,51 @@ export function SalesTerminalView(): JSX.Element {
           <span data-testid="sales-subtotal">{formatBaht(subtotal)}</span>
         </p>
       </header>
+
+      {/* ── Checkout ─────────────────────────────────────────────────────────
+          The VAT breakdown is on screen because a customer who is asked for
+          ฿45.50 and told ฿45.50 is entitled to see that ฿2.98 of it is VAT. It
+          comes from the same `calculateOrderTotals` call that produced the total,
+          so the two can never disagree — printing a net that does not add back up
+          to the gross is the fastest way to lose a customer's trust. */}
+      <section className="sales-terminal__checkout" aria-label="สรุปการชำระเงิน">
+        <dl className="sales-terminal__tax-breakdown">
+          <div>
+            <dt>ราคารวมภาษี</dt>
+            <dd data-testid="checkout-subtotal">{formatBaht(totals.subtotal)}</dd>
+          </div>
+          <div>
+            <dt>ภาษีมูลค่าเพิ่ม 7%</dt>
+            <dd data-testid="checkout-tax">{formatBaht(totals.tax)}</dd>
+          </div>
+          <div>
+            <dt>ราคาก่อนภาษี</dt>
+            <dd data-testid="checkout-net">{formatBaht(totals.net)}</dd>
+          </div>
+        </dl>
+
+        <button
+          type="button"
+          className="sales-terminal__pay"
+          onClick={handleCheckout}
+          // Disabled while empty or in flight. An empty basket is not a sale, and
+          // a second press mid-transaction would attempt a second order.
+          disabled={cart.items.length === 0 || submitting}
+        >
+          {submitting ? 'กำลังบันทึก…' : `ชำระเงิน ${formatBaht(subtotal)}`}
+        </button>
+
+        {checkout?.ok === true && (
+          <p className="sales-terminal__receipt" data-testid="checkout-receipt">
+            {`บันทึกใบเสร็จ ${checkout.receiptNumber} แล้ว`}
+          </p>
+        )}
+        {checkout?.ok === false && (
+          <p className="sales-terminal__error" data-testid="checkout-error" role="alert">
+            {`บันทึกไม่สำเร็จ: ${checkout.message}`}
+          </p>
+        )}
+      </section>
 
       <div className="sales-terminal__body">
         {/* The menu: one grid of tiles, every tile priced by the catalog domain.

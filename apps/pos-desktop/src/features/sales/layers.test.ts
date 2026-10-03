@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'bun:test';
+import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -86,6 +87,145 @@ describe('sales feature layer boundary', () => {
 
     // No float literal typing of money, and no division that could produce one.
     expect(source).not.toMatch(/:\s*number\s*=.*_satang/);
+  });
+});
+
+/**
+ * The `infrastructure/` layer: the EDGE, and therefore the one place allowed to
+ * reach outside the feature.
+ *
+ * The rule is still directional, just different from `domain/`:
+ *
+ *   infrastructure → domain + application + @tauri-apps  ✅ ALLOWED
+ *   domain         → infrastructure                       ❌ FORBIDDEN
+ *
+ * A domain module that imported the Tauri adapter would acquire a dependency on
+ * a native runtime, and the pure cart/tax maths would stop being testable
+ * without one. That is the whole reason the port in `application/` exists.
+ *
+ * The guard is two-sided on purpose: it asserts the edge MAY use Tauri (so the
+ * rule stays honest rather than aspirational) and that the pure layers still may
+ * NOT (so the allowance does not quietly spread).
+ */
+describe('infrastructure/ is the only layer allowed to reach for Tauri', () => {
+  const INFRA_DIR = new URL('infrastructure/', SALES_DIR);
+
+  /** Every non-test module in `infrastructure/`. */
+  async function infraModules(): Promise<{ name: string; source: string }[]> {
+    const cwd = fileURLToPath(INFRA_DIR);
+    const glob = new Bun.Glob('*.ts');
+    const modules: { name: string; source: string }[] = [];
+
+    for await (const name of glob.scan({ cwd })) {
+      if (name.endsWith('.test.ts')) continue;
+      modules.push({ name, source: stripComments(await Bun.file(join(cwd, name)).text()) });
+    }
+    return modules;
+  }
+
+  it('finds the infrastructure modules it is guarding', async () => {
+    const modules = await infraModules();
+    expect(modules.map((m) => m.name)).toContain('tauriOfflineOrders.ts');
+  });
+
+  it('the edge DOES use @tauri-apps — otherwise this guard proves nothing', async () => {
+    // If the adapter stopped importing Tauri, the guards below would pass for
+    // the wrong reason. Asserting the allowance is in use keeps the rule real.
+    const modules = await infraModules();
+    const usesTauri = modules.some((m) => /@tauri-apps\/api/.test(m.source));
+    expect(usesTauri).toBe(true);
+  });
+
+  it('the edge imports only the port, the domain, and the Tauri bridge', async () => {
+    const ALLOWED = new Set([
+      '@tauri-apps/api/core',
+      '../application/offlineOrders',
+      '../../payments/domain/money',
+      '../../domain/cart',
+      '../../domain/lineId',
+      '../../domain/tax',
+    ]);
+
+    const violations: string[] = [];
+    for (const { name, source } of await infraModules()) {
+      const imports = [...source.matchAll(/^import .* from ['"]([^'"]+)['"]/gm)].map(
+        (m) => m[1] ?? '',
+      );
+      for (const specifier of imports) {
+        if (!ALLOWED.has(specifier)) violations.push(`${name} imports "${specifier}"`);
+      }
+    }
+    expect(violations).toEqual([]);
+  });
+
+  it('the edge converts satang at the boundary and never sends a JSON number', async () => {
+    // The invariant that justifies this layer existing. If a future edit sends
+    // satang as a number, precision above 2^53 is lost SILENTLY — so this
+    // asserts the mechanism is present, not just that some conversion happens.
+    const source = (await infraModules()).find((m) => m.name === 'tauriOfflineOrders.ts')?.source ?? '';
+
+    // Outbound: every satang goes through the one named serialiser.
+    expect(source).toContain('function satangToWire(');
+    expect(source).toContain('value.toString()');
+
+    // Inbound: every satang is parsed from a string and validated.
+    expect(source).toContain('function satangFromWire(');
+    expect(source).toMatch(/if \(typeof raw !== 'string'\)/);
+
+    // And it may never hand a `bigint` straight to `invoke`, nor ask
+    // `Number()` to carry money in either direction.
+    expect(source).not.toMatch(/JSON\.stringify\([^)]*satang/i);
+    expect(source).not.toMatch(/Number\([^)]*[Ss]atang[^)]*\)/);
+  });
+
+  it('the pure layers still may NOT reach for Tauri', async () => {
+    // The counterweight. Allowing the edge must not become allowing everything.
+    //
+    // NOTE the exclusion of `react` from this list: the UI layer IS allowed to
+    // import React — that is the documented direction (`SKILL.md` §2.3, and the
+    // first two tests in this file). What the UI may never do is reach PAST the
+    // domain and talk to hardware or a server directly, so that is what is
+    // forbidden here. Tauri and `fetch` are the real risks: a view that calls
+    // `invoke` itself bypasses the port, and the offline guarantee that makes
+    // this product work stops being enforced anywhere.
+    const forbidden = [/@tauri-apps/, /\bfetch\(/, /escpos/i, /serialport/i];
+    const violations: string[] = [];
+
+    for (const layer of ['domain/', 'application/', 'ui/']) {
+      const cwd = fileURLToPath(new URL(layer, SALES_DIR));
+      if (!existsSync(cwd)) continue;
+
+      const glob = new Bun.Glob('*.ts*');
+      for await (const name of glob.scan({ cwd })) {
+        if (name.endsWith('.test.ts') || name.endsWith('.test.tsx')) continue;
+        const source = stripComments(await Bun.file(join(cwd, name)).text());
+
+        for (const pattern of forbidden) {
+          if (pattern.test(source)) {
+            violations.push(`${layer}${name} matches ${pattern}`);
+          }
+        }
+      }
+    }
+
+    expect(violations).toEqual([]);
+  });
+
+  it('domain/ still may not import the infrastructure layer', async () => {
+    // Dependency direction: the pure domain must not know an adapter exists.
+    const cwd = fileURLToPath(new URL('domain/', SALES_DIR));
+    const glob = new Bun.Glob('*.ts');
+    const violations: string[] = [];
+
+    for await (const name of glob.scan({ cwd })) {
+      if (name.endsWith('.test.ts')) continue;
+      const source = stripComments(await Bun.file(join(cwd, name)).text());
+      if (/from ['"][^'"]*infrastructure\//.test(source)) {
+        violations.push(`${name} imports infrastructure/`);
+      }
+    }
+
+    expect(violations).toEqual([]);
   });
 });
 
