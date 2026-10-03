@@ -1,0 +1,86 @@
+[package]
+name = "wasri-pos-desktop"
+version = "0.1.0"
+description = "Wal-Asri POS — Tauri 2 desktop terminal (offline-first sell path)"
+authors = ["Wal-Asri POS"]
+license = ""
+repository = ""
+edition = "2024"
+rust-version = "1.90"
+
+# ── Edition & toolchain note ──────────────────────────────────────────────────
+# The `tauri init` template (2026-10-02) emits `edition = "2024"` and
+# `rust-version = "1.90"`. Edition 2024 is stable since Rust 1.85; the repo's
+# SKILL.md §3.1 requires Rust `>= 1.75`, so 1.90 is a floor, not a ceiling — any
+# 1.90+ toolchain compiles this crate unchanged. Verified against 1.98.1.
+#
+# NOTE ON THE COMMENT SYNTAX IN THIS FILE: it is `#`, not `//`. TOML has no `//`
+# comment. The previous revision of this manifest used `//`, which cargo rejects
+# outright — and nothing caught it, because this crate had never been handed to
+# cargo before now. A manifest that has never been parsed is not a manifest.
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "wasri_pos_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "=2.7.1" }
+
+[dependencies]
+# serde / serde_json are needed at the command boundary: every monetary value
+# crosses `invoke` as a STRING (see src/commands.rs), and `sync_outbox.payload`
+# is a JSON TEXT column the outbox drain will later deserialise. Pinned exact (no
+# `^`) so the offline-first build is reproducible.
+serde = { version = "=1.0", features = ["derive"] }
+serde_json = "=1.0"
+log = "0.4"
+tauri = { version = "=2.12.1" }
+tauri-plugin-log = "2"
+
+# ── SQLite ────────────────────────────────────────────────────────────────────
+# WHY rusqlite AND NOT tauri-plugin-sql
+# SKILL.md §2.2 requires the three-write checkout (local_orders +
+# local_order_lines + sync_outbox) to commit inside ONE transaction. The plugin's
+# JS API is `db_execute`, one statement per call with no transaction scope
+# spanning calls — the requirement is not expressible through it. Reaching into
+# the plugin's internal pool state from a custom command would be a private-API
+# coupling that breaks on every version bump, so the driver is owned directly.
+#
+# ── WHY bundled-sqlcipher ─────────────────────────────────────────────────────
+# SKILL.md §2.3 lists a "SQLCipher key" as the Rust core's responsibility, and
+# the TypeScript port documents the order store as encrypted
+# (src/features/sales/application/offlineOrders.ts). A POS terminal writes
+# customer orders to a disk the shop owner does not control; plaintext would mean
+# a stolen laptop discloses every sale.
+#
+# `bundled` compiles the SQLCipher amalgamation from C rather than linking the
+# system libsqlite3, which is almost never built with encryption. It links against
+# the system OpenSSL — verified present on the build host (3.0.13 dev headers). A
+# host without `libssl-dev` needs `bundled-sqlcipher-vendored-openssl` instead,
+# which compiles OpenSSL too and is correspondingly slower.
+#
+# PINNED EXACT: this feature compiles a C amalgamation whose ABI against
+# libsqlite3-sys is version-sensitive.
+rusqlite = { version = "=0.40.2", features = ["bundled-sqlcipher"] }
+
+# getrandom reads the OS CSPRNG for the 32-byte SQLCipher key on first run.
+# Deliberately NOT `rand`: this needs 32 unpredictable bytes once, not a random
+# number generator, and rand's dependency tree would be the heaviest in the
+# manifest for that single call.
+getrandom = "0.3"
+
+[profile.release]
+# The template ships no [profile] section. We add one because a POS terminal
+# binary ships in a constrained drawer and `lto = true` + `codegen-units = 1` are
+# the standard Tauri recommendation. Opt-level stays at the default 3.
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+# Faster dev builds, and less disk. debug = false because the host volume runs
+# at ~87% and a Tauri debug tree with full debuginfo is the single largest thing
+# this crate writes.
+debug = false

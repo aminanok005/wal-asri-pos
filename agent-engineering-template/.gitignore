@@ -1,0 +1,55 @@
+# Dependencies
+node_modules/
+*.local
+/*.pak
+
+# Build outputs
+dist/
+dist-electron/
+build/
+release/
+*.exe
+*.msi
+*.dmg
+*.zip
+
+# Tauri
+src-tauri/target/
+src-tauri/db/
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Environment
+.env
+.env.local
+.env.*.local
+.env.production
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+*.log
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+__pycache__/
+
+# IDE / misc
+.augtend/
+.cursor/
+.kilocode/
+.trae/
+.claude/
+.mcp/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*

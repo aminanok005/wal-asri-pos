@@ -1,0 +1,886 @@
+//! The Tauri command surface: the only place the frontend can touch the database.
+//!
+//! ── What lives here ──────────────────────────────────────────────────────────
+//! Two commands, both thin, neither clever:
+//!
+//!   * `save_offline_order` — the three-write checkout, in one transaction.
+//!   * `list_recent_orders` — the history screen's projection query.
+//!
+//! Per SKILL.md §2.3 this is an adapter. It holds NO business rules: it does not
+//! compute tax, does not sum a total, does not decide an order's status. Every
+//! number it writes was computed by the TypeScript domain and arrived already
+//! decided. The single exception is documented at `parse_satang` and is a
+//! *rejection* rule, not a calculation.
+//!
+//! ── Why satang crosses the bridge as a STRING ───────────────────────────────
+//! `invoke` serialises through JSON, and a JSON number is a double in
+//! JavaScript. `4550` survives that, and so would any realistic order total —
+//! 2^53 satang is about 90 trillion baht. But "survives today" is not the same as
+//! "cannot silently become wrong": the migration header
+//! (`migrations/0001_init.sql:81-89`) documents SQLite's equivalent trap, where a
+//! numeric-looking TEXT value is coerced to INTEGER by affinity and the evidence
+//! is gone before the CHECK can see it. Sending money as a string makes that
+//! failure mode unreachable at the bridge rather than merely unlikely, and
+//! `parse_satang` turns anything that is not a canonical integer into a loud
+//! rejection. The value reaches SQLite as an i64, never as text.
+//!
+//! ── Why the transaction is here and not in the caller ────────────────────────
+//! SKILL.md §2.2: checkout writes the sale AND its outbox event in one
+//! transaction, or it has not happened. A sale with no outbox event is a sale the
+//! server will never learn about; an outbox event with no sale is a phantom. The
+//! only place that guarantee can be enforced is the one place that owns the
+//! connection.
+
+use rusqlite::types::Value;
+use rusqlite::{Connection, Statement};
+use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, Manager};
+
+use crate::AppState;
+
+/// A command failure, shaped for the wire.
+///
+/// `kind` is a stable machine-readable discriminator and `message` is for a human
+/// reading a till log. They are separate because the frontend branches on the
+/// first and shows the second, and a frontend that pattern-matches on prose is a
+/// frontend that breaks when the prose is reworded.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandError {
+  pub kind: CommandErrorKind,
+  pub message: String,
+}
+
+/// Why a command failed. `camelCase` on the wire so TypeScript discriminants read
+/// naturally at the call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CommandErrorKind {
+  /// A field arrived in a shape the money rules forbid.
+  InvalidPayload,
+  /// SQLite refused: a CHECK, a UNIQUE, a foreign key, or a locked file.
+  Storage,
+  /// The blocking worker could not be scheduled or its result lost.
+  Worker,
+}
+
+impl CommandError {
+  fn invalid(field: &str, why: &str) -> Self {
+    CommandError {
+      kind: CommandErrorKind::InvalidPayload,
+      message: format!("{field}: {why}"),
+    }
+  }
+
+  fn storage(what: &str, e: rusqlite::Error) -> Self {
+    CommandError {
+      kind: CommandErrorKind::Storage,
+      message: format!("{what}: {e}"),
+    }
+  }
+
+  fn worker(e: impl std::fmt::Display) -> Self {
+    CommandError {
+      kind: CommandErrorKind::Worker,
+      message: format!("database worker did not finish: {e}"),
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The wire shape
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One committed sale, as the frontend computed it.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OrderInput {
+  pub id: String,
+  pub branch_id: String,
+  pub terminal_id: String,
+  pub staff_user_id: String,
+  /// `type` is a Rust keyword, so the field is `order_type` on the wire as
+  /// `type` — matching the column name, which is what the SQL will read.
+  #[serde(rename = "type")]
+  pub order_type: String,
+  /// Absent means the schema's own default. Rust does not choose a rung: that is
+  /// a domain decision, made in `sales/domain/checkout.ts`.
+  #[serde(default)]
+  pub status: Option<String>,
+  #[serde(default)]
+  pub source: Option<String>,
+  #[serde(default)]
+  pub currency: Option<String>,
+  #[serde(default)]
+  pub vat_rate_bp: Option<i64>,
+  pub subtotal_satang: String,
+  pub discount_satang: String,
+  pub taxable_satang: String,
+  pub tax_satang: String,
+  pub service_charge_satang: String,
+  pub rounding_adjustment_satang: String,
+  pub total_satang: String,
+  #[serde(default)]
+  pub discount_type: Option<String>,
+  #[serde(default)]
+  pub loyalty_points_earned: Option<i64>,
+  pub idempotency_key: String,
+  pub local_receipt_number: String,
+  pub created_at: String,
+}
+
+/// One line of a sale. Money as strings, for the same reason as the order's.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LineInput {
+  pub id: String,
+  pub variant_id: String,
+  #[serde(default)]
+  pub product_id: Option<String>,
+  #[serde(default)]
+  pub sku: Option<String>,
+  pub name_th: String,
+  #[serde(default)]
+  pub name_en: Option<String>,
+  /// Not money, but `typeof(quantity) = 'integer'` is CHECKed on the column for
+  /// the same affinity reason, so it crosses as a string too.
+  pub quantity: String,
+  pub unit_price_satang: String,
+  pub line_discount_satang: String,
+  pub line_tax_satang: String,
+  pub line_total_satang: String,
+  pub created_at: String,
+}
+
+/// The one outbox event checkout must queue in the same transaction.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OutboxInput {
+  pub id: String,
+  #[serde(default)]
+  pub aggregate_type: Option<String>,
+  #[serde(default)]
+  pub event_type: Option<String>,
+  #[serde(default)]
+  pub action: Option<String>,
+  /// The event body, as JSON text. The column's CHECK rejects anything that is
+  /// not a JSON object, so a truncated or array-shaped payload fails at INSERT.
+  pub payload: String,
+  pub idempotency_key: String,
+  pub next_attempt_at: String,
+  pub created_at: String,
+}
+
+/// The whole checkout.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SaveOfflineOrderInput {
+  pub order: OrderInput,
+  pub lines: Vec<LineInput>,
+  pub outbox: OutboxInput,
+}
+
+/// What checkout reports back.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveOfflineOrderOutput {
+  pub order_id: String,
+  pub local_receipt_number: String,
+  pub line_count: usize,
+}
+
+/// One row of the history screen's projection.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrderSummary {
+  pub id: String,
+  pub local_receipt_number: String,
+  pub status: String,
+  pub sync_state: String,
+  pub created_at: String,
+  pub line_count: i64,
+  /// A string, for the reason at the module header. The TypeScript adapter wraps
+  /// it in `Money` at the edge.
+  pub total_satang: String,
+  pub currency_code: String,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The edge: string → i64
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Parse one satang field, or reject it.
+///
+/// The grammar is `^(0|[1-9][0-9]*)$` and nothing else. That rejects, in order of
+/// how badly each one has bitten this codebase before:
+///
+///   * `"4550 "` / `" 4550"` — whitespace a formatter added.
+///   * `"+4550"` / `"-4550"` — a sign. Negative satang is never legitimate on a
+///     sale; a refund is a separate row with its own event type.
+///   * `"4550.0"` — a float that happened to be whole. `Money.fromNumber` throws
+///     on it in TypeScript, and the same value must not be laundered through a
+///     string to get past that.
+///   * `"4.55e3"` / `"0x11A"` — anything that is not base-ten digits.
+///   * `"04550"` — a leading zero. It parses, and it is exactly the shape a
+///     zero-padded formatter produces, so it is a bug worth reporting rather
+///     than absorbing.
+///   * anything above `i64::MAX` — would silently wrap if cast.
+fn parse_satang(field: &str, raw: &str) -> Result<i64, CommandError> {
+  if raw.is_empty() {
+    return Err(CommandError::invalid(field, "is empty; satang must be a decimal integer"));
+  }
+  if !raw.bytes().all(|b| b.is_ascii_digit()) {
+    return Err(CommandError::invalid(
+      field,
+      &format!(
+        "must be plain base-ten digits, got {raw:?}; a sign, a decimal point, an exponent or \
+         surrounding whitespace is rejected so no value can reach SQLite as text"
+      ),
+    ));
+  }
+  if raw.len() > 1 && raw.starts_with('0') {
+    return Err(CommandError::invalid(
+      field,
+      &format!("has a leading zero ({raw:?}); send the canonical integer form"),
+    ));
+  }
+
+  raw
+    .parse::<i64>()
+    .map_err(|_| CommandError::invalid(field, &format!("{raw:?} does not fit in a signed 64-bit integer")))
+}
+
+/// The four parameter shapes this module ever binds.
+///
+/// `Value` rather than `&dyn ToSql` because it names the SQLite storage class at
+/// the call site — which is the point: it makes visible that a money parameter is
+/// `Integer` and can never be bound as `Text`.
+fn text(s: String) -> Value {
+  Value::Text(s)
+}
+
+/// `NULL` for an absent optional column. Explicit rather than an `Option<T>`
+/// generic, so binding NULL to a `NOT NULL` column is a compile-time mismatch
+/// instead of a runtime constraint failure.
+fn opt_text(s: Option<String>) -> Value {
+  match s {
+    Some(v) => Value::Text(v),
+    None => Value::Null,
+  }
+}
+
+fn int(i: i64) -> Value {
+  Value::Integer(i)
+}
+
+fn opt_int(i: Option<i64>) -> Value {
+  match i {
+    Some(v) => Value::Integer(v),
+    None => Value::Null,
+  }
+}
+
+/// Bind `values` to `?1 … ?N` on a prepared statement.
+///
+/// Done by index rather than by handing rusqlite a parameter list: `Params` is
+/// implemented for fixed-size arrays and for `&[&dyn ToSql]`, so an arity that
+/// varies by table (21 columns here, 13 on a line, 9 on an outbox event) cannot
+/// be expressed as one list without a self-referential borrow. `raw_bind_`
+/// sidesteps the trait entirely, and it makes the binding order — the thing that
+/// silently shifts a column when someone adds one — visible in the loop.
+fn bind_all(stmt: &mut Statement<'_>, values: &[Value]) -> rusqlite::Result<()> {
+  for (offset, value) in values.iter().enumerate() {
+    stmt.raw_bind_parameter(offset + 1, value)?;
+  }
+  Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The three-write checkout
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Commit a sale, its lines, and its outbox event in ONE transaction.
+///
+/// Returns the order id on success. On any failure, NOTHING is written — which is
+/// the entire point, and is what `rollback_leaves_nothing_behind` in the tests
+/// below pins with a deliberately broken line.
+///
+/// No arithmetic happens here. Every money value is validated for *shape* and
+/// inserted; whether the set of them satisfies the schema's identities is
+/// SQLite's CHECK to decide, and whether they are *right* is the domain's.
+fn write_order(conn: &mut Connection, input: &SaveOfflineOrderInput) -> Result<SaveOfflineOrderOutput, CommandError> {
+  let o = &input.order;
+
+  // ── Shape validation, before any statement runs ────────────────────────────
+  let subtotal = parse_satang("order.subtotalSatang", &o.subtotal_satang)?;
+  let discount = parse_satang("order.discountSatang", &o.discount_satang)?;
+  let taxable = parse_satang("order.taxableSatang", &o.taxable_satang)?;
+  let tax = parse_satang("order.taxSatang", &o.tax_satang)?;
+  let service = parse_satang("order.serviceChargeSatang", &o.service_charge_satang)?;
+  let rounding = parse_satang("order.roundingAdjustmentSatang", &o.rounding_adjustment_satang)?;
+  let total = parse_satang("order.totalSatang", &o.total_satang)?;
+
+  if input.lines.is_empty() {
+    return Err(CommandError::invalid(
+      "lines",
+      "is empty; an order with no lines cannot be reconciled against a receipt",
+    ));
+  }
+
+  let mut lines = Vec::with_capacity(input.lines.len());
+  for (index, l) in input.lines.iter().enumerate() {
+    let quantity = parse_satang(&format!("lines[{index}].quantity"), &l.quantity)?;
+    if quantity <= 0 {
+      return Err(CommandError::invalid(
+        &format!("lines[{index}].quantity"),
+        "must be greater than zero; a zero-quantity line is a mistake, not a void",
+      ));
+    }
+    lines.push(ValidatedLine {
+      id: l.id.clone(),
+      variant_id: l.variant_id.clone(),
+      product_id: l.product_id.clone(),
+      sku: l.sku.clone(),
+      name_th: l.name_th.clone(),
+      name_en: l.name_en.clone(),
+      quantity,
+      unit_price_satang: parse_satang(&format!("lines[{index}].unitPriceSatang"), &l.unit_price_satang)?,
+      line_discount_satang: parse_satang(&format!("lines[{index}].lineDiscountSatang"), &l.line_discount_satang)?,
+      line_tax_satang: parse_satang(&format!("lines[{index}].lineTaxSatang"), &l.line_tax_satang)?,
+      line_total_satang: parse_satang(&format!("lines[{index}].lineTotalSatang"), &l.line_total_satang)?,
+      created_at: l.created_at.clone(),
+    });
+  }
+
+  let payload = input.outbox.payload.clone();
+
+  // ── The transaction ────────────────────────────────────────────────────────
+  // `transaction()` opens BEGIN DEFERRED and rolls back when the guard is
+  // dropped without a commit, so every `?` above and every error below leaves
+  // the database exactly as it was found.
+  let tx = conn.transaction().map_err(|e| CommandError::storage("begin transaction", e))?;
+
+// rusqlite's `Params` is implemented for a SLICE of `ToSql`, not for a `Vec`
+  // of either `Value` or trait objects, so the parameter list is bound to a
+  // local and passed by slice.
+  let order_params: Vec<Value> = vec![
+      text(o.id.clone()),
+      text(o.branch_id.clone()),
+      text(o.terminal_id.clone()),
+      text(o.staff_user_id.clone()),
+      text(o.order_type.clone()),
+      opt_text(o.status.clone()),
+      opt_text(o.source.clone()),
+      opt_text(o.currency.clone()),
+      opt_int(o.vat_rate_bp),
+      int(subtotal),
+      int(discount),
+      int(taxable),
+      int(tax),
+      int(service),
+      int(rounding),
+      int(total),
+      opt_text(o.discount_type.clone()),
+      opt_int(o.loyalty_points_earned),
+      text(o.idempotency_key.clone()),
+      text(o.local_receipt_number.clone()),
+      text(o.created_at.clone()),
+    ];
+
+  {
+    let mut stmt = tx
+      .prepare(
+        "INSERT INTO local_orders (
+           id, branch_id, terminal_id, staff_user_id, type, status, source, currency,
+           vat_rate_bp, subtotal_satang, discount_satang, taxable_satang, tax_satang,
+           service_charge_satang, rounding_adjustment_satang, total_satang, discount_type,
+           loyalty_points_earned, idempotency_key, local_receipt_number, sync_state,
+           created_at, updated_at
+         ) VALUES (
+           ?1, ?2, ?3, ?4, ?5,
+           COALESCE(?6, 'draft'), COALESCE(?7, 'pos_desktop'), COALESCE(?8, 'THB'),
+           COALESCE(?9, 700), ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
+           COALESCE(?18, 0), ?19, ?20, 'pending', ?21, NULL
+         )",
+      )
+      .map_err(|e| CommandError::storage("prepare local_orders insert", e))?;
+
+    bind_all(&mut stmt, &order_params).map_err(|e| CommandError::storage("bind local_orders", e))?;
+    stmt.raw_execute().map_err(|e| CommandError::storage("insert local_orders", e))?;
+  }
+
+  {
+    let mut insert = tx
+      .prepare(
+        "INSERT INTO local_order_lines (
+           id, order_id, variant_id, product_id, sku, name_th, name_en, quantity,
+           unit_price_satang, line_discount_satang, line_tax_satang, line_total_satang,
+           created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+      )
+      .map_err(|e| CommandError::storage("prepare line insert", e))?;
+
+    for l in &lines {
+      let line_params: Vec<Value> = vec![
+        text(l.id.clone()),
+        text(o.id.clone()),
+        text(l.variant_id.clone()),
+        opt_text(l.product_id.clone()),
+        opt_text(l.sku.clone()),
+        text(l.name_th.clone()),
+        opt_text(l.name_en.clone()),
+        int(l.quantity),
+        int(l.unit_price_satang),
+        int(l.line_discount_satang),
+        int(l.line_tax_satang),
+        int(l.line_total_satang),
+        text(l.created_at.clone()),
+      ];
+      bind_all(&mut insert, &line_params)
+        .map_err(|e| CommandError::storage("bind local_order_lines", e))?;
+      insert
+        .raw_execute()
+        .map_err(|e| CommandError::storage("insert local_order_lines", e))?;
+    }
+  }
+
+let ob = &input.outbox;
+  let outbox_params: Vec<Value> = vec![
+    text(ob.id.clone()),
+    text(ob.aggregate_type.clone().unwrap_or_else(|| "order".to_owned())),
+    text(o.id.clone()),
+    text(ob.event_type.clone().unwrap_or_else(|| "order_committed".to_owned())),
+    text(ob.action.clone().unwrap_or_else(|| "push_order".to_owned())),
+    text(payload),
+    text(ob.idempotency_key.clone()),
+    text(ob.next_attempt_at.clone()),
+    text(ob.created_at.clone()),
+  ];
+
+  {
+    let mut stmt = tx
+      .prepare(
+        "INSERT INTO sync_outbox (
+           id, aggregate_type, aggregate_id, event_type, action, payload,
+           idempotency_key, status, attempt_count, next_attempt_at, last_error,
+           created_at, processed_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', 0, ?8, NULL, ?9, NULL)",
+      )
+      .map_err(|e| CommandError::storage("prepare sync_outbox insert", e))?;
+
+    bind_all(&mut stmt, &outbox_params).map_err(|e| CommandError::storage("bind sync_outbox", e))?;
+    stmt.raw_execute().map_err(|e| CommandError::storage("insert sync_outbox", e))?;
+  }
+
+  tx.commit().map_err(|e| CommandError::storage("commit checkout", e))?;
+
+  Ok(SaveOfflineOrderOutput {
+    order_id: o.id.clone(),
+    local_receipt_number: o.local_receipt_number.clone(),
+    line_count: lines.len(),
+  })
+}
+
+/// A line whose money and quantity are known-good integers.
+struct ValidatedLine {
+  id: String,
+  variant_id: String,
+  product_id: Option<String>,
+  sku: Option<String>,
+  name_th: String,
+  name_en: Option<String>,
+  quantity: i64,
+  unit_price_satang: i64,
+  line_discount_satang: i64,
+  line_tax_satang: i64,
+  line_total_satang: i64,
+  created_at: String,
+}
+
+/// The history projection. Mirrors `OfflineOrderSummary` in TypeScript.
+fn query_recent(conn: &Connection, limit: i64) -> Result<Vec<OrderSummary>, CommandError> {
+  if limit <= 0 {
+    return Err(CommandError::invalid(
+      "limit",
+      "must be a positive integer; returning an empty list would look like a till with no sales",
+    ));
+  }
+
+  // ORDER BY created_at DESC, id DESC — the same tie-break the TypeScript port
+  // documents at offlineOrders.ts:252-267. A correlated COUNT rather than a
+  // JOIN, so a 50-row page is 50 index seeks and not a 50-row aggregate over
+  // every line in the shift.
+  let mut stmt = conn
+    .prepare(
+      "SELECT o.id, o.local_receipt_number, o.status, o.sync_state, o.created_at,
+              o.total_satang, o.currency,
+              (SELECT COUNT(*) FROM local_order_lines l WHERE l.order_id = o.id) AS line_count
+       FROM local_orders o
+       ORDER BY o.created_at DESC, o.id DESC
+       LIMIT ?1",
+    )
+    .map_err(|e| CommandError::storage("prepare history query", e))?;
+
+  let rows = stmt
+    .query_map([limit], |row| {
+      Ok(OrderSummary {
+        id: row.get(0)?,
+        local_receipt_number: row.get(1)?,
+        status: row.get(2)?,
+        sync_state: row.get(3)?,
+        created_at: row.get(4)?,
+        total_satang: row.get::<_, i64>(5)?.to_string(),
+        currency_code: row.get(6)?,
+        line_count: row.get(7)?,
+      })
+    })
+    .map_err(|e| CommandError::storage("read history", e))?;
+
+  rows.collect::<Result<Vec<_>, _>>().map_err(|e| CommandError::storage("read history row", e))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The Tauri commands
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Run blocking database work off the async runtime.
+///
+/// `rusqlite` is synchronous. Calling it directly from an `async` command would
+/// block the runtime's worker thread, and on a single-threaded executor that is
+/// the UI thread — which is how a 20 ms `synchronous = FULL` fsync becomes a
+/// visible stutter on a till being used at speed.
+async fn blocking<T, F>(app: AppHandle, work: F) -> Result<T, CommandError>
+where
+  T: Send + 'static,
+  F: FnOnce(&mut Connection) -> Result<T, CommandError> + Send + 'static,
+{
+  tauri::async_runtime::spawn_blocking(move || {
+    let state = app.state::<AppState>();
+    // The Mutex is held for the length of one statement group, which is what
+    // SQLite requires anyway: one writer at a time. `lock()` recovers from
+    // poisoning rather than panicking, because a poisoned lock here means some
+    // earlier command panicked mid-transaction — and the rollback that unwound
+    // it still left the database in the correct state.
+    let mut conn = state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    work(&mut conn)
+  })
+  .await
+  .map_err(CommandError::worker)?
+}
+
+/// Commit a completed checkout. See `write_order`.
+#[tauri::command]
+pub async fn save_offline_order(
+  app: AppHandle,
+  input: SaveOfflineOrderInput,
+) -> Result<SaveOfflineOrderOutput, CommandError> {
+  blocking(app, move |conn| write_order(conn, &input)).await
+}
+
+/// Read the most recent orders, newest first.
+#[tauri::command]
+pub async fn list_recent_orders(app: AppHandle, limit: i64) -> Result<Vec<OrderSummary>, CommandError> {
+  blocking(app, move |conn| query_recent(conn, limit)).await
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::migrate::migrate;
+
+  fn conn() -> Connection {
+    let mut c = Connection::open_in_memory().expect("open in-memory database");
+    c.pragma_update(None, "foreign_keys", "ON").unwrap();
+    migrate(&mut c).expect("migrate");
+    c
+  }
+
+  /// A checkout that satisfies every CHECK in the schema.
+  fn good_input() -> SaveOfflineOrderInput {
+    SaveOfflineOrderInput {
+      order: OrderInput {
+        id: "018f3c2a-0000-7000-8000-000000000001".into(),
+        branch_id: "branch-1".into(),
+        terminal_id: "terminal-1".into(),
+        staff_user_id: "staff-1".into(),
+        order_type: "takeaway".into(),
+        status: Some("submitted".into()),
+        source: None,
+        currency: None,
+        vat_rate_bp: Some(700),
+        // VAT-INCLUSIVE (docs/02-design/DOMAIN.md §"Money and tax rules").
+        // ฿45.50 is what the customer pays; the tax sits inside it.
+        //   net = round_half_up(4550 * 10000 / 10700) = round_half_up(4252.336) = 4252
+        //   tax = 4550 - 4252 = 298   (฿2.98 — NOT the ฿3.19 forward VAT would give)
+        //   total = 4550, the subtotal itself; the tax is already inside it
+        subtotal_satang: "4550".into(),
+        discount_satang: "0".into(),
+        taxable_satang: "4252".into(),
+        tax_satang: "298".into(),
+        service_charge_satang: "0".into(),
+        rounding_adjustment_satang: "0".into(),
+        total_satang: "4550".into(),
+        discount_type: None,
+        loyalty_points_earned: None,
+        idempotency_key: "idem-1".into(),
+        local_receipt_number: "R-0001".into(),
+        created_at: "2026-10-03T09:00:00.000Z".into(),
+      },
+      lines: vec![LineInput {
+        id: "line-1".into(),
+        variant_id: "variant-1".into(),
+        product_id: Some("product-1".into()),
+        sku: Some("BEV-LATTE".into()),
+        name_th: "ลาเต้".into(),
+        name_en: Some("Latte".into()),
+        quantity: "1".into(),
+        unit_price_satang: "4550".into(),
+        line_discount_satang: "0".into(),
+        // VAT is posted once per order, so a line carries none. The schema
+        // enforces `line_tax_satang = 0` and rejects this row otherwise — which
+        // is the point of that CHECK.
+        line_tax_satang: "0".into(),
+        line_total_satang: "4550".into(),
+        created_at: "2026-10-03T09:00:00.000Z".into(),
+      }],
+      outbox: OutboxInput {
+        id: "outbox-1".into(),
+        aggregate_type: None,
+        event_type: None,
+        action: None,
+        payload: r#"{"order_id":"018f3c2a-0000-7000-8000-000000000001"}"#.into(),
+        idempotency_key: "idem-outbox-1".into(),
+        next_attempt_at: "2026-10-03T09:00:00.000Z".into(),
+        created_at: "2026-10-03T09:00:00.000Z".into(),
+      },
+    }
+  }
+
+  fn count(conn: &Connection, table: &str) -> i64 {
+    conn
+      .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+      .unwrap_or_else(|e| panic!("count {table}: {e}"))
+  }
+
+  // ── satang parsing ────────────────────────────────────────────────────────
+
+  #[test]
+  fn canonical_integers_parse() {
+    assert_eq!(parse_satang("f", "0").unwrap(), 0);
+    assert_eq!(parse_satang("f", "4550").unwrap(), 4550);
+  }
+
+  #[test]
+  fn a_float_that_happens_to_be_whole_is_rejected() {
+    // The value a `Money.fromNumber` call would have thrown on. It must not be
+    // laundered through a string to get past that check.
+    assert!(parse_satang("f", "4550.0").is_err());
+  }
+
+  #[test]
+  fn a_negative_amount_is_rejected() {
+    // A refund is a separate row with its own event type, never a negative price.
+    assert!(parse_satang("f", "-1").is_err());
+  }
+
+  #[test]
+  fn a_signed_value_is_rejected_rather_than_coerced() {
+    assert!(parse_satang("f", "+4550").is_err());
+  }
+
+  #[test]
+  fn whitespace_around_a_number_is_rejected() {
+    assert!(parse_satang("f", " 4550").is_err());
+    assert!(parse_satang("f", "4550 ").is_err());
+    assert!(parse_satang("f", "4550\n").is_err());
+  }
+
+  #[test]
+  fn non_base_ten_notations_are_rejected() {
+    assert!(parse_satang("f", "4.55e3").is_err());
+    assert!(parse_satang("f", "0x11A").is_err());
+    assert!(parse_satang("f", "1_000").is_err());
+    assert!(parse_satang("f", "").is_err());
+  }
+
+  #[test]
+  fn a_leading_zero_is_reported_because_it_means_a_zero_padded_formatter() {
+    assert!(parse_satang("f", "04550").is_err());
+  }
+
+  #[test]
+  fn a_value_beyond_i64_is_rejected_rather_than_wrapping() {
+    assert!(parse_satang("f", &"9".repeat(19)).is_err());
+    assert!(parse_satang("f", &"9".repeat(30)).is_err());
+  }
+
+  // ── the transaction ───────────────────────────────────────────────────────
+
+  #[test]
+  fn a_good_checkout_writes_the_order_its_lines_and_one_outbox_event() {
+    let mut c = conn();
+    let out = write_order(&mut c, &good_input()).expect("checkout should commit");
+
+    assert_eq!(out.line_count, 1);
+    assert_eq!(count(&c, "local_orders"), 1);
+    assert_eq!(count(&c, "local_order_lines"), 1);
+    // Exactly one, not "at least one": the whole point of §2.2 is that the event
+    // is queued with the sale, so an unqueued sale can never be a thing.
+    assert_eq!(count(&c, "sync_outbox"), 1);
+  }
+
+  #[test]
+  fn a_broken_line_leaves_nothing_behind() {
+    // THE test for SKILL.md §2.2. A line whose total does not satisfy the
+    // schema's arithmetic identity — exactly what a bug in the TypeScript cart
+    // maths produces — is rejected by the CHECK on the line insert. The order
+    // row was already written by then. If the three writes were not in one
+    // transaction, this database would now hold a committed sale with no lines
+    // and no outbox event: money taken, nothing queued, nothing to sync.
+    let mut c = conn();
+    let mut input = good_input();
+    input.lines[0].line_total_satang = "9999".into(); // 4550 - 0 + 319 = 4869
+
+    let error = write_order(&mut c, &input).expect_err("a broken line must fail the checkout");
+
+    assert_eq!(error.kind, CommandErrorKind::Storage);
+    assert_eq!(count(&c, "local_orders"), 0, "the order row must have rolled back");
+    assert_eq!(count(&c, "local_order_lines"), 0);
+    assert_eq!(count(&c, "sync_outbox"), 0, "no event may be queued for a sale that did not happen");
+  }
+
+  #[test]
+  fn a_second_checkout_with_the_same_idempotency_key_is_rejected() {
+    let mut c = conn();
+    write_order(&mut c, &good_input()).expect("first checkout");
+
+    let error = write_order(&mut c, &good_input()).expect_err("a replay must not sell the drink twice");
+    assert_eq!(error.kind, CommandErrorKind::Storage);
+    assert_eq!(count(&c, "local_orders"), 1, "the duplicate must not become a second sale");
+  }
+
+  #[test]
+  fn an_order_with_no_lines_is_rejected_before_any_statement_runs() {
+    let mut c = conn();
+    let mut input = good_input();
+    input.lines.clear();
+
+    write_order(&mut c, &input).expect_err("an order with no lines is not reconcilable");
+
+    assert_eq!(count(&c, "local_orders"), 0);
+  }
+
+  #[test]
+  fn a_zero_quantity_line_is_rejected() {
+    let mut c = conn();
+    let mut input = good_input();
+    input.lines[0].quantity = "0".into();
+
+    let error = write_order(&mut c, &input).expect_err("a zero-quantity line must be refused");
+    assert_eq!(error.kind, CommandErrorKind::InvalidPayload);
+    assert_eq!(count(&c, "local_orders"), 0);
+  }
+
+  #[test]
+  fn a_malformed_satang_field_is_rejected_before_anything_is_written() {
+    let mut c = conn();
+    let mut input = good_input();
+    input.order.total_satang = "48.69".into();
+
+    let error = write_order(&mut c, &input).expect_err("a float must not reach the database");
+    assert_eq!(error.kind, CommandErrorKind::InvalidPayload);
+    assert!(error.message.contains("totalSatang"));
+    assert_eq!(count(&c, "local_orders"), 0);
+  }
+
+  #[test]
+  fn the_database_refuses_a_line_whose_order_does_not_exist() {
+    // Proves the foreign-key pragma at src/db.rs is actually in force. It was
+    // silently OFF for the life of migration 0001, which set
+    // `PRAGMA foreign_keys = ON` inside the migration's own transaction.
+    let c = conn();
+    c.execute(
+      "INSERT INTO local_order_lines (id, order_id, variant_id, name_th, quantity,
+         unit_price_satang, line_discount_satang, line_tax_satang, line_total_satang, created_at)
+       VALUES ('l1', 'no-such-order', 'v1', 'กาแฟ', 1, 100, 0, 0, 100, '2026-10-03T09:00:00.000Z')",
+      [],
+    )
+    .expect_err("a line must not outlive its order");
+  }
+
+  #[test]
+  fn a_committed_sale_cannot_be_deleted_or_restated() {
+    // The money-immutability trigger, from the write path's side: once checkout
+    // has returned, the only correction is void-and-re-ring.
+    let mut c = conn();
+    write_order(&mut c, &good_input()).expect("checkout");
+
+    c.execute("DELETE FROM local_orders", []).expect_err("a sale may not be deleted");
+    c.execute("UPDATE local_orders SET total_satang = 1 WHERE id = ?1", ["018f3c2a-0000-7000-8000-000000000001"])
+      .expect_err("a committed sale may not be restated");
+  }
+
+  // ── the history query ─────────────────────────────────────────────────────
+
+  #[test]
+  fn an_empty_database_reads_as_an_empty_list_not_an_error() {
+    let c = conn();
+    assert!(query_recent(&c, 50).expect("query on an empty database").is_empty());
+  }
+
+  #[test]
+  fn history_returns_newest_first_with_its_line_count_and_satang_as_a_string() {
+    let mut c = conn();
+    write_order(&mut c, &good_input()).expect("first checkout");
+
+    let mut second = good_input();
+    second.order.id = "018f3c2a-0000-7000-8000-000000000002".into();
+    second.order.local_receipt_number = "R-0002".into();
+    second.order.idempotency_key = "idem-2".into();
+    second.order.created_at = "2026-10-03T10:00:00.000Z".into();
+    second.lines[0].id = "line-2".into();
+    // The outbox row's own identity needs distinct values too: `sync_outbox`
+    // carries its own UNIQUE `idempotency_key`, and reusing the first checkout's
+    // is refused — which is the replay protection working, not a test artefact.
+    second.outbox.id = "outbox-2".into();
+    second.outbox.idempotency_key = "idem-outbox-2".into();
+    write_order(&mut c, &second).expect("second checkout");
+
+    let rows = query_recent(&c, 50).expect("history");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].local_receipt_number, "R-0002", "newest first");
+    assert_eq!(rows[1].local_receipt_number, "R-0001");
+    assert_eq!(rows[0].line_count, 1);
+    // VAT-inclusive: the stored total is the ฿45.50 charged, tax included.
+    // Under the old exclusive rule this read 4869 (4550 + 319).
+    assert_eq!(rows[0].total_satang, "4550");
+    assert_eq!(rows[0].currency_code, "THB");
+    assert_eq!(rows[0].sync_state, "pending");
+  }
+
+  #[test]
+  fn history_honours_its_limit() {
+    let mut c = conn();
+    write_order(&mut c, &good_input()).expect("checkout");
+
+    assert_eq!(query_recent(&c, 1).expect("history").len(), 1);
+  }
+
+  #[test]
+  fn a_non_positive_limit_is_an_error_rather_than_an_empty_list() {
+    let c = conn();
+    for bad in [0, -1] {
+      let error = query_recent(&c, bad).expect_err("a broken page size must be loud");
+      assert_eq!(error.kind, CommandErrorKind::InvalidPayload);
+    }
+  }
+
+  #[test]
+  fn migration_is_idempotent_against_a_database_that_already_has_the_schema() {
+    // What happens when the app is launched twice, or recovers from a crash
+    // between opening the file and finishing startup.
+    let mut c = conn();
+    migrate(&mut c).expect("second migration pass");
+    write_order(&mut c, &good_input()).expect("checkout still works");
+  }
+}

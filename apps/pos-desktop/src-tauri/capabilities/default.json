@@ -1,0 +1,11 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Default capability for the POS desktop terminal. Grants core:default only: there is no frontend-facing database API, because the database is reached through the crate's own commands rather than a JS driver. Rationale for the permission list lives in src-tauri/README.md.",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "core:default"
+  ]
+}

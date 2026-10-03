@@ -1,0 +1,177 @@
+# GreenTable POS - integration gate.
+#
+# Protects the contract between the committed lockfile, the workspace type
+# surface, the test suite, and the production bundle. Every step below is
+# already known to pass on this machine, so a red run means something changed -
+# not that the harness itself is broken.
+
+name: Verify lockfile, types, tests and bundle
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# This gate is minutes, not tens of minutes, so a superseded run is pure waste:
+# it would race the newer run for the same apps/pos-desktop/dist/ and the same
+# caches. Keyed on github.ref so cancellation is per-branch and PR runs on
+# different refs do not cancel each other.
+concurrency:
+  group: verify-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege: this gate only ever reads the repository. Nothing here
+# pushes, comments, or opens a PR, so no write scopes are granted.
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Typecheck, test and build
+    runs-on: ubuntu-latest
+    # Minutes, not tens of minutes. The 6-hour default suits long suites; here
+    # it would let a hung tsc or vite hold a branch hostage for hours. 15 is
+    # generous headroom over the observed runtime.
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Bun 1.3.14 (pinned)
+        uses: oven-sh/setup-bun@v2
+        with:
+          # EXACT pin, and it is the load-bearing choice in this file. The Bun
+          # workspace note in SKILL.md (section 3.5) records that Bun 1.4+ writes
+          # bun.lock with lockfileVersion: 2, while 1.3.x writes version 1 - the
+          # format actually committed here. A runner on a newer Bun would rewrite
+          # the lockfile to a format the local toolchain does not expect and can
+          # lose the workspace graph, so this mirrors the root
+          # "packageManager": "bun@1.3.14" exactly. Do not float it to latest,
+          # ^1.3.14 or 1.x.
+          bun-version: 1.3.14
+
+      - name: Install Node 22 (pinned)
+        uses: actions/setup-node@v4
+        with:
+          # setup-bun does not install Node, and ubuntu-latest does not
+          # guarantee a Node new enough for Vite 7, which requires
+          # ^20.19.0 || >=22.12.0. The root engines.node floor of >=20.0.0 is
+          # looser than the build step actually needs - it still admits the
+          # 20.19-21.x range Vite 7 rejects - so it cannot keep a runner safe.
+          # Hence 22, pinned rather than ranged.
+          #
+          # No cache: on purpose. setup-node's cache is npm/yarn oriented; this
+          # repo installs with Bun, and Bun's install cache is handled by the
+          # actions/cache step below.
+          node-version: 22
+
+      - name: Cache Bun install cache
+        uses: actions/cache@v4
+        with:
+          # Keyed on bun.lock because a lockfile change is exactly the event
+          # that invalidates the downloaded tarballs. A key on anything coarser
+          # either wastes the cache on every unrelated commit or keeps serving a
+          # stale one; nothing finer would ever hit.
+          key: bun-install-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+          # The download cache only - never node_modules/. Restoring an installed
+          # tree would hide a drifted or broken lockfile instead of surfacing it,
+          # which is the opposite of what a guard rail is for.
+          path: ~/.bun/install/cache
+
+      - name: Install dependencies (frozen lockfile)
+        # From the repository root, which is where bun.lock lives.
+        # --frozen-lockfile is the whole point: it fails the run when bun.lock
+        # disagrees with any package.json, which is precisely the drift this gate
+        # exists to catch, and it is what makes restoring the download cache
+        # above safe. Without it CI would happily install a different dependency
+        # graph than the one that was locked and reviewed.
+        run: bun install --frozen-lockfile
+
+      - name: Verify (typecheck then test, all workspaces)
+        run: bun run verify
+
+      # Kept separate from verify so a red run names the step that broke. Build
+      # runs after verify, not before: a bundle produced from code that does not
+      # typecheck or pass its tests is not evidence of anything.
+      - name: Build (all workspaces)
+        run: bun run build
+
+  # --- Rust ---------------------------------------------------------------------
+  #
+  # The checkout money path is only half TypeScript. `save_offline_order` in
+  # apps/pos-desktop/src-tauri/src/commands.rs opens the SQLCipher database and
+  # writes the order, its lines and the outbox event in ONE transaction — the
+  # §2.2 offline guarantee. The migrations that encode the VAT rules are applied
+  # by that same crate, and the SQL-level tests in migrations.test.ts attack
+  # 0001_init.sql through bun:sqlite.
+  #
+  # Those two facts are exactly why this is a REQUIRED job and not an optional
+  # extra. migrations.test.ts proves the constraints are correct; only
+  # `cargo test` proves the Rust that must satisfy them actually does. A change
+  # that quietly broke save_offline_order — wrong column order, a transaction
+  # that stopped rolling back, an IPC struct whose field names no longer match
+  # what the TypeScript sends — would leave the JS suite entirely green.
+  rust:
+    name: Check and test the native crate
+    runs-on: ubuntu-latest
+    # cargo check on a cold cache including the bundled-sqlcipher C build is the
+    # slow part; 25 leaves headroom without letting a hung build hold a PR.
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Pinned to match the local toolchain (rustc 1.98.1) so a difference in the
+      # compiler is never mistaken for a difference in the code. This is also the
+      # version the 36 Rust tests were last observed green on.
+      - name: Install Rust (pinned)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+
+      # `bundled-sqlcipher` compiles C from source (libsqlite3 + the crypto
+      # backend). Without build-essential the build fails with an opaque
+      # "cc not found", which reads like a dependency problem rather than a
+      # missing compiler.
+      - name: Install build tools for the bundled SQLCipher
+        run: sudo apt-get update && sudo apt-get install -y build-essential
+
+      # Caches target/ keyed on the lockfile. The crate's own dependencies are
+      # pinned by Cargo.lock; the cache is an optimisation, never the thing that
+      # makes the build reproducible.
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: apps/pos-desktop/src-tauri/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('apps/pos-desktop/src-tauri/Cargo.lock') }}
+
+      # --locked makes Cargo refuse to update Cargo.lock. Without it a build
+      # could silently resolve different dependency versions than the ones
+      # committed and reviewed, which is the same failure mode the frozen
+      # Bun lockfile guard above exists to prevent.
+      - name: cargo check
+        working-directory: apps/pos-desktop/src-tauri
+        run: cargo check --locked --all-targets
+
+      - name: cargo test
+        working-directory: apps/pos-desktop/src-tauri
+        run: cargo test --locked
+
+# --- Deliberate omissions, so the next reader does not "fix" them -------------
+#
+# No `bun run generate:types`. The generated types in
+# packages/api-types/src/index.ts are committed; regenerating them in CI would
+# be either a no-op or a diff CI cannot act on. `typecheck` already consumes
+# them.
+#
+# No `bun run infra:up` / docker / nerdctl. The suite is pure JS/TS and the
+# migrations test drives bun:sqlite against an in-memory database, so nothing
+# depends on Postgres or Redis. A compose step would add a failure mode with no
+# test behind it. The Rust job needs no database either: its tests open their
+# own in-memory SQLCipher connection.
+#
+# No matrix over Bun or Node versions. One pinned toolchain is this gate; drift
+# testing is a separate piece of work.

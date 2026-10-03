@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# ---------------------------------------------------------------------------
+# wasri — namespaced wrapper around `sudo nerdctl` for THIS project only.
+#
+# Why this exists:
+#   The host containerd is shared with the sibling project `pos-walasri`.
+#   Plain `nerdctl` targets the `default` namespace, which belongs to that
+#   project. Running it here would put us in someone else's namespace.
+#
+#   Plain (non-sudo) `nerdctl` does not work at all on this host: there is no
+#   rootless containerd socket. `sudo` is required, not optional.
+#
+# Usage:
+#   ./dev/wasri ps
+#   ./dev/wasri compose up -d
+#   ./dev/wasri compose ps
+#   ./dev/wasri compose down
+#   ./dev/wasri exec wasri-postgres psql -U wasri_user -d walasri_db
+#
+# Anything not covered by this script stays in the other project's namespace
+# and is out of scope for this repo.
+# ---------------------------------------------------------------------------
+set -euo pipefail
+
+NAMESPACE="${CONTAINERD_NAMESPACE:-walasri}"
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Create the namespace on first use; it is harmless if it already exists.
+if ! sudo nerdctl namespace inspect "$NAMESPACE" >/dev/null 2>&1; then
+  echo ">> creating containerd namespace: $NAMESPACE" >&2
+  sudo nerdctl namespace create "$NAMESPACE"
+fi
+
+# Pin the compose project name so volumes/networks are namespaced by project
+# on top of the containerd namespace.
+export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-wal-asri-pos}"
+
+cd "$PROJECT_DIR"
+exec sudo nerdctl --namespace "$NAMESPACE" compose "$@"

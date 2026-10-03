@@ -1,0 +1,31 @@
+{
+  "name": "wal-asri-pos",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Wal-Asri POS \u2014 offline-first monorepo (Bun workspaces)",
+  "type": "module",
+  "packageManager": "bun@1.3.14",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "engines": {
+    "bun": ">=1.3.14",
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "generate:types": "openapi-typescript contracts/openapi.yaml -o packages/api-types/src/index.ts",
+    "build": "bun run --filter '*' build",
+    "typecheck": "bun run --filter '*' typecheck",
+    "test": "bun run --filter '*' test",
+    "verify": "bun run typecheck && bun run test",
+    "infra:up": "./dev/wasri compose up -d",
+    "infra:ps": "./dev/wasri compose ps",
+    "infra:down": "./dev/wasri compose down"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.4",
+    "openapi-typescript": "^7.10.1",
+    "typescript": "^5.9.2"
+  }
+}

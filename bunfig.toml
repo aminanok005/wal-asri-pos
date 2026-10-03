@@ -1,0 +1,18 @@
+# Bun configuration — repository root.
+#
+# `[test] preload` runs BEFORE any test module is imported. That ordering is
+# what makes the simulated DOM available to `@testing-library/react`: the library
+# reads the global `document` when it is imported, so registering the DOM any
+# later would be too late.
+#
+# Bun reads `bunfig.toml` from the CURRENT WORKING DIRECTORY, not from the
+# directory of the test file. Both entry points must therefore preload it:
+#
+#   bun test            (from the repo root — this file)
+#   bun run test        (per workspace, see apps/pos-desktop/bunfig.toml)
+#
+# Without the root copy, `bun test` at the repo root fails with
+# "ReferenceError: document is not defined" the moment a component is rendered.
+
+[test]
+preload = ["./apps/pos-desktop/test/setup-dom.ts"]

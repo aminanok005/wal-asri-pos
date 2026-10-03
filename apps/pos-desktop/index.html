@@ -1,0 +1,51 @@
+<!doctype html>
+<!--
+  The webview document Vite serves in dev and the one Tauri bundles into the app.
+
+  ── Why this file is so bare ──────────────────────────────────────────────────
+  It declares a root element and one module script. That is the whole contract.
+
+  ── WHY THERE IS NO INLINE SCRIPT AND NO REMOTE <link> ─────────────────────────
+  `src-tauri/tauri.conf.json` sets `app.security.csp` to the exact string
+  `default-src 'self'`. That is the CSP the PACKAGED app runs under, and it is
+  enforced by the webview at runtime — not by this repository's linter, and not
+  by a build step. Under `default-src 'self'`:
+
+    * an inline `<script>` has no source that is 'self', so it is blocked;
+    * an inline `style` attribute or `<style>` block is likewise blocked;
+    * a `<link>` to a CDN (fonts, a polyfill, a webfont) points at another
+      origin, so it is blocked too.
+
+  The failure mode is nasty and quiet: the build succeeds, the bundle is
+  produced, and the till shows a white window with only a CSP violation in a
+  console nobody is watching. So the rule is structural rather than a review
+  note — every byte this page loads comes from `dist/`, i.e. from 'self'. If a
+  future screen needs a webfont, it is vendored into `src/` and imported through
+  the bundler, not linked from a CDN.
+
+  ── WHY lang="th" AND NOT lang="en" ───────────────────────────────────────────
+  Every user-facing string in this app is Thai: the nav labels, the screen
+  headings, the money formatting. `lang` is not decoration and not a lint
+  preference — it is what tells a screen reader WHICH PRONUNCIATION RULES to
+  apply. Thai has its own tone, vowel and word-boundary rules, and a Thai
+  document announced with English rules is mispronounced badly enough to be
+  unusable for a blind cashier. This attribute is the only thing carrying that
+  information, so it is set correctly here rather than left to default to `en`.
+-->
+<html lang="th">
+  <head>
+    <meta charset="utf-8" />
+    <!-- The till is a fixed-format kiosk: the cashier must not be able to pinch
+         or double-tap-zoom the price grid out from under a running sale. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!-- The product name from `tauri.conf.json` `productName`, kept in one
+         place: the window title Tauri sets comes from the same string. -->
+    <title>Wal-Asri POS Desktop</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <!-- The ONE module entry. `/src/main.tsx` is a dev-server path: Vite
+         rewrites it to the hashed, relative `dist/assets/…` file on build. -->
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

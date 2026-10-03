@@ -1,0 +1,9 @@
+# Bun configuration for the POS desktop app.
+#
+# `[test] preload` runs BEFORE any test module is imported, which is what makes
+# the simulated DOM available to `@testing-library/react` — that library reads
+# the global `document` at import time, so a later registration would be too
+# late.
+
+[test]
+preload = ["./test/setup-dom.ts"]

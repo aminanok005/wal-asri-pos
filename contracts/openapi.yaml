@@ -1,0 +1,807 @@
+openapi: 3.0.3
+
+info:
+  title: GreenTable POS API
+  version: 0.1.0
+  description: |
+    Contract-first source of truth for the GreenTable POS ecosystem.
+
+    This file is hand-edited (SKILL.md §4 Step 1). TypeScript types are GENERATED
+    from it into `packages/api-types/src/index.ts` by `openapi-typescript` and
+    must never be edited by hand.
+
+    ## Money rule — Satang (int64)
+
+    Every monetary field in this contract is an **integer count of satang**,
+    expressed as `type: integer, format: int64`. 1 Baht = 100 satang, so ฿45.50
+    is `4550`. There is **no float, no decimal point, and no currency symbol on
+    the wire**. A field whose name ends in `_satang` always holds this value.
+
+    Rationale: `3 × 0.1 = 0.30000000000000004`. A POS that drifts a fraction of
+    a satang per line item cannot reconcile at end of shift. Integer satang
+    makes that class of error unrepresentable.
+
+    **JSON caveat, stated deliberately:** JSON has one number type, so an
+    `int64` reaches JavaScript as a `number` and loses precision above
+    2^53 - 1. Every satang value in this contract is far below that
+    (฿90 trillion). The TypeScript side wraps these in the `Money` value object
+    (`bigint`) at the boundary rather than doing arithmetic on them directly.
+
+    ## Identifiers — UUIDv7
+
+    All `id` fields are UUIDv7, generated **client-side**. A terminal must be
+    able to create a record while offline and still produce an identifier that
+    sorts chronologically and does not collide across devices.
+
+    ## Optimistic concurrency and sync
+
+    Every primary entity carries BOTH:
+      * `updated_at` — when the row last changed (RFC 3339, UTC).
+      * `version`    — incremented by the server on every write.
+
+    `version` is what a client sends back to detect a lost update.
+    `updated_at` is what a client uses as a **sync cursor** — see
+    `GET /catalog?since=` and `GET /inventory/balances?since=`.
+
+    ## Scoping — branch and terminal
+
+    Reads are scoped by `branch_id`, because catalog and pricing are
+    branch-specific (each branch has its own price list and VAT rate). Writes
+    are additionally scoped by the authenticated terminal, which the server
+    derives from the device credential — a client never asserts its own
+    terminal identity.
+
+    ## Status vocabulary
+
+    `is_active` is a **boolean** and is the single source of truth for
+    "available to sell". A separate `status` field exists only on entities
+    where DOMAIN.md defines a real state machine (see `OrderStatus`,
+    `OutboxStatus`). Catalog entities do not have one.
+
+    ⚠️ Implementation note: the server that implements this contract lives in
+    `services/api-backend`, which is BLOCKED on the `grit` CLI. Steps 1-2
+    (contract + generated types) are unaffected and can proceed; Step 3
+    (server implementation) cannot. Do not substitute another framework.
+
+servers:
+  - url: /api/v1
+    description: Relative — the client is a Tauri app on the same LAN.
+
+tags:
+  - name: Catalog
+    description: Sellable items and their prices. Pulled down for local cache.
+  - name: Inventory
+    description: Stock levels per branch. Read-only on the client.
+
+paths:
+  # ==========================================================================
+  # Catalog
+  # ==========================================================================
+  /catalog:
+    get:
+      tags: [Catalog]
+      operationId: getCatalog
+      summary: Get the full sellable catalog
+      description: |
+        Returns every category, product, variant and active price-list entry
+        for a branch, so the POS terminal can populate its local SQLite cache.
+
+        This is the read that replaces a network call on the sell path. Once
+        cached, the UI reads only from local SQLite and never blocks on the
+        network (`ARCHITECTURE-DEMO.md` §4, "Sync Down").
+
+        **Incremental pull.** Pass `since` (an RFC 3339 timestamp) to receive
+        only rows changed after that instant, plus a new `cursor`. A terminal
+        that has never synced omits `since` and receives the full catalog.
+
+        **Server wins on price.** Catalog and prices are last-write-wins by
+        `version` — a client may not originate a price change
+        (`ARCHITECTURE-DEMO.md` §9, "Conflict rules").
+      parameters:
+        - $ref: '#/components/parameters/BranchId'
+        - $ref: '#/components/parameters/Since'
+        - $ref: '#/components/parameters/IncludeInactive'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: The catalog snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # ==========================================================================
+  # Inventory
+  # ==========================================================================
+  /inventory/balances:
+    get:
+      tags: [Inventory]
+      operationId: getInventoryBalances
+      summary: Get stock balances for a branch
+      description: |
+        Returns the current `StockBalance` for every tracked inventory item in
+        a branch.
+
+        **Quantities are decimal, not money, and are carried as strings.**
+        `on_hand` is `decimal(12,3)` in the data model because a balance can be
+        `2.500` kg of flour. A JSON number would force binary floating point
+        onto an exact decimal, which is the same class of error the satang
+        rule exists to prevent — so the value travels as a **string** and the
+        client parses it. See `Quantity` in components/schemas.
+
+        **`on_hand` is derived, never written by the client.** It is computed
+        server-side from the `StockMovement` ledger. Stock is a ledger of
+        movements, not an overwritten number (`ARCHITECTURE-DEMO.md` §9). This
+        endpoint is read-only; there is deliberately no `PUT` or `PATCH`.
+      parameters:
+        - $ref: '#/components/parameters/BranchId'
+        - $ref: '#/components/parameters/Since'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/ItemFilter'
+      responses:
+        '200':
+          description: Current stock balances.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InventoryBalancesResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+components:
+
+  # ==========================================================================
+  # Reusable parameters
+  # ==========================================================================
+  parameters:
+    BranchId:
+      name: branch_id
+      in: query
+      required: true
+      description: |
+        Branch whose catalog and stock are being requested. Required because
+        pricing and VAT are branch-specific.
+      schema:
+        $ref: '#/components/schemas/UuidV7'
+      example: 018f3c2a-7b41-7c3d-9e10-5a2b8c4d6e01
+
+    Since:
+      name: since
+      in: query
+      required: false
+      description: |
+        Sync cursor — an RFC 3339 timestamp. When present, only rows with
+        `updated_at` strictly greater than this value are returned. Omit for a
+        full snapshot. Always use the `cursor` from the previous response.
+      schema:
+        type: string
+        format: date-time
+      example: '2026-10-02T09:15:00Z'
+
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: Opaque pagination cursor from a previous response's `next_cursor`.
+      schema:
+        type: string
+
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: Page size. Server caps the maximum.
+      schema:
+        type: integer
+        format: int32
+        minimum: 1
+        maximum: 500
+        default: 200
+
+    IncludeInactive:
+      name: include_inactive
+      in: query
+      required: false
+      description: |
+        Include rows where `is_active` is false. Omit or set false to receive
+        only sellable items.
+      schema:
+        type: boolean
+        default: false
+
+    ItemFilter:
+      name: inventory_item_ids
+      in: query
+      required: false
+      description: |
+        Comma-separated inventory item IDs to restrict the response to. Omit
+        for every tracked item in the branch.
+      schema:
+        type: array
+        items:
+          $ref: '#/components/schemas/UuidV7'
+      style: form
+      explode: false
+
+  # ==========================================================================
+  # Reusable responses
+  # ==========================================================================
+  responses:
+    BadRequest:
+      description: Malformed or missing parameter.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unauthorized:
+      description: No device credential, or the refresh token has expired.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Forbidden:
+      description: |
+        The device credential is valid but is not scoped to the requested
+        branch. The server never trusts a client-asserted branch id.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    InternalError:
+      description: Unexpected server error.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+  # ==========================================================================
+  # Schemas
+  # ==========================================================================
+  schemas:
+
+    # ── Primitives ──────────────────────────────────────────────────────────
+
+    UuidV7:
+      type: string
+      format: uuid
+      description: |
+        UUIDv7, generated **client-side** so a record can be created offline.
+        Time-ordered: sorts chronologically, which is what makes it usable as
+        a primary key on a device that may sync out of order.
+      example: 018f3c2a-7b41-7c3d-9e10-5a2b8c4d6e01
+
+    Satang:
+      type: integer
+      format: int64
+      minimum: 0
+      description: |
+        **MONEY — Satang (int64).** An integer count of satang. 1 Baht = 100
+        satang, so ฿45.50 is `4550`.
+
+        Never a float, never a decimal point, never a currency symbol. Two
+        decimal places of *major* currency are already carried by the scale
+        factor of 100; a value of `1250` means ฿12.50 unambiguously.
+
+        Range: 0 .. 2^53-1 is safe through JSON. 2^53 satang is ฿90 trillion,
+        which no single transaction in this system approaches. Values beyond
+        that must be transported as a string, not a number.
+      example: 4550
+
+    Quantity:
+      type: string
+      pattern: '^-?\d+(\.\d{1,3})?$'
+      description: |
+        **QUANTITY — exact decimal as a string, up to 3 decimal places.**
+        Matches `decimal(12,3)` in the data model.
+
+        Carried as a **string, not a JSON number**, on purpose. A quantity is a
+        ratio, not money, so it legitimately needs a decimal point (`2.500` kg),
+        but a JSON number would place that value in binary floating point —
+        the same drift the satang rule forbids for money. As a string it
+        round-trips exactly and is parsed into a scaled integer by the client.
+
+        A leading `-` is permitted: a balance may go negative when an offline
+        terminal oversells stock, and the server reconciles it later
+        (`ARCHITECTURE-DEMO.md` §9).
+      example: '2.500'
+
+    Version:
+      type: integer
+      format: int64
+      minimum: 0
+      description: |
+        Optimistic-concurrency counter. The server increments it on every
+        write. A client performing a conditional write sends the `version` it
+        read; a mismatch is a conflict, never a silent overwrite.
+
+        `PriceList` already carries a `version` field in the data model with
+        the same meaning; it is exposed here for every primary entity so a
+        client can apply one rule everywhere.
+      example: 7
+
+    CurrencyCode:
+      type: string
+      pattern: '^[A-Z]{3}$'
+      description: ISO 4217 code. Read from the owning `Branch`, never asserted by the client.
+      example: THB
+
+    # ── Catalog ─────────────────────────────────────────────────────────────
+
+    Category:
+      type: object
+      description: |
+        A menu grouping. Hierarchical via `parent_id` (self-referencing), e.g.
+        Beverage → Coffee → Espresso.
+      required:
+        - id
+        - branch_id
+        - name_th
+        - is_active
+        - version
+        - updated_at
+      properties:
+        id:
+          $ref: '#/components/schemas/UuidV7'
+        branch_id:
+          $ref: '#/components/schemas/UuidV7'
+        name_th:
+          type: string
+          maxLength: 255
+          description: Thai display name. The primary label in this product.
+          example: เครื่องดื่ม
+        name_en:
+          type: string
+          maxLength: 255
+          nullable: true
+          description: English display name. Optional.
+          example: Beverages
+        parent_id:
+          allOf: [$ref: '#/components/schemas/UuidV7']
+          nullable: true
+          description: Parent category. `null` for a root category.
+        sequence:
+          type: integer
+          format: int32
+          default: 0
+          description: Manual sort order within the parent. Lower sorts first.
+        is_active:
+          type: boolean
+          description: Whether the category is shown to staff. Not the same as "has sellable items".
+        version:
+          $ref: '#/components/schemas/Version'
+        created_at:
+          type: string
+          format: date-time
+          description: RFC 3339, UTC.
+        updated_at:
+          type: string
+          format: date-time
+          description: RFC 3339, UTC. Doubles as the sync cursor for this row.
+      additionalProperties: false
+
+    Product:
+      type: object
+      description: |
+        A sellable concept, e.g. "Iced Latte". Prices live on
+        `ProductVariant`, never on the product itself — a product with several
+        sizes has several variants at different prices.
+      required:
+        - id
+        - branch_id
+        - name_th
+        - is_active
+        - is_combo
+        - version
+        - updated_at
+      properties:
+        id:
+          $ref: '#/components/schemas/UuidV7'
+        branch_id:
+          $ref: '#/components/schemas/UuidV7'
+        category_id:
+          allOf: [$ref: '#/components/schemas/UuidV7']
+          nullable: true
+          description: Owning category. `null` for an uncategorised product.
+        name_th:
+          type: string
+          maxLength: 255
+          description: Thai display name.
+          example: กาแฟลาเต้เย็น
+        name_en:
+          type: string
+          maxLength: 255
+          nullable: true
+          description: English display name. Optional.
+        is_active:
+          type: boolean
+          description: |
+            Whether the product is sellable. `false` retires it from the menu
+            but keeps it valid on historical orders, which are append-only.
+        is_combo:
+          type: boolean
+          description: |
+            When `true` the product is assembled from other variants via
+            `ComboComponent`, and selling it also consumes their stock.
+        recipe_id:
+          allOf: [$ref: '#/components/schemas/UuidV7']
+          nullable: true
+          description: |
+            Recipe used for ingredient consumption. `null` for a product with
+            no tracked recipe.
+        image_url:
+          type: string
+          format: uri
+          nullable: true
+          description: Optional image location.
+        version:
+          $ref: '#/components/schemas/Version'
+        created_at:
+          type: string
+          format: date-time
+          description: RFC 3339, UTC.
+        updated_at:
+          type: string
+          format: date-time
+          description: RFC 3339, UTC. Doubles as the sync cursor for this row.
+      additionalProperties: false
+
+    ProductVariant:
+      type: object
+      description: |
+        A concrete sellable SKU of a product — the row that carries a price and
+        a stock balance. "Iced Latte" (product) has variants for 12 oz, 16 oz,
+        each with its own `PriceListEntry`.
+      required:
+        - id
+        - product_id
+        - sku
+        - name_th
+        - is_active
+        - version
+        - updated_at
+      properties:
+        id:
+          $ref: '#/components/schemas/UuidV7'
+        product_id:
+          $ref: '#/components/schemas/UuidV7'
+        sku:
+          type: string
+          maxLength: 100
+          description: Stock-keeping unit. Unique per branch.
+          example: BEV-LATTE-12
+        barcode:
+          type: string
+          maxLength: 64
+          nullable: true
+          description: |
+            Scannable barcode. Not present in the current data model —
+            **additive, pending approval** (see D-BARCODE). Optional and
+            nullable so its absence never breaks deserialisation.
+          example: '8851000000000'
+        name_th:
+          type: string
+          maxLength: 255
+          description: Thai variant name, e.g. the size.
+          example: 12 ออนซ์
+        name_en:
+          type: string
+          maxLength: 255
+          nullable: true
+          description: English variant name. Optional.
+        size:
+          type: string
+          maxLength: 100
+          nullable: true
+          description: Free-form size label for display, e.g. "12 oz".
+        image_url:
+          type: string
+          format: uri
+          nullable: true
+          description: Optional image location. Defaults to the parent product's.
+        is_active:
+          type: boolean
+          description: |
+            Whether the variant is sellable. A variant can be retired while its
+            product stays active, e.g. a seasonal size.
+        version:
+          $ref: '#/components/schemas/Version'
+        created_at:
+          type: string
+          format: date-time
+          description: RFC 3339, UTC.
+        updated_at:
+          type: string
+          format: date-time
+          description: RFC 3339, UTC. Doubles as the sync cursor for this row.
+      additionalProperties: false
+
+    PriceListEntry:
+      type: object
+      description: |
+        The **price of one variant** under one price list. This is the only
+        place a sell price appears in the contract.
+
+        A variant may appear in more than one price list (e.g. standard and
+        promotional); the client resolves which list is active for the branch.
+      required:
+        - id
+        - price_list_id
+        - product_variant_id
+        - unit_price_satang
+        - currency_code
+        - version
+        - updated_at
+      properties:
+        id:
+          $ref: '#/components/schemas/UuidV7'
+        price_list_id:
+          $ref: '#/components/schemas/UuidV7'
+        product_variant_id:
+          $ref: '#/components/schemas/UuidV7'
+        unit_price_satang:
+          allOf: [$ref: '#/components/schemas/Satang']
+          description: |
+            **MONEY — Satang (int64).** Price for one unit, before tax and
+            before discount. ฿45.50 is `4550`.
+
+            Promotions do not modify this value. A discount is a separate
+            resolved amount applied at checkout, so the list price stays
+            comparable across periods.
+        currency_code:
+          $ref: '#/components/schemas/CurrencyCode'
+        version:
+          $ref: '#/components/schemas/Version'
+        created_at:
+          type: string
+          format: date-time
+          description: RFC 3339, UTC.
+        updated_at:
+          type: string
+          format: date-time
+          description: RFC 3339, UTC. Doubles as the sync cursor for this row.
+      additionalProperties: false
+
+    # ── Inventory ───────────────────────────────────────────────────────────
+
+    InventoryItem:
+      type: object
+      description: |
+        A stock-keeping article. Points at a `ProductVariant` when the article
+        is itself sellable, and at nothing when it is a raw ingredient
+        (`is_raw: true`) consumed only through a recipe.
+      required:
+        - id
+        - branch_id
+        - name_th
+        - unit
+        - track_stock
+        - is_raw
+        - version
+        - updated_at
+      properties:
+        id:
+          $ref: '#/components/schemas/UuidV7'
+        branch_id:
+          $ref: '#/components/schemas/UuidV7'
+        product_variant_id:
+          allOf: [$ref: '#/components/schemas/UuidV7']
+          nullable: true
+          description: |
+            The sellable variant this item represents. `null` when
+            `is_raw` is true (an ingredient with no direct sale).
+        sku:
+          type: string
+          maxLength: 100
+          description: Stock-keeping unit for this article.
+          example: ING-FLOUR-001
+        name_th:
+          type: string
+          maxLength: 255
+          description: Thai name of the article.
+          example: แป้งเปียก
+        name_en:
+          type: string
+          maxLength: 255
+          nullable: true
+          description: English name. Optional.
+        unit:
+          type: string
+          maxLength: 50
+          description: |
+            **Free-text unit of measure**, e.g. `kg`, `g`, `ml`, `pcs`.
+
+            ⚠️ This is a plain string in the current data model, which cannot
+            prevent a recipe from mixing `kg` with `g`. A `unit_of_measure_id`
+            foreign key is the durable fix and is **proposed, not approved**
+            (see D-UNIT). Until then the server must validate unit consistency
+            on write; the client must not attempt to convert between units.
+          example: kg
+        track_stock:
+          type: boolean
+          description: |
+            Whether a `StockBalance` is maintained for this item. `false` for
+            items that are never counted, e.g. a garnish.
+        is_raw:
+          type: boolean
+          description: |
+            `true` for a raw ingredient consumed via a recipe; `false` for a
+            finished good sold directly.
+        version:
+          $ref: '#/components/schemas/Version'
+        created_at:
+          type: string
+          format: date-time
+          description: RFC 3339, UTC.
+        updated_at:
+          type: string
+          format: date-time
+          description: RFC 3339, UTC. Doubles as the sync cursor for this row.
+      additionalProperties: false
+
+    StockBalance:
+      type: object
+      description: |
+        The derived quantity of one inventory item on hand at one branch.
+
+        **Derived, never written by a client.** It is computed server-side from
+        the `StockMovement` ledger. Stock is a ledger of movements rather than
+        an overwritten number, precisely so that history survives and offline
+        writes can be reconciled (`ARCHITECTURE-DEMO.md` §9).
+      required:
+        - id
+        - inventory_item_id
+        - branch_id
+        - on_hand
+        - reserved
+        - version
+        - updated_at
+      properties:
+        id:
+          $ref: '#/components/schemas/UuidV7'
+        inventory_item_id:
+          $ref: '#/components/schemas/UuidV7'
+        branch_id:
+          $ref: '#/components/schemas/UuidV7'
+        on_hand:
+          allOf: [$ref: '#/components/schemas/Quantity']
+          description: |
+            **QUANTITY — exact decimal string, 3 dp.** Quantity physically on
+            hand. May be negative if an offline terminal oversold before
+            reconciling.
+        reserved:
+          allOf: [$ref: '#/components/schemas/Quantity']
+          description: |
+            **QUANTITY — exact decimal string, 3 dp.** Quantity committed to
+            open orders but not yet deducted. Available-to-sell is
+            `on_hand - reserved`.
+        last_movement_id:
+          allOf: [$ref: '#/components/schemas/UuidV7']
+          nullable: true
+          description: The `StockMovement` that produced this balance. Lets a client verify the derivation.
+        version:
+          $ref: '#/components/schemas/Version'
+        created_at:
+          type: string
+          format: date-time
+          description: RFC 3339, UTC.
+        updated_at:
+          type: string
+          format: date-time
+          description: RFC 3339, UTC. Doubles as the sync cursor for this row.
+      additionalProperties: false
+
+    # ── Envelopes ───────────────────────────────────────────────────────────
+
+    CatalogResponse:
+      type: object
+      description: |
+        A catalog snapshot plus the cursor needed to ask for the next delta.
+      required:
+        - branch_id
+        - categories
+        - products
+        - variants
+        - price_list_entries
+        - cursor
+        - pulled_at
+      properties:
+        branch_id:
+          $ref: '#/components/schemas/UuidV7'
+        categories:
+          type: array
+          items:
+            $ref: '#/components/schemas/Category'
+        products:
+          type: array
+          items:
+            $ref: '#/components/schemas/Product'
+        variants:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProductVariant'
+        price_list_entries:
+          type: array
+          items:
+            $ref: '#/components/schemas/PriceListEntry'
+        cursor:
+          type: string
+          description: |
+            **Sync cursor.** Pass back as `since` to receive only what changed
+            after this snapshot. Equal to the `pulled_at` of this response.
+          example: '2026-10-02T09:15:00Z'
+        pulled_at:
+          type: string
+          format: date-time
+          description: Server time this snapshot was taken, RFC 3339 UTC.
+        next_cursor:
+          type: string
+          nullable: true
+          description: Pagination cursor when the response is partial. `null` when complete.
+      additionalProperties: false
+
+    InventoryBalancesResponse:
+      type: object
+      description: Current stock balances plus the cursor for the next delta.
+      required:
+        - branch_id
+        - balances
+        - cursor
+        - pulled_at
+      properties:
+        branch_id:
+          $ref: '#/components/schemas/UuidV7'
+        balances:
+          type: array
+          items:
+            $ref: '#/components/schemas/StockBalance'
+        cursor:
+          type: string
+          description: Sync cursor. Pass back as `since` for an incremental pull.
+          example: '2026-10-02T09:15:00Z'
+        pulled_at:
+          type: string
+          format: date-time
+          description: Server time this snapshot was taken, RFC 3339 UTC.
+        next_cursor:
+          type: string
+          nullable: true
+          description: Pagination cursor when the response is partial. `null` when complete.
+      additionalProperties: false
+
+    Error:
+      type: object
+      description: |
+        Error envelope. `code` is a stable machine-readable string for
+        branching; `message` is for humans and must not be parsed.
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: Stable machine-readable error code.
+          example: branch_not_accessible
+        message:
+          type: string
+          description: Human-readable explanation. Not for programmatic use.
+          example: This device is not registered to branch 018f3c2a-7b41-7c3d-9e10-5a2b8c4d6e01.
+        details:
+          type: object
+          nullable: true
+          additionalProperties: true
+          description: Optional structured context.
+      additionalProperties: false

@@ -1,0 +1,80 @@
+# Cafe POS — local infrastructure
+#
+# ⚠️ ISOLATION CONTRACT (read before editing)
+#
+# This stack is deliberately kept SEPARATE from the sibling project
+# `pos-walasri`, which owns the containerd namespace `default`.
+# This project owns the namespace `walasri`.
+#
+#   Every command must therefore be:
+#       sudo nerdctl -n walasri compose ...
+#
+#   (see ./dev/DEV-SETUP.md for the `wasri` wrapper alias)
+#
+# Three layers keep them from ever colliding:
+#   1. containerd namespace   walasri        vs  default
+#   2. container names        wasri-*        vs  pos-*
+#   3. host ports / DB names  5433/6380      vs  5432/6379
+#
+# Services below are the ones this project actually specifies
+# (SKILL.md §1: "Modular Monolith on PostgreSQL + Redis").
+# Qdrant is intentionally NOT included — it belongs to pos-walasri.
+# Add it later on a free port (6335) if vector search is ever required.
+
+services:
+  # =========================================================================
+  # 1. PostgreSQL 16 — authoritative server store
+  #    Money is integer satang (int64 / bigint). NEVER float, no numeric.
+  # =========================================================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: wasri-postgres
+    restart: always
+    environment:
+      POSTGRES_DB: walasri_db
+      POSTGRES_USER: wasri_user
+      POSTGRES_PASSWORD: walasri_local_dev_pw
+      # Deterministic collation so ORDER BY does not vary between hosts.
+      POSTGRES_INITDB_ARGS: "--locale=C --encoding=UTF8"
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wasri_user -d walasri_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - walasri_network
+
+  # =========================================================================
+  # 2. Redis 7 — L2 cache, rate limiting, idempotency fast path
+  #    Optional per ARCHITECTURE-DEMO.md §8; PostgreSQL stays the truth.
+  # =========================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: wasri-redis
+    restart: always
+    command: redis-server --save 60 1 --loglevel notice --requirepass walasri_redis_pw
+    ports:
+      - "6380:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "walasri_redis_pw", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - walasri_network
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+
+networks:
+  walasri_network:
+    driver: bridge
