@@ -30,16 +30,23 @@ use rusqlite::Connection;
 /// a renamed file cannot silently reorder the schema. Embedded with
 /// `include_str!`, so the bytes are compiled into the binary — a terminal in
 /// airplane mode on a machine with no source tree can still create its database.
-pub const MIGRATIONS: &[(i64, &str, &str)] = &[(
-  1,
-  "init — local_orders, local_order_lines, sync_outbox",
-  include_str!("../migrations/0001_init.sql"),
-)];
+pub const MIGRATIONS: &[(i64, &str, &str)] = &[
+  (
+    1,
+    "init — local_orders, local_order_lines, sync_outbox",
+    include_str!("../migrations/0001_init.sql"),
+  ),
+  (
+    2,
+    "signed rounding — allow a negative rounding_adjustment_satang",
+    include_str!("../migrations/0002_signed_rounding.sql"),
+  ),
+];
 
 /// The highest migration this build knows about. Used to refuse a database
 /// written by a NEWER terminal, which is a downgrade the current code cannot
 /// reason about.
-pub const LATEST_VERSION: i64 = 1;
+pub const LATEST_VERSION: i64 = 2;
 
 /// Read the schema version recorded in the database header.
 pub fn current_version(conn: &Connection) -> Result<i64, rusqlite::Error> {

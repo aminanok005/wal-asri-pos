@@ -349,19 +349,42 @@ cash drawer opens and a receipt prints with no network and no Go backend.
 | Gate | Layer | Proves |
 |---|---|---|
 | **A** | TypeScript unit | `receiptLayout` turns a cart + `TaxSplit` into a neutral IR (JSON). Asserts shop name, receipt number, the ฿45.50 total and the VAT line are all present and correct. |
-| **B** | Rust `cargo test` | The IR compiles to the exact ESC/POS byte stream: `1B 40` (init), `1B 69` (cut), `10 14 01 00 05` (cash drawer kick). |
+| **B** | Rust `cargo test` | The IR compiles to the exact ESC/POS byte stream: `1B 40` (init), `1B 74 14` (Thai code page), `1D 56 42 00` (full cut), `1B 70 00 19 FA` (cash drawer kick). Plus Thai byte-offset assertions — see below. |
 | **C** | Monorepo guard | `layers.test.ts` forbids any printer library or native API inside `domain/`. |
 
-### Thai text is DOUBLE-WIDTH — Gate B must test bytes, not characters
+### Thai is ONE byte per character — Gate B must test bytes, not characters
 
-Thai is two bytes per glyph in CP874/CP256, but ESC/POS column arithmetic counts
-**bytes**. A layout computed against character counts mis-cuts every Thai product
-name, and the receipt is visibly torn on real paper in a way no type check
-catches. A test that only asserts `1B 40` is present passes while every Thai
-receipt prints wrong.
+**Corrected 2026-10-10.** This section previously claimed "Thai is two bytes per
+glyph in CP874/CP256" and specified a Gate B test asserting that a 10-glyph Thai
+name occupies 20 bytes. That was wrong. `windows-874` is a **single-byte** code
+page: every character — Thai consonant, vowel, tone mark, `฿`, or ASCII — is
+exactly one byte. `src/thai_coverage.rs` proves it, including that Thai digits
+๐–๙ (U+0E50–U+0E59) map to `F0`–`F9`, one byte each.
 
-So Gate B must assert the **compiled byte stream**: a 10-glyph Thai name occupies
-**20 bytes**, and column offsets are computed in bytes.
+The claim mattered beyond pedantry. A layout assuming two bytes per Thai glyph
+would pad receipt lines at half the necessary width, pushing totals off the
+right edge of an 80mm roll — receipts visibly torn in a way no type check
+catches. With one byte per character, column arithmetic becomes **exact**: the
+encoded byte length of a string *is* its width in printer character cells, so
+`padding = 48 − width` is simply correct.
+
+So Gate B asserts the compiled byte stream with the corrected rule: a 10-glyph
+Thai name occupies **10 bytes**, and column offsets are computed in bytes.
+
+**What the byte compiler does not do:** it does not visually stack Thai marks
+over their consonants. In Unicode a vowel is stored *after* its consonant
+(`เกาะ` = เ ก า ะ, four code points); CP874 has no combining mechanism, so each
+mark occupies its own cell and the printer's built-in font table decides how it
+renders. Gate B therefore asserts that all code points survive **in order, one
+byte each** — not a stacking behaviour that lives in the printer's ROM.
+
+| Term | Bytes | Printer columns |
+|---|---|---|
+| `ก` consonant | 1 | 1 |
+| `้` tone mark (U+0E49) | 1 | 1 |
+| `๙` Thai digit nine | 1 (`F9`) | 1 |
+| `สิทธิ์` (6 code points) | 6 | 6 |
+| `฿` baht sign | 1 (`DF`) | 1 |
 
 ### Layer rules for `receiptLayout`
 

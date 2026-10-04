@@ -1,14 +1,19 @@
 # HANDOVER — GreenTable POS terminal
 
 > **For whoever picks this up next.** Written 2026-10-02 at the end of the
-> offline-native foundation. Read this before reading the code: it records what
-> is *decided*, what is *proven*, and — more usefully — what is **not finished**.
+> offline-native foundation; **updated 2026-10-04** after Phase 2A and Phase 2B
+> (ESC/POS byte compiler, CP874 encoding, LAN transport, cash rounding). Read
+> this before reading the code: it records what is *decided*, what is *proven*,
+> and — more usefully — what is **not finished**.
 >
 > Verify the state yourself before trusting it:
 > ```bash
-> bun run verify   # expect 309 pass / 0 fail
-> cd apps/pos-desktop/src-tauri && cargo test --locked   # expect 36 pass / 0 fail
+> bun run verify   # expect 390 pass / 0 fail, then the Rust suite below
+> cd apps/pos-desktop/src-tauri && cargo test --locked   # expect 87 pass / 0 fail
 > ```
+> `bun run verify` now chains the Rust suite (via `test:rust`), so the first
+> command covers both sides. The `cargo` invocation is still worth running on its
+> own when you want the per-test names.
 
 ---
 
@@ -19,10 +24,12 @@ Three surfaces, all green as of the commit that introduced this file.
 | Layer | State | Tests |
 |---|---|---|
 | Domain (`Money`, `cart`, `tax`, `lineId`, `catalog`) | Complete | `bun test` |
-| Storage (`0001_init.sql`) | Complete, enforced | `migrations.test.ts` |
+| Domain (`cashRounding`) | Complete — cash rounding, signed adjustment | `cashRounding.test.ts` |
+| Storage (`0001` + `0002`) | Complete, enforced | `migrations.test.ts` |
 | Native crate (SQLCipher, offline checkout) | Complete | `cargo test` |
-| UI (`CartView`, `SalesTerminalView`, `AppShell`) | Present, **not yet connected to the database** | component tests |
-| ESC/POS printing | **Not started** | — |
+| Native crate (CP874, ESC/POS compiler, TCP transport) | Complete, **no hardware tested** | `cargo test` |
+| UI (`CartView`, `SalesTerminalView`, `AppShell`) | Connected to the database | component tests |
+| ESC/POS printing | Byte compiler + TCP adapter done; **never run against a real printer** | `cargo test` |
 | Go backend + sync | **Blocked** | — |
 
 **The single most important fact:** the POS sells offline. Checkout, the receipt
@@ -82,29 +89,42 @@ one shared allowlist, so a new module cannot quietly reach for `escpos`,
 
 ---
 
-## 4. Phase 2A — Native bridge (the next real work)
+## 4. Phase 2A — Native bridge ✅ DONE
 
-**Rust side is essentially done.** `save_offline_order` and `list_recent_orders`
-exist, are registered in `lib.rs`, and are tested. Do not rewrite them.
+**Do not rewrite any of this.** `@tauri-apps/api` is installed and pinned to
+2.12.1 to match the Rust Tauri, `tauriOfflineOrders.ts` implements the
+`OfflineOrdersRepository` port, the infrastructure boundary guards are in place,
+and `SalesTerminalView` has the checkout button, the VAT breakdown and
+commit-then-clear behaviour. All satang cross `invoke` as decimal strings and
+become `Money(bigint)` at the infrastructure edge.
 
-What is missing is the **TypeScript ↔ Rust wire**:
+## 4b. Phase 2B — Printer and cash rounding ⚠️ BUILT, NOT PROVEN ON HARDWARE
 
-1. **Install `@tauri-apps/api`** — not currently a dependency.
-2. **Write a Tauri adapter** implementing the `OfflineOrdersRepository` port in
-   `application/offlineOrders.ts` (that port exists; only the in-memory adapter
-   does).
-3. ⚠️ **`i64` crosses as a STRING, never a number.** The Rust structs already
-   serialise money as `String` and `parse_satang` rejects anything non-numeric —
-   this is deliberate. A JS `number` silently loses precision above 2^53, and
-   satang values are `i64` on the wire. `Money.fromSatang` expects `bigint`, so
-   the adapter must go `string → bigint` at the boundary.
-4. **Keep the in-memory adapter** as a test double — the UI tests must keep
-   running without a Tauri runtime.
-5. **Add the checkout button** to `SalesTerminalView`, and surface the order
-   summary on screen: gross `4550` / net `4252` / tax `298`.
+Both halves are unit-tested and green, and neither has touched real equipment.
 
-The highest-risk part is (3). It is where an `i64` becomes a `number` by
-accident, and the failure is silent until a large order lands.
+**Byte compiler** — `src-tauri/src/{cp874,escpos}.rs`.
+`escpos::compile(ReceiptIr) -> Vec<u8>`, transport-independent.
+⚠️ Two corrections to earlier documentation are recorded in the module headers:
+Thai is **one** byte per character (not two), and the byte compiler does **not**
+visually stack Thai marks — CP874 has no combining mechanism, so that is the
+printer's font table. `ESC t 20` is also unverified against Epson's manual; it
+lives in one constant (`cp874::THAI_CODE_PAGE_SELECT`) so changing it is a
+one-line edit with the tests watching.
+
+**Transport** — `src-tauri/src/{printer_port,printer_commands}.rs`. TCP to a LAN
+printer, behind a `PrinterTransport` trait, wrapped in `spawn_blocking` so a
+dead IP cannot freeze the UI thread. Tested against a real loopback socket, so
+the socket path is genuinely exercised. ⚠️ **`bytes_sent` is not proof that paper
+moved** — ESC/POS has no acknowledgement.
+
+**Cash rounding** — `sales/domain/cashRounding.ts`, plus migration
+`0002_signed_rounding.sql`. Round-to-nearest, bigint only, zero adjustment for
+QR/PromptPay. Migration 0002 is a **full table rebuild** (SQLite cannot ALTER a
+CHECK) and had to repair `local_order_lines`' foreign key afterwards; the
+reasoning is in that file and the tests in `migrations.test.ts` §8–§9.
+
+**Still outstanding:** a physical printer smoke test, and the `ESC t` value
+confirmed against the actual printer model.
 
 ---
 
@@ -116,19 +136,25 @@ Nothing exists yet. Blueprint in `docs/02-design/DOMAIN.md`
 Three test gates: **A** TypeScript layout → neutral IR · **B** Rust IR → byte
 stream · **C** layer guard (already installed).
 
-⚠️ **The trap: Thai is DOUBLE-WIDTH.** Two bytes per glyph in CP874/CP256, but
-ESC/POS column arithmetic counts **bytes**. A layout computed against character
-counts mis-cuts every Thai product name, and the receipt looks torn on paper in a
-way no type check catches. Gate B must assert the **compiled byte stream** — a
-10-glyph Thai name is 20 bytes — not merely that `1B 40` is present. A test that
-only checks control codes passes while every Thai receipt prints wrong.
+⚠️ **The trap, CORRECTED 2026-10-04: Thai is ONE byte per character, not two.**
+This file previously said "Thai is DOUBLE-WIDTH — two bytes per glyph in
+CP874/CP256" and asked Gate B to assert that a 10-glyph Thai name is 20 bytes.
+**That was wrong**, and it was wrong in the expensive direction: `windows-874` is
+a single-byte code page, so a layout assuming two bytes per glyph pads receipt
+lines at half the necessary width and pushes totals off the right edge of an
+80mm roll. `thai_coverage.rs` proves it, including that ๐–๙ (U+0E50–U+0E59) map to
+`F0`–`F9`, one byte each. With one byte per character, column arithmetic is
+exact rather than approximate — the encoded byte length *is* the cell count.
 
-Also undecided: CP874 is not in the Rust standard library, so this needs either
-a crate (`encoding_rs` exposes `windows-874`) or a hand-written table. That is a
-real decision, not an implementation detail.
+The general lesson still stands and is still worth Gate B's attention: assert the
+**compiled byte stream**, not just that `1B 40` is present. A test that only
+checks control codes passes while every Thai receipt prints wrong.
 
-Byte-level control codes agreed: `1B 40` init · `1B 69` cut ·
-`10 14 01 00 05` drawer kick.
+`encoding_rs` was the decision, over a hand-written table — see the reasoning at
+the top of `Cargo.toml`.
+
+Control codes actually shipped: `1B 40` init · `1B 74 14` Thai code page ·
+`1D 56 42 00` full cut · `1B 70 00 19 FA` drawer kick.
 
 ---
 
@@ -156,7 +182,7 @@ caught; this section exists so nobody re-derives them.
 |---|---|---|
 | **A half-satang tie is unreachable at 7%** | A rounding test scanned for one, found none, and passed silently behind `if (tie !== null)`. At 700 bp the congruence `gross×10000 ≡ 5350 (mod 10700)` has no solution, because `gcd(10000,10700)=100` does not divide `5350`. | Real fixtures at 2000 bp (gcd 2000 \| 6000): gross 9 → exactly 7.5 → net 8. |
 | **Guards that match prose** | A boundary guard flagged its own doc comment for mentioning `setItems`. | `stripComments()` runs before every source scan. |
-| **`line_tax = 0` caught stale fixtures** | Enforcing per-order rounding immediately failed 4 Rust tests still carrying the old exclusive numbers. That was the CHECK working. | 36 Rust tests. |
+| **`line_tax = 0` caught stale fixtures** | Enforcing per-order rounding immediately failed 4 Rust tests still carrying the old exclusive numbers. That was the CHECK working. | 36 Rust tests (the suite has since grown). |
 | **`Money.fromSatang` rejects numbers** | Passing a `number` where `bigint` was expected. | Runtime throw — satang never pass through a JS number. |
 | **`Bun.Glob.scan` needs a string `cwd`** | Passing a `URL` throws `invalid cwd, not a string`. | `fileURLToPath()` in `layers.test.ts`. |
 | **Only Rust's own tests prove the Rust** | `migrations.test.ts` proves the CHECKs are right; nothing proved the code satisfying them was right. | CI `rust` job with `--locked`. |
@@ -168,7 +194,7 @@ caught; this section exists so nobody re-derives them.
 | Tool | Version | Why pinned |
 |---|---|---|
 | Bun | `1.3.14` | 1.4 writes `bun.lock` v2; 1.3.x writes v1, the committed format. A newer runner silently loses the workspace graph. |
-| Rust | `1.98.1` | Matches the toolchain the 36 Rust tests were last green on. |
+| Rust | `1.98.1` | Matches the toolchain the 36 Rust tests were last green on (now 87). |
 | cargo / bun | `--locked` / `--frozen-lockfile` | CI must not resolve different dependency versions than were reviewed. |
 
 **Container runtime:** Docker Desktop is installed but its daemon is down. The

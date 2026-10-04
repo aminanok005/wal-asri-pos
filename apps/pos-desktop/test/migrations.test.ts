@@ -21,6 +21,7 @@ import { readFileSync } from 'node:fs';
 import { beforeEach, describe, expect, it } from 'bun:test';
 import { join } from 'node:path';
 import { Money } from '../src/features/payments/domain/money';
+import { applyCashRounding } from '../src/features/sales/domain/cashRounding';
 import {
   DEFAULT_VAT_RATE_BP,
   splitInclusive,
@@ -36,10 +37,33 @@ import {
  * inside the package (`bun test test`) — a CWD-relative path would break one of
  * the two.
  */
-const MIGRATION_PATH = join(import.meta.dir, '..', 'src-tauri', 'migrations', '0001_init.sql');
+/**
+ * Resolve the migrations directory from THIS file's own directory.
+ *
+ * The test lives in `apps/pos-desktop/test/` and the SQL lives in
+ * `apps/pos-desktop/src-tauri/migrations/`, so the path is resolved relative to
+ * `import.meta.dir` rather than the process CWD. That keeps the suite runnable
+ * both from the monorepo root (`bun test apps/pos-desktop/test`) and from
+ * inside the package (`bun test test`) — a CWD-relative path would break one of
+ * the two.
+ */
+const MIGRATIONS_DIR = join(import.meta.dir, '..', 'src-tauri', 'migrations');
 
-/** The shipped migration SQL, read once and executed into every test database. */
-const MIGRATION_SQL = readFileSync(MIGRATION_PATH, 'utf8');
+/**
+ * Every shipped migration, in version order, concatenated.
+ *
+ * Read as a LIST rather than globbed, deliberately: the test suite must apply
+ * the same ordered sequence `src/migrate.rs` applies, and a silent glob would
+ * let a migration file be added without any test noticing it is unexercised.
+ *
+ * `0002_signed_rounding.sql` is a full table REBUILD — SQLite cannot ALTER a
+ * CHECK constraint — so a database tested without it would still reject a
+ * negative cash-rounding adjustment that production now accepts, and every
+ * signed-rounding test below would fail for the wrong reason.
+ */
+const MIGRATION_SQL: string = ['0001_init.sql', '0002_signed_rounding.sql']
+  .map((file) => readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
+  .join('\n');
 
 /**
  * A fresh, empty in-memory database with migration 0001 applied.
@@ -261,7 +285,29 @@ describe('0001_init.sql — schema objects', () => {
   it('records the migration version so the Rust side can detect drift', () => {
     const row = db.prepare('PRAGMA user_version').get() as { user_version: number } | null;
 
-    expect(row?.user_version).toBe(1);
+    // 2, not 1: the suite applies BOTH shipped migrations (see MIGRATION_SQL).
+    // This must stay in step with `LATEST_VERSION` in `src/migrate.rs` — if it
+    // drifts, `src/migrate.rs`'s refusal to open a database from a NEWER
+    // terminal starts firing on this build's own database.
+    expect(row?.user_version).toBe(2);
+  });
+
+  it('agrees with LATEST_VERSION in the Rust migration runner', () => {
+    // The SQL files and the Rust constant are two records of the same fact.
+    // Nothing in the type system ties them together, so this is the only place
+    // that notices when a migration file is added and `LATEST_VERSION` is not
+    // bumped — which would leave that migration silently unapplied in
+    // production while the tests here still pass.
+    const migrateRs = readFileSync(
+      join(import.meta.dir, '..', 'src-tauri', 'src', 'migrate.rs'),
+      'utf8',
+    );
+
+    const latest = migrateRs.match(/LATEST_VERSION: i64 = (\d+)/);
+    expect(latest, 'LATEST_VERSION must be declared in src-tauri/src/migrate.rs').not.toBeNull();
+
+    const row = db.prepare('PRAGMA user_version').get() as { user_version: number };
+    expect(row.user_version).toBe(Number(latest![1]));
   });
 });
 
@@ -977,6 +1023,429 @@ describe('0001_init.sql — committed money is append-only', () => {
     // (9100 = 4550 * 2 - 0 + 0) with quantity moved 1 -> 2.
     expect(() =>
       db.prepare('UPDATE local_order_lines SET quantity = 2, line_total_satang = 9100').run(),
+    ).toThrow();
+  });
+});
+
+/**
+ * 8. Migration 0002 — a cash rounding adjustment may be NEGATIVE.
+ *
+ * Round-to-nearest moves in both directions: ฿45.63 rounds up to ฿45.75 and
+ * ฿45.52 rounds down to ฿45.50. `0001_init.sql` constrained
+ * `rounding_adjustment_satang >= 0`, so any total that rounded DOWN could not be
+ * committed at all — the sale was neither recorded nor printed.
+ *
+ * These tests exist because that failure was invisible to the domain suite.
+ * `cashRounding.test.ts` proved the arithmetic correct, the UI showed a correct
+ * total, and the database rejected the row at COMMIT.
+ */
+describe('0002_signed_rounding.sql — a negative rounding adjustment commits', () => {
+  /**
+   * The worked example from the migration header, and the case the brief named:
+   *
+   *   subtotal ฿45.32 (4532), discount 0, service 0, rounding −7
+   *     total    = 4532 - 0 + 0 + (-7) = 4525        ฿45.25
+   *     tax      = 4532 - round_half_up(4532 * 10000 / 10700) = 296
+   *     taxable  = 4532 - 296 = 4236
+   *     4236 + 296 = 4532 = 4525 - 0 - (-7)                        ✓
+   *
+   * 4525 is also genuinely payable: 4525 = 181 × 25, an exact multiple of the
+   * 25-satang coin, which is the entire reason the rounding was applied.
+   */
+  const roundedDown = {
+    id: '0190f3a0-0000-7000-8000-0000000000c1',
+    idempotency_key: 'idem-order-rounded-down',
+    local_receipt_number: 'R-0002',
+    subtotal_satang: 4532,
+    discount_satang: 0,
+    taxable_satang: 4236,
+    tax_satang: 296,
+    service_charge_satang: 0,
+    rounding_adjustment_satang: -7,
+    total_satang: 4525,
+  } as const;
+
+  it('commits an order whose total rounded DOWN, with adjustment −7', () => {
+    expect(() => insertOrder({ ...roundedDown })).not.toThrow();
+
+    const row = db
+      .prepare(
+        'SELECT subtotal_satang, rounding_adjustment_satang, total_satang, taxable_satang, tax_satang FROM local_orders WHERE idempotency_key = ?',
+      )
+      .get('idem-order-rounded-down') as Record<string, number>;
+
+    expect(row.subtotal_satang).toBe(4532);
+    expect(row.rounding_adjustment_satang).toBe(-7);
+    expect(row.total_satang).toBe(4525);
+  });
+
+  it('stores the negative adjustment as a genuine INTEGER, not a coerced value', () => {
+    insertOrder({ ...roundedDown });
+
+    // The `typeof = 'integer'` guard was KEPT when the `>= 0` guard was removed.
+    // A REAL here would defeat every arithmetic identity in the table.
+    expect(typeofColumn('local_orders', 'id', roundedDown.id, 'rounding_adjustment_satang')).toBe(
+      'integer',
+    );
+  });
+
+  it('satisfies both arithmetic identities with a negative adjustment', () => {
+    insertOrder({ ...roundedDown });
+
+    const row = db
+      .prepare(
+        'SELECT total_satang, subtotal_satang - discount_satang + service_charge_satang + rounding_adjustment_satang AS charged, taxable_satang + tax_satang AS parts, total_satang - service_charge_satang - rounding_adjustment_satang AS parts_should_be FROM local_orders WHERE idempotency_key = ?',
+      )
+      .get('idem-order-rounded-down') as Record<string, number>;
+
+    // total = subtotal - discount + service + rounding   (4525)
+    expect(row.charged).toBe(row.total_satang);
+    // taxable + tax = total - service - rounding         (4532)
+    expect(row.parts).toBe(row.parts_should_be);
+
+    // These are DIFFERENT quantities and must not be compared to each other:
+    // `parts` is the VAT-inclusive gross before rounding, `charged` is what the
+    // customer pays. An earlier draft of this test asserted they were equal,
+    // which is false by exactly the rounding adjustment.
+  });
+
+  it('still refuses a rounding adjustment that is not an integer', () => {
+    // Removing `>= 0` must not have removed the storage-class guard. A REAL
+    // would mean ฿45.25 stored as 45.25 while everything else is satang.
+    expect(() =>
+      insertOrder({
+        id: '0190f3a0-0000-7000-8000-0000000000c2',
+        idempotency_key: 'idem-float-rounding',
+        subtotal_satang: 4532,
+        taxable_satang: 4236,
+        tax_satang: 296,
+        rounding_adjustment_satang: -7.5,
+        total_satang: 4525,
+      }),
+    ).toThrow();
+  });
+
+  it('still refuses a total that contradicts the negative adjustment', () => {
+    // The sign of rounding_adjustment_satang is now free, but the identity that
+    // uses it is not: a total that ignores the adjustment must be rejected, or
+    // the cashier could be charged ฿45.32 on a ฿45.25 receipt.
+    expect(() =>
+      insertOrder({
+        ...roundedDown,
+        id: '0190f3a0-0000-7000-8000-0000000000c3',
+        idempotency_key: 'idem-wrong-total',
+        total_satang: 4532,
+      }),
+    ).toThrow();
+  });
+
+  it('refuses a negative total even though a negative rounding is allowed', () => {
+    // The relaxation is scoped to the ADJUSTMENT, not to the amount charged.
+    // A negative total_satang is a refund, which is modelled as a void.
+    expect(() =>
+      insertOrder({
+        ...roundedDown,
+        id: '0190f3a0-0000-7000-8000-0000000000c4',
+        idempotency_key: 'idem-negative-total',
+        rounding_adjustment_satang: -4600,
+        total_satang: -68,
+      }),
+    ).toThrow();
+  });
+
+  it('accepts a positive adjustment unchanged, so 0001 behaviour is preserved', () => {
+    // ฿45.63 rounds UP to ฿45.75, an adjustment of +12.
+    const { gross, net, tax } = splitInclusive(Money.fromSatang(4563n), DEFAULT_VAT_RATE_BP);
+
+    expect(() =>
+      insertOrder({
+        id: '0190f3a0-0000-7000-8000-0000000000c5',
+        idempotency_key: 'idem-order-rounded-up',
+        subtotal_satang: gross.satang,
+        taxable_satang: net.satang,
+        tax_satang: tax.satang,
+        rounding_adjustment_satang: 12,
+        total_satang: 4575,
+      }),
+    ).not.toThrow();
+  });
+
+  it('accepts zero, which was and remains the ordinary case', () => {
+    expect(() => insertOrder()).not.toThrow();
+  });
+
+  it('accepts a negative adjustment produced by the real domain function', () => {
+    // The end-to-end guarantee that matters: whatever
+    // `sales/domain/cashRounding.ts` computes must be storable. This is the
+    // cross-layer test that would have caught the original bug at the moment it
+    // was introduced rather than at a customer's till.
+    const adjustments = [-12n, -7n, -2n, -1n, 0n, 1n, 12n, 13n];
+
+    for (const adjustment of adjustments) {
+      const subtotal = 4550n;
+      const payable = subtotal + adjustment;
+      const { gross, net, tax } = splitInclusive(Money.fromSatang(subtotal), DEFAULT_VAT_RATE_BP);
+
+      expect(() =>
+        insertOrder({
+          id: `round-domain-${adjustment}`,
+          idempotency_key: `round-domain-${adjustment}`,
+          subtotal_satang: gross.satang,
+          taxable_satang: net.satang,
+          tax_satang: tax.satang,
+          rounding_adjustment_satang: adjustment,
+          total_satang: payable,
+        }),
+      ).not.toThrow();
+    }
+  });
+
+  it('accepts every rounding the domain can produce across a sweep of totals', () => {
+    // The property test: for a band of totals, every adjustment the domain
+    // produces at the 25-satang step must commit. A single unrepresentable
+    // amount in the middle of the range is a sale that cannot be rung up.
+    for (let total = 4400n; total < 4700n; total += 3n) {
+      const rounding = applyCashRounding(total, 'cash', 25n);
+      const { gross, net, tax } = splitInclusive(Money.fromSatang(total), DEFAULT_VAT_RATE_BP);
+
+      expect(() =>
+        insertOrder({
+          id: `sweep-${total}`,
+          idempotency_key: `sweep-${total}`,
+          subtotal_satang: gross.satang,
+          taxable_satang: net.satang,
+          tax_satang: tax.satang,
+          rounding_adjustment_satang: rounding.adjustment,
+          total_satang: rounding.payable,
+        }),
+      ).not.toThrow();
+    }
+  });
+
+  it('leaves rounding_adjustment_satang immutable after commit, negative or not', () => {
+    insertOrder({ ...roundedDown });
+
+    // The money-immutability trigger must have been recreated by the rebuild —
+    // a `DROP TABLE` takes every trigger with it, and a POS missing this one
+    // would let a committed sale be restated in place.
+    expect(() =>
+      db
+        .prepare('UPDATE local_orders SET rounding_adjustment_satang = 0 WHERE idempotency_key = ?')
+        .run('idem-order-rounded-down'),
+    ).toThrow();
+  });
+
+  it('keeps the append-only and DELETE protections after the rebuild', () => {
+    insertOrder({ ...roundedDown });
+
+    expect(() => db.prepare('DELETE FROM local_orders WHERE idempotency_key = ?').run(
+      'idem-order-rounded-down',
+    )).toThrow();
+  });
+
+  it('preserves rows that already existed before the rebuild', () => {
+    // Migration 0002 is a table REBUILD: create, copy, drop, rename. If the
+    // INSERT...SELECT omitted a column, or the copy ran in the wrong order, a
+    // terminal upgrading mid-shift would silently lose committed sales.
+    // This is simulated by seeding 0001-only, then applying 0002.
+    const legacy = new Database(':memory:');
+    legacy.exec('PRAGMA foreign_keys = ON;');
+    legacy.exec(readFileSync(join(MIGRATIONS_DIR, '0001_init.sql'), 'utf8'));
+
+    legacy
+      .prepare(
+        'INSERT INTO local_orders (id,branch_id,terminal_id,staff_user_id,type,status,source,currency,vat_rate_bp,subtotal_satang,discount_satang,taxable_satang,tax_satang,service_charge_satang,rounding_adjustment_satang,total_satang,idempotency_key,local_receipt_number,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+      )
+      .run(
+        'pre-0002-order', 'branch-siam', 'terminal-01', 'staff-01', 'dine_in', 'completed',
+        'pos_desktop', 'THB', 700, 4550, 0, 4252, 298, 0, 0, 4550, 'idem-pre-0002', 'R-0001',
+        '2026-10-01T09:00:00.000Z',
+      );
+
+    // And a line, so the ON DELETE RESTRICT foreign key is genuinely exercised
+    // by the DROP TABLE inside the rebuild.
+    legacy
+      .prepare(
+        'INSERT INTO local_order_lines (id,order_id,variant_id,product_id,sku,name_th,name_en,quantity,unit_price_satang,line_discount_satang,line_tax_satang,line_total_satang,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
+      )
+      .run(
+        'pre-0002-line', 'pre-0002-order', 'variant-latte-hot', 'product-latte', 'LATTE-HOT',
+        'ลาเต้ร้อน', 'Latte', 1, 4550, 0, 0, 4550, '2026-10-01T09:00:01.000Z',
+      );
+
+    // Wrapped in a transaction because `src/migrate.rs` runs every migration in
+    // one, and the rebuild's PRAGMA behaviour differs outside a transaction
+    // (`PRAGMA legacy_alter_table` in particular is documented as having no
+    // effect inside a transaction). Testing it any other way would not be
+    // testing the thing that ships.
+    legacy.exec('BEGIN;');
+    legacy.exec(readFileSync(join(MIGRATIONS_DIR, '0002_signed_rounding.sql'), 'utf8'));
+    legacy.exec('COMMIT;');
+
+    const order = legacy
+      .prepare('SELECT subtotal_satang, total_satang, status FROM local_orders WHERE id = ?')
+      .get('pre-0002-order') as Record<string, unknown>;
+    expect(order.total_satang).toBe(4550);
+    expect(order.status).toBe('completed');
+
+    const line = legacy
+      .prepare('SELECT line_total_satang FROM local_order_lines WHERE id = ?')
+      .get('pre-0002-line') as Record<string, unknown>;
+    expect(line.line_total_satang).toBe(4550);
+
+    // The rebuilt table must also still accept a negative adjustment.
+    expect(() =>
+      legacy
+        .prepare(
+          'INSERT INTO local_orders (id,branch_id,terminal_id,staff_user_id,type,status,source,currency,vat_rate_bp,subtotal_satang,discount_satang,taxable_satang,tax_satang,service_charge_satang,rounding_adjustment_satang,total_satang,idempotency_key,local_receipt_number,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        )
+        .run(
+          'post-0002-order', 'branch-siam', 'terminal-01', 'staff-01', 'dine_in', 'completed',
+          'pos_desktop', 'THB', 700, 4532, 0, 4236, 296, 0, -7, 4525, 'idem-post-0002', 'R-0002',
+          '2026-10-01T10:00:00.000Z',
+        ),
+    ).not.toThrow();
+
+    legacy.close();
+  });
+
+  it('recreates the indexes the rebuild had to drop', () => {
+    // A `DROP TABLE` takes every index with it. A POS missing these still passes
+    // every correctness test and then runs a full table scan on the till at
+    // end of shift, which is exactly the kind of regression no unit test in the
+    // rest of this file would notice.
+    for (const index of [
+      'idx_local_orders_created_at',
+      'idx_local_orders_status',
+      'idx_local_orders_sync_state',
+    ]) {
+      const row = db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?")
+        .get(index);
+      expect(row, `${index} must exist after the rebuild`).not.toBeNull();
+    }
+  });
+
+  it('recreates both local_orders triggers after the rebuild', () => {
+    for (const trigger of ['local_orders_money_immutable', 'local_orders_no_delete']) {
+      const row = db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'trigger' AND name = ?")
+        .get(trigger);
+      expect(row, `${trigger} must exist after the rebuild`).not.toBeNull();
+    }
+  });
+
+  it('leaves the no longer-used replacement table name behind', () => {
+    // The rebuild creates `local_orders__new` and renames it. If the rename were
+    // skipped, the POS would have two order tables and every query would read
+    // an empty one.
+    const row = db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'local_orders__new'")
+      .get();
+    expect(row).toBeNull();
+  });
+});
+
+/**
+ * 9. The rebuild must leave `local_order_lines` pointing at `local_orders`.
+ *
+ * This is its own section because it is the one defect in migration 0002 that
+ * every correctness test would otherwise miss.
+ *
+ * SQLite 3.25+ rewrites foreign-key references in other tables when a table is
+ * renamed. Renaming `local_orders` to make room for the replacement therefore
+ * SILENTLY REPOINTED every `local_order_lines.order_id` at the temporary table.
+ * The 0002 rebuild repairs this by recreating the child with the correct
+ * `REFERENCES local_orders(id)` clause, but a repair that is merely believed to
+ * work is how this kind of bug ships: with the clause still wrong, every
+ * ORDER still inserted fine and every LINE insert failed — and only because a
+ * test happened to insert a line.
+ */
+describe('0002_signed_rounding.sql — the child foreign key still points at local_orders', () => {
+  it('stores the REFERENCES clause against local_orders, not a temporary name', () => {
+    // Read the clause out of the schema itself. Asserting behaviourally (that a
+    // line inserts) would also pass if the FK had been dropped entirely, which
+    // is the other half of what this migration could plausibly get wrong.
+    const sql = db
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'local_order_lines'")
+      .get() as { sql: string };
+
+    expect(sql.sql).toContain('REFERENCES local_orders(id)');
+    expect(sql.sql).not.toContain('local_orders__old');
+    expect(sql.sql).not.toContain('local_orders__new');
+  });
+
+  it('still enforces ON DELETE RESTRICT against the rebuilt parent', () => {
+    insertOrder();
+    insertLine();
+
+    // If the FK had been silently dropped along with the bad reference, this
+    // delete would SUCCEED and take a sale's line items with it.
+    expect(() =>
+      db
+        .prepare('DELETE FROM local_orders WHERE idempotency_key = ?')
+        .run('idem-order-0001'),
+    ).toThrow();
+  });
+
+  it('still rejects a line whose order does not exist', () => {
+    expect(() =>
+      insertLine({
+        id: '0190f3a0-0000-7000-8000-0000000000f1',
+        order_id: 'no-such-order',
+      }),
+    ).toThrow();
+  });
+
+  it('leaves no __old or __new table behind from either rebuild', () => {
+    const tables = (
+      db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as {
+        name: string;
+      }[]
+    ).map((row) => row.name);
+
+    expect(tables).not.toContain('local_orders__old');
+    expect(tables).not.toContain('local_orders__new');
+    expect(tables).not.toContain('local_order_lines__old');
+    expect(tables).toContain('local_orders');
+    expect(tables).toContain('local_order_lines');
+  });
+
+  it('recreates the line index the child rebuild dropped', () => {
+    const row = db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?")
+      .get('idx_local_order_lines_order_id');
+    expect(row).not.toBeNull();
+  });
+
+  it('recreates both line triggers after the child rebuild', () => {
+    for (const trigger of ['local_order_lines_money_immutable', 'local_order_lines_no_delete']) {
+      const row = db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'trigger' AND name = ?")
+        .get(trigger);
+      expect(row, `${trigger} must exist`).not.toBeNull();
+    }
+  });
+
+  it('still refuses a direct DELETE on local_order_lines', () => {
+    insertOrder();
+    insertLine();
+
+    expect(() =>
+      db
+        .prepare('DELETE FROM local_order_lines WHERE id = ?')
+        .run('0190f3a0-0000-7000-8000-0000000000a1'),
+    ).toThrow();
+  });
+
+  it('still refuses an UPDATE that rewrites a committed line total', () => {
+    insertOrder();
+    insertLine();
+
+    expect(() =>
+      db
+        .prepare('UPDATE local_order_lines SET line_total_satang = 9100 WHERE id = ?')
+        .run('0190f3a0-0000-7000-8000-0000000000a1'),
     ).toThrow();
   });
 });

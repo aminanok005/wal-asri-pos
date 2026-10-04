@@ -49,6 +49,22 @@ pub type AppState = Mutex<Connection>;
 pub mod commands;
 pub mod db;
 pub mod migrate;
+// Strict CP874 encoding, shared by the coverage test and the byte compiler so
+// the two cannot drift — the compiler must never be more permissive than the
+// test that vouched for it. See src/cp874.rs.
+pub mod cp874;
+// ESC/POS byte compiler: ReceiptIr (JSON) -> Vec<u8>. Pure — no socket, no USB,
+// no Tauri. The Thai column arithmetic it relies on is documented in the
+// module header, including the correction to DOMAIN.md's "two bytes per Thai
+// glyph" claim.
+pub mod escpos;
+// LAN printer transport (TCP) and the command that joins it to the compiler.
+pub mod printer_commands;
+pub mod printer_port;
+// Proves the receipt printer's code page can encode the Thai this POS actually
+// uses — especially ๐–๙, which post-date windows-874 and were the likeliest
+// unmappable characters. See the module for why this runs before any receipt.
+pub mod thai_coverage;
 
 /// Entry point for both desktop and mobile (the `#[cfg_attr(mobile, ...)]`
 /// attribute below is what the template emits; on desktop it is a no-op).
@@ -78,6 +94,7 @@ pub fn run() {
     .invoke_handler(tauri::generate_handler![
       commands::save_offline_order,
       commands::list_recent_orders,
+      printer_commands::print_receipt,
     ])
     .run(tauri::generate_context!())
     .expect("error while building tauri application");

@@ -39,6 +39,38 @@ log = "0.4"
 tauri = { version = "=2.12.1" }
 tauri-plugin-log = "2"
 
+# ── Thai receipt encoding (ESC/POS) ───────────────────────────────────────────
+# WHY encoding_rs AND NOT A HAND-WRITTEN CP874 TABLE
+# An ESC/POS thermal printer is a 1980s device: it does not speak UTF-8, it
+# speaks a single-byte code page (CP874 / TIS-620 / Windows-874). Something has
+# to map a Rust `String` onto that byte set, and the two honest options are a
+# battle-tested implementation or a hand-built table.
+#
+# `windows-874` is the WHATWG Encoding Standard's name for the CP874-family
+# code page, and encoding_rs is Mozilla's implementation of that standard — the
+# same tables Firefox uses. A hand-written table is ~90 rows of Thai and Lao
+# codepoints that must be exactly right, including the saras and the stacked
+# vowels; one wrong row prints a garbled product name on a customer's receipt,
+# and nothing fails, because a wrong byte is still a valid byte.
+#
+# THE REASON `without_replacement` IS USED EVERYWHERE
+# `Encoding::encode()` substitutes any unmappable character with an HTML
+# numeric character reference (`&#9749;` — eight literal ASCII bytes) and
+# hands those bytes back in the output. It does set a `had_errors` flag, but it
+# arrives after the mangled bytes are already in the caller's buffer, so every
+# call site becomes a chance to forget to check. On a Thai receipt that turns a
+# legitimate glyph into garbage mid-line-item on the customer's copy. Every
+# encode in receipt printing therefore uses
+# `encode_from_utf8_to_vec_without_replacement()`, which reports
+# `EncoderResult::Unmappable` instead and never emits a replacement byte at all,
+# so the caller REFUSES to print rather than print a lie. The coverage test in
+# src/thai_coverage.rs exists to prove the characters a Thai shop actually uses
+# are all encodable, before any receipt is ever cut.
+#
+# PINNED EXACT, matching serde above: an encoding change must never arrive as a
+# floating upgrade in a build that produces customer receipts.
+encoding_rs = "=0.8.42"
+
 # ── SQLite ────────────────────────────────────────────────────────────────────
 # WHY rusqlite AND NOT tauri-plugin-sql
 # SKILL.md §2.2 requires the three-write checkout (local_orders +

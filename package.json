@@ -18,7 +18,8 @@
     "build": "bun run --filter '*' build",
     "typecheck": "bun run --filter '*' typecheck",
     "test": "bun run --filter '*' test",
-    "verify": "bun run typecheck && bun run test",
+    "verify": "bun run typecheck && bun run test && bun run test:rust",
+    "test:rust": "cd apps/pos-desktop/src-tauri && cargo test --locked",
     "infra:up": "./dev/wasri compose up -d",
     "infra:ps": "./dev/wasri compose ps",
     "infra:down": "./dev/wasri compose down"
