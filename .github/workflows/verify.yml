@@ -89,8 +89,30 @@ jobs:
         # graph than the one that was locked and reviewed.
         run: bun install --frozen-lockfile
 
-      - name: Verify (typecheck then test, all workspaces)
-        run: bun run verify
+      # WHY THIS IS NOT `bun run verify`
+      #
+      # `bun run verify` is the DEVELOPER-facing gate: typecheck, TS tests, the
+      # Rust suite, and (since the Go backend landed) `go test ./...`. On a
+      # developer machine that is exactly right — one command, everything green.
+      #
+      # In CI it is the wrong shape. This job runs on a 15-minute budget with NO
+      # cargo cache, and `bun run verify` would now pull `cargo test --locked`
+      # into it — recompiling the bundled-sqlcipher C amalgamation from scratch
+      # in a second job, on top of the `rust` job that already does it with a
+      # warm cache. That is several minutes of duplicated C compilation and a
+      # real chance of tripping this job's timeout for no added coverage.
+      #
+      # So the gates are split by job and run in parallel instead:
+      #   this job  -> typecheck + TS tests + the production bundle
+      #   rust job  -> cargo check + cargo test  (see below)
+      #   go job    -> go vet + go test
+      #
+      # The invariant that matters — "what `bun run verify` runs locally is what
+      # CI runs" — is maintained by the job list below, not by calling the
+      # aggregate script. If a new gate is added to `verify`, it needs a job here
+      # too, and the `NOTE` at the foot of this file says so.
+      - name: Typecheck and test (all workspaces)
+        run: bun run typecheck && bun run test
 
       # Kept separate from verify so a red run names the step that broke. Build
       # runs after verify, not before: a bundle produced from code that does not
@@ -139,6 +161,16 @@ jobs:
       - name: Install build tools for the bundled SQLCipher
         run: sudo apt-get update && sudo apt-get install -y build-essential
 
+      # Proves the C toolchain is actually USABLE, rather than merely installed.
+      # Without this the first sign of a missing compiler is "linker `cc` not
+      # found" deep inside a rusqlite build, which reads like a broken
+      # dependency rather than the toolchain problem it is. Cheap, and it turns
+      # an opaque failure into a named one.
+      - name: Verify the C toolchain
+        run: |
+          cc --version
+          echo "C compiler target: $(cc -dumpmachine)"
+
       # Caches target/ keyed on the lockfile. The crate's own dependencies are
       # pinned by Cargo.lock; the cache is an optimisation, never the thing that
       # makes the build reproducible.
@@ -160,6 +192,55 @@ jobs:
         working-directory: apps/pos-desktop/src-tauri
         run: cargo test --locked
 
+  # --- The Go backend ---------------------------------------------------------
+  #
+  # Added because `bun run verify` came to include `go test ./...`, and the
+  # `verify` job above no longer runs that aggregate script (see the note on its
+  # test step). Without this job the Go backend would have NO CI coverage at
+  # all: `go test` would pass on a laptop and never run on a pull request.
+  #
+  # Deliberately the smallest job in this file. It exists to keep the Go gate
+  # honest; everything else about that service — Postgres, migrations, the sync
+  # protocol — is separate work with its own tests.
+  go:
+    name: Test the Go backend
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    defaults:
+      run:
+        working-directory: services/api-backend
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # `go-version-file` reads the `go` directive straight out of the module's
+      # own go.mod, so the CI toolchain tracks the module instead of drifting
+      # from a copy-pasted number. `go.mod` here declares `go 1.25`.
+      #
+      # NO `cache-dependency-path`. The module currently has no external
+      # dependencies, so there is no `go.sum` — and `actions/setup-go` FAILS the
+      # step outright when the path it is given does not resolve ("Some specified
+      # paths were not resolved"). Adding a cache here would have turned a green
+      # Go job red on the very first run. When the first real dependency lands and
+      # `go.sum` is committed, add `cache-dependency-path:
+      # services/api-backend/go.sum` at the same time.
+      - name: Install Go (from go.mod)
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: services/api-backend/go.mod
+
+      # `go vet` before `go test`: vet catches a class of mistake a unit test
+      # cannot (unreachable code, a printf verb that does not match its
+      # argument) and costs seconds. Running it first means those failures are
+      # reported as themselves rather than as an opaque test failure later.
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test ./...
+
 # --- Deliberate omissions, so the next reader does not "fix" them -------------
 #
 # No `bun run generate:types`. The generated types in
@@ -171,7 +252,19 @@ jobs:
 # migrations test drives bun:sqlite against an in-memory database, so nothing
 # depends on Postgres or Redis. A compose step would add a failure mode with no
 # test behind it. The Rust job needs no database either: its tests open their
-# own in-memory SQLCipher connection.
+# own in-memory SQLCipher connection. The Go job likewise needs none — its tests
+# are domain and usecase level.
+#
+# `bun run verify` is not called by any job. That is deliberate and is the one
+# thing a future editor is most likely to "fix" back: the aggregate script runs
+# the Rust and Go suites too, and calling it from the `verify` job would
+# recompile the bundled-sqlcipher C amalgamation a second time in a job with no
+# cargo cache, against a 15-minute budget, duplicating the `rust` job for no
+# extra coverage. The gates are split across jobs on purpose.
+#
+# The consequence: the job list here, not the script, defines CI. If a gate is
+# added to `bun run verify`, it needs a job in this file as well or it will only
+# ever run on a developer's machine.
 #
 # No matrix over Bun or Node versions. One pinned toolchain is this gate; drift
 # testing is a separate piece of work.
