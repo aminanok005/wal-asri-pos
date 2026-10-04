@@ -154,7 +154,13 @@ func TestEveryModuleHasTheThreeLayers(t *testing.T) {
 	domainOnly := map[string]string{
 		"money":    "a value-object library: Satang, Quantity and the VAT rule. No application logic, no I/O.",
 		"identity": "a value-object library: UUIDv7 parsing and ordering. No application logic, no I/O.",
-		"sync":     "cross-cutting domain only for now; its usecase and adapter arrive with the /sync/push endpoint, which the contract does not yet define.",
+		// `sync` was listed here as "cross-cutting domain only for now; its usecase
+		// and adapter arrive with the /sync/push endpoint, which the contract does
+		// not yet define." The contract now defines POST /sync/push along with the
+		// Order, OrderLine and sync schemas, so `sync` is a full module and holds
+		// the three layers like any other. It keeps the extra constraint below: its
+		// domain must not depend on the order module's, because the outbox batches
+		// every aggregate and must not know what an order is.
 	}
 
 	// `architecture` holds this test and no production code.

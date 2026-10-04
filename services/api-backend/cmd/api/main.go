@@ -51,7 +51,13 @@ import (
 	cataloghttp "wal-asri-pos/services/api-backend/internal/catalog/adapter/http"
 	cataloguc "wal-asri-pos/services/api-backend/internal/catalog/usecase"
 	identity "wal-asri-pos/services/api-backend/internal/identity/domain"
+	money "wal-asri-pos/services/api-backend/internal/money/domain"
 	orderhttp "wal-asri-pos/services/api-backend/internal/order/adapter/http"
+	order "wal-asri-pos/services/api-backend/internal/order/domain"
+	orderuc "wal-asri-pos/services/api-backend/internal/order/usecase"
+	syncorder "wal-asri-pos/services/api-backend/internal/sync/adapter/order"
+	syncdomain "wal-asri-pos/services/api-backend/internal/sync/domain"
+	syncuc "wal-asri-pos/services/api-backend/internal/sync/usecase"
 )
 
 // version is stamped from the build, not from a constant that drifts.
@@ -95,20 +101,49 @@ func run() error {
 	getCatalog := cataloguc.NewGetCatalog(unwiredCatalogRepository{}, clock)
 	cataloghttp.NewHandler(getCatalog, clock).Route(mux)
 
-	// ── order ─────────────────────────────────────────────────────────────────
+	// ── sync ──────────────────────────────────────────────────────────────────
 	//
-	// The ingest interactor is built and fully tested in
-	// internal/order/usecase; it has no route because the contract declares none.
-	// Logged at startup so the gap is visible in a deployment rather than
-	// discovered by a terminal that cannot sync.
-	for path := range orderhttp.Routes {
-		logger.Warn("an order route is declared but contracts/openapi.yaml does not define it",
-			"path", path, "reason", orderhttp.ErrContractMissing(path))
-	}
-	logger.Info("the order sync endpoint is not served",
-		"reason", "contracts/openapi.yaml defines no /sync/push path",
-		"implemented", "internal/order/usecase.IngestOrder is complete and tested",
-		"missing", "the path and the Order/OutboxStatus schemas in the contract")
+	// `POST /sync/push` is IMPLEMENTED and its route is registered, because
+	// contracts/openapi.yaml now declares it along with the Order, OrderLine and
+	// sync schemas. The drain interactor is real, the batch idempotency and the
+	// per-command outcomes are real, and the handler is exercised end to end by
+	// internal/order/adapter/http's tests.
+	//
+	// What is NOT real is persistence. There is no store to commit an accepted
+	// sale into, so the ingester refuses with a transient error rather than
+	// pretending. That choice is the whole difference between this and the
+	// catalogue's placeholder, and it is deliberate:
+	//
+	//	an empty slice / a silent 200  the terminal marks the sale done, prunes its
+	//	                             outbox row, and the customer has paid for
+	//	                             something the server will never have
+	//	an error / a loud 500        the terminal keeps the row, retries with
+	//	                             backoff, and the sale survives
+	//
+	// See internal/order/adapter/memory for the in-memory ports that prove the
+	// success path, and internal/order/adapter/postgres for why the real driver
+	// cannot be written yet: Go's standard library contains no PostgreSQL driver,
+	// and adding one is outside what this service is permitted to depend on.
+	ingest := orderuc.NewIngestOrder(orderuc.IngestOrderDeps{
+		Orders: unwiredOrderRepository{},
+		Rates:  unwiredBranchRates{},
+		Idem:   unwiredIdempotencyStore{},
+		Outbox: unwiredOutboxLedger{},
+		Now:    clock,
+	})
+	drain := syncuc.NewDrainOutbox(syncuc.DrainDeps{
+		Orders: syncorder.NewIngester(ingest),
+		Idem:   unwiredBatchIdempotency{},
+		Now:    clock,
+	})
+	orderhttp.NewHandler(drain, func() int64 { return clock().UnixNano() }).Route(mux)
+
+	logger.Warn("POST "+orderhttp.BasePath+"/sync/push is routed but refuses every submission",
+		"reason", "no persistence is wired: sqlc is HELD (SKILL.md 3.2/3.4), db/migrations is empty, "+
+			"and the Go standard library contains no PostgreSQL driver",
+		"implemented", "the drain interactor, batch idempotency, authoritative re-pricing and the HTTP handler",
+		"proven_by", "internal/order/adapter/http + internal/sync/usecase tests against in-memory ports",
+		"effect", "a terminal pushing a batch receives 500 and retries; no sale is acknowledged that was not stored")
 
 	srv := &http.Server{
 		Addr:         *addr,
@@ -177,3 +212,66 @@ func (unwiredCatalogRepository) PriceListEntries(context.Context, identity.UUIDv
 // InterfaceCheck: the placeholder must satisfy the port, or the route registration
 // above would not compile and the failure would point at the wrong file.
 var _ cataloguc.CatalogRepository = unwiredCatalogRepository{}
+
+// ── the sync placeholders ─────────────────────────────────────────────────────
+//
+// Every one of these refuses with errUnwired, and the drain turns that into
+// ErrInfrastructure, which the handler maps to 500. So a terminal that pushes
+// during this state is told "retry", it keeps its outbox row, and the sale is
+// still there when persistence exists.
+//
+// They are checked against their ports for the same reason the catalogue's is:
+// the route is registered now, so a port that drifts must fail HERE rather than
+// at the first real write.
+
+type unwiredOrderRepository struct{}
+
+func (unwiredOrderRepository) Append(context.Context, order.Order) error { return errUnwired }
+
+type unwiredBranchRates struct{}
+
+func (unwiredBranchRates) VATRateBp(context.Context, identity.UUIDv7) (money.BasisPoints, error) {
+	return 0, errUnwired
+}
+
+type unwiredIdempotencyStore struct{}
+
+func (unwiredIdempotencyStore) Lookup(context.Context, syncdomain.IdempotencyKey) (*syncdomain.IdempotencyRecord, error) {
+	return nil, errUnwired
+}
+func (unwiredIdempotencyStore) Save(context.Context, syncdomain.IdempotencyRecord) error {
+	return errUnwired
+}
+
+type unwiredOutboxLedger struct{}
+
+func (unwiredOutboxLedger) Append(context.Context, syncdomain.SyncOutboxItem) error {
+	return errUnwired
+}
+func (unwiredOutboxLedger) TransitionTo(context.Context, identity.UUIDv7, syncdomain.OutboxState, time.Time) error {
+	return errUnwired
+}
+
+// The drain's OrderIngester is the REAL adapter over the REAL interactor — only the
+// four ports underneath it refuse. So a submission in this state travels the whole
+// pipeline, reaches `rates.VATRateBp`, fails there as transient, and comes back as
+// 500 with no sale acknowledged. The failure is where the missing dependency
+// actually is, rather than a hand-written refusal at the edge that would go stale
+// the moment a real store is wired in.
+
+type unwiredBatchIdempotency struct{}
+
+func (unwiredBatchIdempotency) Lookup(context.Context, syncdomain.IdempotencyKey) (*syncdomain.IdempotencyRecord, error) {
+	return nil, errUnwired
+}
+func (unwiredBatchIdempotency) Save(context.Context, syncdomain.IdempotencyRecord) error {
+	return errUnwired
+}
+
+var (
+	_ orderuc.OrderRepository  = unwiredOrderRepository{}
+	_ orderuc.BranchRateSource = unwiredBranchRates{}
+	_ orderuc.IdempotencyStore = unwiredIdempotencyStore{}
+	_ orderuc.OutboxLedger     = unwiredOutboxLedger{}
+	_ syncuc.BatchIdempotency  = unwiredBatchIdempotency{}
+)

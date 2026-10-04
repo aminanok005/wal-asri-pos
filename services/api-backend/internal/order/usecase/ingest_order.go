@@ -410,9 +410,16 @@ func (i *IngestOrder) holdForConflict(
 //
 // The actual JSON shape belongs to the HTTP adapter. What matters here is that it
 // is FIXED at the moment of the original submission.
+//
+// Every `*_satang` value is a QUOTED STRING, because contracts/openapi.yaml types
+// `Satang` as `type: string` with pattern `^(0|[1-9][0-9]*)$`. Emitting a bare
+// integer here would make the stored response — the bytes a retry gets back, and
+// the only record of what the server decided — disagree with the wire contract
+// that every other response on this endpoint follows.
 func renderAcknowledged(o order.Order, totals order.Totals) string {
 	return fmt.Sprintf(
-		`{"order_id":"%s","branch_id":"%s","status":"%s","total_satang":%d,"taxable_satang":%d,"tax_satang":%d,"vat_rate_bp":%d}`,
+		`{"order_id":"%s","branch_id":"%s","status":"%s","total_satang":"%s","taxable_satang":"%s","tax_satang":"%s","vat_rate_bp":%d}`,
 		o.ID, o.BranchID, o.Status,
-		totals.TotalSatang, totals.NetSatang(), totals.TaxSatang(), totals.TaxSplit.RateBp)
+		totals.TotalSatang.String(), totals.NetSatang().String(), totals.TaxSatang().String(),
+		totals.TaxSplit.RateBp)
 }

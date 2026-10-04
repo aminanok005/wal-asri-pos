@@ -287,6 +287,131 @@ func isCanonicalDigits(s string) bool {
 	return true
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// SignedSatang — the one signed money field
+// ─────────────────────────────────────────────────────────────────────────────
+
+// SignedSatang is the wire form of `rounding_adjustment_satang`, the ONLY signed
+// money value in this service.
+//
+// Cash rounding moves the amount charged to the nearest value the drawer can
+// actually pay, and that value sits on either side of the exact total: ฿45.53
+// rounds up to ฿45.55 or down to ฿45.50, and both are ordinary. A
+// non-negative representation could only express half of that, so a cashier
+// rounding down would have to misreport the direction of the adjustment.
+//
+// ── WHY IT IS A SEPARATE TYPE, AND WHY IT IS NOT A STRING ─────────────────────
+//
+// A separate type, because the sign is a PERMISSION, not a convenience. `Satang`
+// means "an amount that is not negative" throughout this service; widening its
+// parser to accept `-` would let a negative price, a negative total or a negative
+// tax through every call site, and those are all genuinely wrong. Only the
+// rounding adjustment may go below zero, and only because it is a settlement of
+// the tender rather than part of the price.
+//
+// NOT a string, unlike `Satang`, and that asymmetry is deliberate rather than an
+// oversight. contracts/openapi.yaml defines:
+//
+//	Satang        type: string, pattern ^(0|[1-9][0-9]*)$
+//	SignedSatang  type: integer, format: int64      (no pattern, no minimum)
+//
+// The reason is the 2^53 cliff. `Satang` is quoted so that JavaScript never places
+// it in the number type. A signed satang can never approach 2^53 — a value that
+// large is not a rounding adjustment, it is a unit error — so the reason for
+// quoting does not apply, and the contract keeps it a plain integer.
+//
+// The wire form is therefore a BARE JSON integer: `MarshalJSON` writes `-3`, not
+// `"-3"`. Do not "fix" this to match `Satan`: a client generated from the
+// contract sends and expects the number.
+type SignedSatang Satang
+
+// Signed returns the underlying amount.
+//
+// Total, because the domain models the adjustment as an ordinary `Satang` — the
+// domain already accepts a negative `Satan` for this one field, and widening the
+// TYPE is what this package deliberately avoids.
+func (s SignedSatang) Signed() Satang { return Satang(s) }
+
+// String renders the signed decimal form, e.g. "-3".
+func (s SignedSatang) String() string { return Satang(s).String() }
+
+// MarshalJSON emits a bare JSON integer, per the contract's SignedS schema.
+//
+// Deliberately NOT quoted. See the type note.
+func (s SignedSatang) MarshalJSON() ([]byte, error) {
+	return []byte(Satang(s).String()), nil
+}
+
+// UnmarshalJSON accepts only a bare JSON integer in the canonical signed form.
+//
+// The mirror of `Satan.UnmarshalJSON`, and strict for the same reason: a guard,
+// not a decoder. `encoding/json` would accept `3.0`, `3e0`, `"3"` and `03`, and
+// the last of those is a second spelling of three.
+//
+//	-3    3    0    accepted
+//	3.0   3e0  rejected, never a decimal or exponent form
+//	"3"        rejected, a Satang is a bare integer here, not a quoted one
+//	03         rejected, leading zeros are a second spelling of one value
+//	+3         rejected, only '-' is canonical
+//	-0         rejected, negative zero is a second spelling of zero
+//	null       rejected, a money field is never null
+func (s *SignedSatang) UnmarshalJSON(b []byte) error {
+	txt := strings.TrimSpace(string(b))
+	if txt == "null" {
+		return fmt.Errorf("money kernel: null is not a valid SignedSatang")
+	}
+	// A quoted value is refused explicitly rather than by falling through, because
+	// the message is the only thing that tells a client which of the contract's two
+	// money schemas it used.
+	if len(txt) >= 2 && txt[0] == '"' {
+		return fmt.Errorf(
+			"money kernel: %s is not a valid SignedSatang: rounding_adjustment_satang is a bare JSON "+
+				"integer (contracts/openapi.yaml, schema SignedSatang), not a quoted string. A quoted "+
+				"digit string is the Satang schema, which does not permit a sign", txt)
+	}
+	parsed, err := ParseSignedSatang(txt)
+	if err != nil {
+		return err
+	}
+	*s = SignedSatang(parsed)
+	return nil
+}
+
+// ParseSignedSatang converts the contract's signed wire spelling to an amount.
+//
+// It accepts `-?(0|[1-9][0-9]*)$`. The unsigned half is validated by exactly the
+// same `isCanonicalDigits` as `ParseSatang`, because a grammar that exists twice
+// is a grammar that eventually disagrees with itself — and a disagreement here is a
+// money field one caller accepts and another refuses.
+func ParseSignedSatang(s string) (Satang, error) {
+	digits := s
+	negative := false
+	if rest, ok := strings.CutPrefix(s, "-"); ok {
+		negative, digits = true, rest
+	}
+	if digits == "" {
+		return 0, fmt.Errorf("money kernel: %q is not a valid SignedSatang: it is a bare '-'", s)
+	}
+	if !isCanonicalDigits(digits) {
+		return 0, fmt.Errorf(
+			"money kernel: %q is not a valid SignedSatang: expected -?(0|[1-9][0-9]*)$ — no explicit plus, "+
+				"no leading zeros, no decimal point", s)
+	}
+	if negative && digits == "0" {
+		return 0, fmt.Errorf(
+			"money kernel: %q is not a valid SignedSatang: negative zero is a second spelling of zero, send 0", s)
+	}
+
+	// Parse the whole string sign-and-all so that the magnitude of i64::MIN, which
+	// is one larger than i64::MAX and cannot be held by a positive int64, is
+	// accepted rather than reported as an overflow. It fits exactly.
+	v, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("money kernel: %q is not a valid SignedSatang: %w", s, err)
+	}
+	return SatangOf(v)
+}
+
 // DivRoundHalfUp divides a by b, rounding half away from zero.
 //
 // Half-UP, not banker's rounding: this is money and half-up is the commercial

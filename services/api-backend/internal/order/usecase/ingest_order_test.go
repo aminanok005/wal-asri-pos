@@ -173,6 +173,40 @@ func TestIngestOrder_AcceptsAWellFormedOrder(t *testing.T) {
 	}
 }
 
+// TestIngestOrder_TheStoredResponseUsesStringSatang pins the wire form of the
+// bytes this usecase persists.
+//
+// Those bytes are the whole record of what the server decided, and they are
+// replayed verbatim on a duplicate for 24 hours. contracts/openapi.yaml types
+// `Satang` as `type: string` with pattern `^(0|[1-9][0-9]*)$`, so a bare integer
+// here means a retry hands the terminal a differently-shaped money field than the
+// original response did — which surfaces as a customer's total, not as a parse
+// error at the point of disagreement.
+func TestIngestOrder_TheStoredResponseUsesStringSatang(t *testing.T) {
+	repo, rates, idem, out := &fakeOrders{}, &fakeRates{bp: 700}, newFakeIdem(), &fakeOutbox{}
+	i := newIngest(repo, rates, idem, out)
+
+	res, err := i.Execute(context.Background(), IngestRequest{
+		IdempotencyKey: "order-key-1",
+		TerminalID:     uid(9),
+		Order:          terminalOrder(700, 100),
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	for _, want := range []string{`"total_satang":"4550"`, `"taxable_satang":"4252"`, `"tax_satang":"298"`} {
+		if !strings.Contains(res.Response, want) {
+			t.Errorf("the stored response is missing %s; got: %s", want, res.Response)
+		}
+	}
+	for _, forbidden := range []string{`"total_satang":4550`, `"taxable_satang":4252`, `"tax_satang":298`} {
+		if strings.Contains(res.Response, forbidden) {
+			t.Errorf("a bare JSON number leaked into a Satang field (%s); got: %s", forbidden, res.Response)
+		}
+	}
+}
+
 func TestIngestOrder_AStaleTerminalRateIsHeldNotCorrected(t *testing.T) {
 	// The realistic failure: a terminal last synced before the branch changed VAT
 	// rate. The sale really happened and the customer really paid, so dropping it
