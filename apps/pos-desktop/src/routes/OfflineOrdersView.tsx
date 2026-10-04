@@ -18,7 +18,7 @@
  * @see ../features/sales/application/offlineOrders.ts — the port and the unions
  */
 
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import type { JSX } from 'react';
 
 // `import type` for both of these. `verbatimModuleSyntax` is on repo-wide, and
@@ -34,6 +34,7 @@ import type {
   SyncState,
 } from '../features/sales/application/offlineOrders';
 import type { Money } from '../features/payments/domain/money';
+import { ALL_SYNC_STATES, summariseSyncStates } from './offlineOrdersSummary';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Props
@@ -214,6 +215,12 @@ export function OfflineOrdersView(props: OfflineOrdersViewProps): JSX.Element {
     };
   }, [repository, effectiveLimit]);
 
+  // Counted once per page rather than per render.
+  const syncCounts = useMemo(
+    () => (state.kind === 'loaded' ? summariseSyncStates(state.orders) : null),
+    [state],
+  );
+
   // ── Render ────────────────────────────────────────────────────────────────
   // The Thai heading matches the nav label in `app/routes.ts`, so the tab the
   // cashier pressed and the screen it opened say the same thing.
@@ -225,6 +232,35 @@ export function OfflineOrdersView(props: OfflineOrdersViewProps): JSX.Element {
       data-testid="offline-orders"
     >
       <h2 className="offline-orders__heading">ประวัติออเดอร์ออฟไลน์</h2>
+
+      {/* ── Sync summary ──────────────────────────────────────────────────
+          Two axes: the four buckets partition the page and sum to it, `voided`
+          counts the same rows again by another column. Merging them would make
+          the figures disagree about how many orders this terminal holds.
+          The trailing colon keeps each label a text node of its own — the row
+          badges reuse these four strings, and a test matches one by exact text. */}
+      {syncCounts !== null && (
+        <div className="offline-orders__sync-summary" role="status">
+          <ul className="offline-orders__sync-list">
+            {ALL_SYNC_STATES.map((syncState) => (
+              <li
+                key={syncState}
+                className="offline-orders__sync-item"
+                data-sync-state={syncState}
+              >
+                <span className="offline-orders__sync-label">{`${THAI_SYNC_LABELS[syncState]}:`}</span>
+                <span className="offline-orders__sync-count">
+                  {syncCounts.bySyncState[syncState].toString()}
+                </span>
+              </li>
+            ))}
+          </ul>
+
+          <p className="offline-orders__sync-voided">
+            {`ยกเลิกออเดอร์แล้ว ${syncCounts.voided} รายการ`}
+          </p>
+        </div>
+      )}
 
       {/* ── Loading ──────────────────────────────────────────────────────
           A live region, so a screen reader is told the list is on its way

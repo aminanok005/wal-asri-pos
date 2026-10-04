@@ -48,6 +48,73 @@
   line-height: 1.5;
 }
 
+/* ── Sync summary ───────────────────────────────────────────────────────── */
+
+.offline-orders__sync-summary {
+  margin: 0 0 16px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--card);
+}
+
+.offline-orders__sync-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.offline-orders__sync-item {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 10px;
+  background: var(--bg);
+  font-size: 13px;
+}
+
+.offline-orders__sync-label {
+  color: var(--mut);
+}
+
+/*
+ * `tabular-nums`: the counts sit in a wrapping row and re-flow as pages change,
+ * so equal digit widths keep the tiles from twitching as the numbers grow.
+ * Counts, not money — no Money is called anywhere in this bar.
+ */
+.offline-orders__sync-count {
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The two rungs a shift lead must act on, matching the row badges below. */
+.offline-orders__sync-item[data-sync-state='conflict'] .offline-orders__sync-label {
+  color: var(--acc);
+  font-weight: 600;
+}
+
+.offline-orders__sync-item[data-sync-state='rejected'] .offline-orders__sync-label {
+  color: var(--danger);
+  font-weight: 600;
+}
+
+/*
+ * The voided count is on its own line, below a border, because it counts the same
+ * rows on a SECOND axis rather than partitioning the page with the four buckets
+ * above. Sharing a row would invite the reader to add it to the others.
+ */
+.offline-orders__sync-voided {
+  margin: 10px 0 0;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+  color: var(--mut);
+  font-size: 12px;
+}
+
 /* ── Rows ───────────────────────────────────────────────────────────────── */
 
 .offline-orders__list {

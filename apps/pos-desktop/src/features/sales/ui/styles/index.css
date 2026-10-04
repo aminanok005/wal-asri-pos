@@ -8,7 +8,7 @@
  */
 
 @import './tokens.css';
-@import '../../catalog/ui/styles/catalog-grid.css';
+@import '../../../catalog/ui/styles/catalog-grid.css';
 @import './cart-view.css';
 @import './sales-terminal.css';
 @import './offline-orders.css';
