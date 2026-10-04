@@ -527,4 +527,76 @@ mod tests {
     };
     assert!(matches!(config.socket_addr(), Err(SendError::BadAddress { .. })));
   }
+
+  // ── The spawn_blocking wrapper ──────────────────────────────────────────────
+  //
+  // Every test above calls `TcpPrinterTransport::send` DIRECTLY. That proves
+  // the socket path, but it bypasses `send_bytes`, which is the wrapper the
+  // whole "never block the UI thread" guarantee actually rests on.
+  //
+  // So the wrapper was, until these tests, entirely unproven — it appeared only
+  // in comments and in `printer_commands.rs`. A wrapper that silently ran its
+  // work inline, or panicked inside `spawn_blocking`, would have passed every
+  // other test in this file while reintroducing exactly the UI freeze the
+  // module exists to prevent.
+
+  #[test]
+  fn send_bytes_delivers_the_receipt_through_the_async_wrapper() {
+    use tauri::async_runtime::block_on;
+
+    let (addr, printer) = fake_printer();
+    let sent = vec![0x1B, 0x40, 0x1B, 0x74, 0x14, b'T', b'h', b'a', b'i', 0x1B, 0x70, 0x00, 0x19, 0xFA];
+
+    let outcome = block_on(send_bytes(transport_to(addr), sent.clone())).expect("send_bytes");
+
+    assert_eq!(outcome.bytes_sent, sent.len());
+    assert_eq!(
+      printer.join().expect("printer thread"),
+      sent,
+      "the bytes must survive the spawn_blocking hop unchanged"
+    );
+  }
+
+  #[test]
+  fn send_bytes_reports_a_transport_failure_rather_than_panicking() {
+    use tauri::async_runtime::block_on;
+
+    // Nothing is listening on port 1, so the connect is refused. The point is
+    // that the refusal comes back as a typed `Err` through the wrapper's
+    // channel, not as a panic inside the blocking worker — which is the
+    // difference between a cashier seeing "cannot reach printer at …" and the
+    // till silently dying.
+    let transport = TcpPrinterTransport::new(TcpPrinterConfig {
+      host: "127.0.0.1".to_string(),
+      port: 1,
+    });
+
+    let result = block_on(send_bytes(transport, vec![0x1B, 0x40]));
+
+    match result {
+      Err(SendError::Connect { .. }) => {}
+      other => panic!("expected a typed Connect error, got {other:?}"),
+    }
+  }
+
+  // ── What is NOT tested here, and why ────────────────────────────────────────
+  //
+  // There is deliberately NO test asserting "the send ran on a different
+  // thread". An earlier draft of this file had one, and it was VACUOUS: it
+  // checked an `mpsc` channel that nothing ever wrote to, before the send, so
+  // it passed whether or not `spawn_blocking` was involved at all.
+  //
+  // Proving thread affinity honestly needs the blocking closure to report the
+  // thread it ran on, which means either a test-only hook in production code or
+  // making the transport injectable into the wrapper. Neither is worth the
+  // machinery here, so the guarantee rests on three things instead, none of
+  // which is a hand-wave:
+  //   - `TcpPrinterTransport::send` is a plain blocking fn, so there is no async
+  //     path into the socket that skips the wrapper.
+  //   - `CONNECT_TIMEOUT` (3s) and `WRITE_TIMEOUT` (5s) bound every socket
+  //     call, so even a hypothetical inline execution could not freeze the
+  //     window indefinitely.
+  //   - `printer_commands::print_receipt` — the fn Tauri actually invokes — is
+  //     tested end-to-end over loopback in printer_commands.rs, and its body
+  //     wraps compile + send in a single `spawn_blocking`.
 }

@@ -128,7 +128,197 @@ pub async fn print_receipt(request: PrintRequest) -> Result<SendOutcome, Printer
 /// menu" or "check the cable".
 #[cfg(test)]
 mod tests {
+  use std::net::SocketAddr;
+
   use super::*;
+
+  // ── Loopback harness ────────────────────────────────────────────────────────
+  //
+  // `print_receipt` is the command Tauri actually invokes, and it takes no
+  // `AppHandle` and no `State`, so it can be driven directly. Until these tests
+  // existed, NOTHING exercised the assembled production path: `escpos::compile`
+  // and `TcpPrinterTransport::send` were each tested alone, and this module
+  // only tested error MAPPING. A bug in the wiring — the wrong receipt handed to
+  // the compiler, the drawer flag dropped, the compile happening after the
+  // connect instead of before — would have passed every other test in the crate.
+  fn fake_printer() -> (SocketAddr, std::thread::JoinHandle<Vec<u8>>) {
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let addr = listener.local_addr().expect("local addr");
+
+    let handle = std::thread::spawn(move || {
+      use std::io::Read;
+      let (mut stream, _) = listener.accept().expect("accept");
+      let mut buf = Vec::new();
+      stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+        .expect("read timeout");
+      let _ = stream.read_to_end(&mut buf);
+      buf
+    });
+
+    (addr, handle)
+  }
+
+  fn request(addr: SocketAddr, receipt: ReceiptIr) -> PrintRequest {
+    PrintRequest {
+      printer: TcpPrinterConfig {
+        host: addr.ip().to_string(),
+        port: addr.port(),
+      },
+      receipt,
+    }
+  }
+
+  fn receipt(open_drawer: bool) -> ReceiptIr {
+    ReceiptIr {
+      shop_name: "ร้านวาลังอาซิ".to_string(),
+      receipt_number: "R-0001".to_string(),
+      lines: vec![crate::escpos::ReceiptLine {
+        text: "กาแฟโก้".to_string(),
+        align: crate::escpos::Align::Left,
+      }],
+      total_satang: "4550".to_string(),
+      open_drawer,
+    }
+  }
+
+  #[test]
+  fn print_receipt_sends_a_compiled_receipt_and_opens_the_drawer() {
+    use tauri::async_runtime::block_on;
+
+    let (addr, printer) = fake_printer();
+
+    let outcome = block_on(print_receipt(request(addr, receipt(true)))).expect("print");
+
+    let received = printer.join().expect("printer thread");
+
+    assert_eq!(outcome.bytes_sent, received.len());
+    assert!(!received.is_empty());
+
+    // The head: initialise then the Thai code page, before any text.
+    assert_eq!(&received[0..2], b"\x1b\x40", "ESC @ leads the stream");
+    assert_eq!(&received[2..5], b"\x1b\x74\x14", "ESC t 20 follows it");
+
+    // The tail: the DRAWER pulse, because this receipt set `open_drawer`. The
+    // cut precedes it.
+    assert_eq!(
+      &received[received.len() - 5..],
+      b"\x1b\x70\x00\x19\xfa",
+      "ESC p 0 25 250 is last when the drawer opens"
+    );
+    assert!(
+      received.windows(4).any(|w| w == b"\x1d\x56\x42\x00"),
+      "the cut is in the stream, just not last"
+    );
+  }
+
+  #[test]
+  fn print_receipt_ends_on_the_cut_when_no_drawer_is_requested() {
+    use tauri::async_runtime::block_on;
+
+    let (addr, printer) = fake_printer();
+
+    block_on(print_receipt(request(addr, receipt(false)))).expect("print");
+    let received = printer.join().expect("printer thread");
+
+    assert_eq!(
+      &received[received.len() - 4..],
+      b"\x1d\x56\x42\x00",
+      "GS V 66 0 is the final command with no drawer"
+    );
+    assert!(
+      !received.windows(5).any(|w| w == b"\x1b\x70\x00\x19\xfa"),
+      "no drawer pulse may appear"
+    );
+  }
+
+  #[test]
+  fn print_receipt_encodes_before_it_connects() {
+    use tauri::async_runtime::block_on;
+
+    // Port 1 has no listener, so ANY attempt to open a socket fails. If the
+    // command connected before compiling, this would report `Transport`; because
+    // it compiles first, an unencodable receipt reports `UnmappableText` and
+    // never touches the network.
+    //
+    // That ordering is a deliberate property, not an accident: an operator with
+    // a broken menu entry must be told to fix the menu, not to check the cables.
+    let mut bad = receipt(false);
+    bad.lines[0].text = "ชา ☕".to_string();
+
+    let result = block_on(print_receipt(PrintRequest {
+      printer: TcpPrinterConfig {
+        host: "127.0.0.1".to_string(),
+        port: 1,
+      },
+      receipt: bad,
+    }));
+
+    match result {
+      Err(e) => {
+        assert_eq!(
+          e.kind,
+          PrinterErrorKind::UnmappableText,
+          "a menu-data fault must not be reported as a transport fault: {}",
+          e.message
+        );
+        assert!(e.message.contains('☕'), "names the character: {}", e.message);
+      }
+      Ok(outcome) => panic!("expected a refusal, sent {outcome:?}"),
+    }
+  }
+
+  #[test]
+  fn print_receipt_reports_an_unreachable_printer_as_a_transport_error() {
+    use tauri::async_runtime::block_on;
+
+    let result = block_on(print_receipt(PrintRequest {
+      printer: TcpPrinterConfig {
+        host: "127.0.0.1".to_string(),
+        port: 1,
+      },
+      receipt: receipt(false),
+    }));
+
+    match result {
+      Err(e) => {
+        assert_eq!(e.kind, PrinterErrorKind::Transport);
+        assert!(
+          e.message.contains("127.0.0.1"),
+          "names the address: {}",
+          e.message
+        );
+      }
+      Ok(outcome) => panic!("expected a transport error, sent {outcome:?}"),
+    }
+  }
+
+  #[test]
+  fn print_receipt_rejects_a_malformed_total_before_opening_a_socket() {
+    use tauri::async_runtime::block_on;
+
+    // The same ordering guarantee for the money path: a total that is not a
+    // plain integer must never reach the printer or a customer's receipt.
+    let mut bad = receipt(false);
+    bad.total_satang = "forty five".to_string();
+
+    let result = block_on(print_receipt(PrintRequest {
+      printer: TcpPrinterConfig {
+        host: "127.0.0.1".to_string(),
+        port: 1,
+      },
+      receipt: bad,
+    }));
+
+    assert!(matches!(
+      result,
+      Err(PrinterError {
+        kind: PrinterErrorKind::InvalidReceipt,
+        ..
+      })
+    ));
+  }
 
   #[test]
   fn an_unmappable_character_becomes_a_menu_data_error_not_a_transport_one() {
