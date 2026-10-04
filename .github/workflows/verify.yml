@@ -103,9 +103,9 @@ jobs:
       # real chance of tripping this job's timeout for no added coverage.
       #
       # So the gates are split by job and run in parallel instead:
-      #   this job  -> typecheck + TS tests + the production bundle
-      #   rust job  -> cargo check + cargo test  (see below)
-      #   go job    -> go vet + go test
+      #   this job    -> typecheck + TS tests + the production bundle
+      #   rust job    -> cargo check + cargo test  (see below)
+      #   backend job -> go vet + go test          (see below)
       #
       # The invariant that matters — "what `bun run verify` runs locally is what
       # CI runs" — is maintained by the job list below, not by calling the
@@ -199,10 +199,16 @@ jobs:
   # test step). Without this job the Go backend would have NO CI coverage at
   # all: `go test` would pass on a laptop and never run on a pull request.
   #
+  # Named `backend` rather than `go` because it gates the whole Go monolith, not
+  # the language: it is the sync outbox engine, the order ingest pipeline and the
+  # money kernel. A future second Go service would be a separate job with its own
+  # name, and a language-named job would read as "the Go tests" rather than "this
+  # service".
+  #
   # Deliberately the smallest job in this file. It exists to keep the Go gate
-  # honest; everything else about that service — Postgres, migrations, the sync
-  # protocol — is separate work with its own tests.
-  go:
+  # honest; everything else about that service — Postgres, migrations — is
+  # separate work with its own tests.
+  backend:
     name: Test the Go backend
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -219,27 +225,62 @@ jobs:
       # own go.mod, so the CI toolchain tracks the module instead of drifting
       # from a copy-pasted number. `go.mod` here declares `go 1.25`.
       #
-      # NO `cache-dependency-path`. The module currently has no external
-      # dependencies, so there is no `go.sum` — and `actions/setup-go` FAILS the
-      # step outright when the path it is given does not resolve ("Some specified
-      # paths were not resolved"). Adding a cache here would have turned a green
-      # Go job red on the very first run. When the first real dependency lands and
-      # `go.sum` is committed, add `cache-dependency-path:
-      # services/api-backend/go.sum` at the same time.
+      # `cache: false` is LOAD-BEARING, and it was a real red build before it was
+      # set.
+      #
+      # `actions/setup-go@v5` enables caching by DEFAULT (action.yml: `cache`
+      # default `true`), and its `src/cache-restore.ts` resolves the dependency
+      # file like this:
+      #
+      #   findDependencyFile()  ->  fs.readdirSync(GITHUB_WORKSPACE) and looks
+      #                             for `go.sum` in the REPOSITORY ROOT
+      #   if (!goSumFileExists) ->  throw `Dependencies file is not found in ...`
+      #
+      # There is no `go.sum` anywhere in this repo, and there cannot be one: the
+      # module declares `go 1.25` with NO require block, so it depends only on the
+      # standard library. The step therefore threw on its first run and took the
+      # whole job red before a single Go test executed.
+      #
+      # Note what did NOT protect it: simply omitting `cache-dependency-path`.
+      # Leaving it unset makes `findDependencyFile` run and throw, rather than
+      # skipping the lookup — omitting the input is not the same as disabling the
+      # feature. Only `cache: false` actually turns it off.
+      #
+      # Disabling is also correct on the merits, not merely as a workaround: with
+      # zero external modules there is nothing to download, so a module cache
+      # would be pure overhead keyed on a file that does not exist.
+      #
+      # When the first real dependency lands and `go.sum` is committed, flip this
+      # to `cache: true` and add
+      # `cache-dependency-path: services/api-backend/go.sum` IN THE SAME COMMIT —
+      # note the path, because the action looks in the repository ROOT by default
+      # and a module nested one level down is not where it expects to find it.
       - name: Install Go (from go.mod)
         uses: actions/setup-go@v5
         with:
           go-version-file: services/api-backend/go.mod
+          cache: false
 
       # `go vet` before `go test`: vet catches a class of mistake a unit test
       # cannot (unreachable code, a printf verb that does not match its
       # argument) and costs seconds. Running it first means those failures are
       # reported as themselves rather than as an opaque test failure later.
+      #
+      # Kept as its own step rather than chained with `&&`. GitHub renders a failed
+      # step by name, so a red run says "go vet" or "go test" outright instead of
+      # one merged line — which matters here, because the two failures mean
+      # different things: vet failing is usually a mistake in the code, while a
+      # test failing in `money` or `sync` means a money rule moved.
       - name: go vet
         run: go vet ./...
 
+      # `-v` so the log names every test that ran. It costs about 130 lines
+      # against the suite's size, and it is worth it on this service specifically:
+      # when a money identity or an idempotency decision starts failing, the first
+      # question is always "which tests actually executed", and a bare `ok` line
+      # answers nothing.
       - name: go test
-        run: go test ./...
+        run: go test -v ./...
 
 # --- Deliberate omissions, so the next reader does not "fix" them -------------
 #
@@ -252,8 +293,9 @@ jobs:
 # migrations test drives bun:sqlite against an in-memory database, so nothing
 # depends on Postgres or Redis. A compose step would add a failure mode with no
 # test behind it. The Rust job needs no database either: its tests open their
-# own in-memory SQLCipher connection. The Go job likewise needs none — its tests
-# are domain and usecase level.
+# own in-memory SQLCipher connection. The backend job likewise needs none — it has
+# no Postgres driver to talk to and its tests run against in-memory ports and
+# httptest, which is the only reason its suite is this fast.
 #
 # `bun run verify` is not called by any job. That is deliberate and is the one
 # thing a future editor is most likely to "fix" back: the aggregate script runs
