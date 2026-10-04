@@ -33,7 +33,10 @@ import { buildCatalog } from '../features/catalog/domain/catalog';
 import type { CatalogEntry, CatalogIndex } from '../features/catalog/domain/catalog';
 import { CatalogGrid } from '../features/catalog/ui/CatalogGrid';
 import { DEMO_SNAPSHOT } from '../features/catalog/ui/demoCatalog';
-import type { Money } from '../features/payments/domain/money';
+// A VALUE import, not `import type`. It was type-only while this screen only
+// formatted a `Money`; it now CONSTRUCTS one (`Money.fromSatang`) to carry the
+// rounded payable total into the receipt IR, so the runtime import is real.
+import { Money } from '../features/payments/domain/money';
 import { addItem, calculateOrderTotals, createCart, totalUnits } from '../features/sales/domain/cart';
 import type { Cart } from '../features/sales/domain/cart';
 import { nextCartLineId } from '../features/sales/domain/lineId';
@@ -42,6 +45,17 @@ import { CartView } from '../features/sales/ui/CartView';
 import type { CartCatalogueItem } from '../features/sales/ui/CartView';
 import { toWireInput } from '../features/sales/infrastructure/tauriOfflineOrders';
 import type { CheckoutFigures } from '../features/sales/infrastructure/tauriOfflineOrders';
+// Cash rounding, the receipt IR, and the printer port. Each is imported from its
+// own layer and none of them may be reimplemented here — see the checkout
+// handler for why that matters more than usual on this screen.
+import { applyCashRounding } from '../features/sales/domain/cashRounding';
+import type { PaymentMethod } from '../features/sales/domain/cashRounding';
+import { buildReceiptIr } from '../features/sales/domain/receiptLayout';
+import { createNullReceiptPrinter } from '../features/sales/application/receiptPrinter';
+import type {
+  PrinterEndpoint,
+  ReceiptPrinter,
+} from '../features/sales/application/receiptPrinter';
 
 /**
  * How the checkout reaches the database.
@@ -100,7 +114,24 @@ const EMPTY_CATALOGUE: readonly CartCatalogueItem[] = Object.freeze([]);
  * way to do that. The screen is the only place that decides how an error looks.
  */
 export type CheckoutResult =
-  | { readonly ok: true; readonly receiptNumber: string }
+  | {
+      readonly ok: true;
+      readonly receiptNumber: string;
+      /**
+       * Set when the sale COMMITTED but the receipt did not print.
+       *
+       * ⚠️ This exists because a single `ok` flag cannot honestly describe
+       * commit-then-print. The two outcomes are independent: the money is
+       * committed, the customer has been served, and the printer is dead.
+       * Collapsing that into `ok: false` would tell the cashier the SALE failed
+       * when it succeeded, and the obvious response — ring it again — would
+       * double the sale.
+       *
+       * `null` means the receipt printed. Never absent: `undefined` here would
+       * make "printed" and "we forgot to ask" indistinguishable at the call site.
+       */
+      readonly printWarning: string | null;
+    }
   | { readonly ok: false; readonly message: string };
 
 /** Render a `Money` as Thai baht, e.g. ฿45.50. Display only — no arithmetic. */
@@ -118,9 +149,57 @@ export interface SalesTerminalViewProps {
    * adapter; tests pass an in-memory double.
    */
   readonly repository?: CheckoutRepository;
+  /**
+   * Where the receipt is printed. Defaults to the null printer, which REFUSES
+   * rather than pretending — a till with no printer configured must say so,
+   * not show a green "printed" that never happened.
+   */
+  readonly printer?: ReceiptPrinter;
+  /**
+   * The printer's address. Separate from the printer so a test can vary the
+   * endpoint without supplying a printer at all, and so the two concerns are
+   * not confused: the endpoint is configuration, the port is a capability.
+   */
+  readonly printerEndpoint?: PrinterEndpoint;
 }
 
-export function SalesTerminalView({ repository }: SalesTerminalViewProps = {}): JSX.Element {
+/** The channels a customer can pay on screen. */
+const PAYMENT_METHODS: readonly { readonly id: PaymentMethod; readonly label: string }[] =
+  Object.freeze([
+    Object.freeze({ id: 'cash' as const, label: 'เงินสด' }),
+    Object.freeze({ id: 'qr' as const, label: 'QR' }),
+    Object.freeze({ id: 'promptpay' as const, label: 'พร้อมเพย์' }),
+  ]);
+
+/**
+ * Sign a satang adjustment the way a Thai customer expects to read it.
+ *
+ * Exported so the formatting is directly testable. That matters because a
+ * component test cannot reach it: every price in the demo menu is an exact
+ * multiple of 25 satang, so no basket the screen can build ever rounds. See
+ * `SalesTerminalPrint.test.ts` for the full note.
+ *
+ * `bigint` throughout — a `number` here would reintroduce exactly the float the
+ * rest of the money path exists to keep out.
+ */
+export function formatAdjustment(satang: bigint): string {
+  if (satang === 0n) return '฿0.00';
+  const magnitude = satang < 0n ? -satang : satang;
+  const whole = magnitude / 100n;
+  const frac = (magnitude % 100n).toString().padStart(2, '0');
+  return satang < 0n ? `-฿${whole}.${frac}` : `+฿${whole}.${frac}`;
+}
+
+/** The whole rounding line, as the cashier reads it. `payable` is "45.50". */
+export function roundingRowText(adjustment: bigint, payable: string): string {
+  return `ปัดเศษ ${formatAdjustment(adjustment)} → ฿${payable}`;
+}
+
+export function SalesTerminalView({
+  repository,
+  printer,
+  printerEndpoint = { host: '127.0.0.1', port: 9100 },
+}: SalesTerminalViewProps = {}): JSX.Element {
   // Resolved once per mount. The lazy default keeps `@tauri-apps/api` out of
   // the module graph of any test that renders this screen WITHOUT a prop — the
   // import would resolve, but calling `invoke` outside a Tauri runtime would
@@ -190,6 +269,26 @@ export function SalesTerminalView({ repository }: SalesTerminalViewProps = {}): 
   const [checkout, setCheckout] = useState<CheckoutResult | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
+  // ── Payment method, and what it does to the total ──────────────────────────
+  //
+  // The rounding is a DOMAIN decision, computed once here and reused in three
+  // places: the on-screen total, the figures committed to SQLite, and the total
+  // printed on the receipt. All three MUST be the same number — a till that
+  // shows ฿45.50, stores ฿45.52 and prints ฿45.50 is three sources of truth
+  // for one sale, and the shift report is the one that gets blamed.
+  const [paymentMethod, setPaymentMethod] = useState<PaymentMethod>('cash');
+
+  const rounding = useMemo(
+    () => applyCashRounding(totals.total.satang, paymentMethod),
+    [totals.total, paymentMethod],
+  );
+
+  // The amount actually charged. A `Money`, so no float can creep in between
+  // the rounding decision and the receipt.
+  const payable = useMemo(() => Money.fromSatang(rounding.payable), [rounding.payable]);
+
+  const canOpenDrawer = paymentMethod === 'cash';
+
   const handleCheckout = useCallback(async () => {
     if (submitting) return; // a double press must not write two orders
 
@@ -204,8 +303,14 @@ export function SalesTerminalView({ repository }: SalesTerminalViewProps = {}): 
         taxableSatang: totals.net.satang,
         taxSatang: totals.tax.satang,
         serviceChargeSatang: totals.serviceCharge.satang,
-        roundingAdjustmentSatang: 0n,
-        totalSatang: totals.total.satang,
+        // ⚠️ SIGNED, and COMMITTED — not merely displayed. Round-to-nearest moves
+        // both ways, so a cash total of ฿45.52 stores -2 satang here. It MUST be
+        // persisted rather than only shown, because `payable` is what the
+        // customer actually hands over; a stored unrounded total would make the
+        // shift report disagree with the cash drawer. Migration 0002 is what
+        // allows this column to be negative at all.
+        roundingAdjustmentSatang: rounding.adjustment,
+        totalSatang: rounding.payable,
       };
 
       const payload = toWireInput({
@@ -264,7 +369,43 @@ export function SalesTerminalView({ repository }: SalesTerminalViewProps = {}): 
       // it before would mean a cashier who taps twice has no basket and no
       // order — the sale is simply gone, and the till has no record of it.
       setCart(createCart());
-      setCheckout({ ok: true, receiptNumber: saved.receiptNumber });
+
+      // ── COMMIT-THEN-PRINT, and the order of those two words matters ─────────
+      //
+      // `save` resolved, so the money is committed and the sale happened. Only
+      // NOW is a printer touched. Printing first would mean a receipt for a sale
+      // that then failed to commit — a customer holding proof of a transaction
+      // the till has no record of, which is unrecoverable without a void flow
+      // that does not exist yet.
+      //
+      // The IR is built from `payable`, the SAME `Money` that went into
+      // `figures` above. Passing anything else would put one number on paper and
+      // another in the database, and neither would notice.
+      const print = printer ?? createNullReceiptPrinter();
+      const ir = buildReceiptIr({
+        cart,
+        shopName: 'ร้านวาลังอาซิ',
+        receiptNumber: saved.receiptNumber,
+        total: payable,
+        openDrawer: canOpenDrawer,
+      });
+
+      try {
+        await print.print(ir, printerEndpoint);
+        setCheckout({ ok: true, receiptNumber: saved.receiptNumber, printWarning: null });
+      } catch (printError) {
+        // A print failure is ADVISORY, not a rollback. The sale is committed and
+        // the money was taken; re-ringing it would double the sale. The result
+        // is therefore still `ok: true` — with a warning the cashier can act on
+        // — because `ok: false` would say the SALE failed, which it did not.
+        setCheckout({
+          ok: true,
+          receiptNumber: saved.receiptNumber,
+          printWarning: `บันทึกออเดอร์แล้ว แต่พิมพ์ใบเสร็จไม่สำเร็จ: ${
+            printError instanceof Error ? printError.message : String(printError)
+          }`,
+        });
+      }
     } catch (error) {
       // The cart is left intact on purpose: nothing was committed, so the
       // cashier still has the sale in front of them to retry.
@@ -275,7 +416,7 @@ export function SalesTerminalView({ repository }: SalesTerminalViewProps = {}): 
     } finally {
       setSubmitting(false);
     }
-  }, [cart, repo, submitting, totals, units]);
+  }, [cart, repo, submitting, totals, units, rounding, payable, canOpenDrawer, printer, printerEndpoint]);
 
   // ── Render ────────────────────────────────────────────────────────────────
 
@@ -330,6 +471,39 @@ export function SalesTerminalView({ repository }: SalesTerminalViewProps = {}): 
           </div>
         </dl>
 
+        {/* ── Payment method, and the rounding it causes ──────────────────────
+            Shown BEFORE the customer confirms, never after. A customer who is
+            charged ฿45.50 instead of ฿45.52 has to see WHY while they can still
+            ask about it; revealing it on the receipt is how a till earns a
+            complaint at the counter.
+
+            The adjustment line renders only when it is non-zero. A cash sale of
+            exactly ฿45.50 needs no explanation, and a "ปัดเศษ ฿0.00" row on every
+            receipt trains staff to stop reading the one that matters. */}
+        <fieldset className="sales-terminal__payment" aria-label="ช่องทางชำระเงิน">
+          <legend>ช่องทางชำระเงิน</legend>
+          {PAYMENT_METHODS.map((method) => (
+            <label key={method.id} className="sales-terminal__payment-option">
+              <input
+                type="radio"
+                name="payment-method"
+                value={method.id}
+                checked={paymentMethod === method.id}
+                disabled={submitting}
+                onChange={() => setPaymentMethod(method.id)}
+                data-testid={`payment-${method.id}`}
+              />
+              {method.label}
+            </label>
+          ))}
+        </fieldset>
+
+        {rounding.adjustment !== 0n && (
+          <p className="sales-terminal__rounding" data-testid="checkout-rounding">
+            {`${roundingRowText(rounding.adjustment, payable.toString())}`}
+          </p>
+        )}
+
         <button
           type="button"
           className="sales-terminal__pay"
@@ -338,13 +512,28 @@ export function SalesTerminalView({ repository }: SalesTerminalViewProps = {}): 
           // a second press mid-transaction would attempt a second order.
           disabled={cart.items.length === 0 || submitting}
         >
-          {submitting ? 'กำลังบันทึก…' : `ชำระเงิน ${formatBaht(subtotal)}`}
+          {/* The PAYABLE total, not the subtotal: if cash rounding moved it, the
+              button must quote the amount that will actually be charged. */}
+          {submitting ? 'กำลังบันทึก…' : `ชำระเงิน ${formatBaht(payable)}`}
         </button>
 
         {checkout?.ok === true && (
-          <p className="sales-terminal__receipt" data-testid="checkout-receipt">
-            {`บันทึกใบเสร็จ ${checkout.receiptNumber} แล้ว`}
-          </p>
+          <>
+            <p className="sales-terminal__receipt" data-testid="checkout-receipt">
+              {`บันทึกใบเสร็จ ${checkout.receiptNumber} แล้ว`}
+            </p>
+            {/* Rendered ALONGSIDE the success line, never instead of it: the sale
+                did happen, and only the paper failed. */}
+            {checkout.printWarning !== null && (
+              <p
+                className="sales-terminal__error"
+                data-testid="checkout-print-warning"
+                role="alert"
+              >
+                {checkout.printWarning}
+              </p>
+            )}
+          </>
         )}
         {checkout?.ok === false && (
           <p className="sales-terminal__error" data-testid="checkout-error" role="alert">

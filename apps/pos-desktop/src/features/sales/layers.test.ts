@@ -140,6 +140,12 @@ describe('infrastructure/ is the only layer allowed to reach for Tauri', () => {
     const ALLOWED = new Set([
       '@tauri-apps/api/core',
       '../application/offlineOrders',
+      // The receipt-printer port and the IR it carries. Both are legitimate edge
+      // imports: the adapter implements a port, and a printer request has to
+      // carry a receipt somewhere. The guard exists to stop the edge reaching
+      // INTO the UI or the native layer, not to forbid the features it serves.
+      '../application/receiptPrinter',
+      '../domain/receiptLayout',
       '../../payments/domain/money',
       '../../domain/cart',
       '../../domain/lineId',
