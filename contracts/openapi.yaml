@@ -10,22 +10,46 @@ info:
     from it into `packages/api-types/src/index.ts` by `openapi-typescript` and
     must never be edited by hand.
 
-    ## Money rule — Satang (int64)
+    ## Money rule — Satang (decimal string)
 
-    Every monetary field in this contract is an **integer count of satang**,
-    expressed as `type: integer, format: int64`. 1 Baht = 100 satang, so ฿45.50
-    is `4550`. There is **no float, no decimal point, and no currency symbol on
+    Every monetary field in this contract is a **whole number of satang carried
+    as a JSON string**, e.g. `"4550"`. 1 Baht = 100 satang, so ฿45.50 is
+    `"4550"`. There is **no float, no decimal point, and no currency symbol on
     the wire**. A field whose name ends in `_satang` always holds this value.
 
     Rationale: `3 × 0.1 = 0.30000000000000004`. A POS that drifts a fraction of
     a satang per line item cannot reconcile at end of shift. Integer satang
     makes that class of error unrepresentable.
 
-    **JSON caveat, stated deliberately:** JSON has one number type, so an
-    `int64` reaches JavaScript as a `number` and loses precision above
-    2^53 - 1. Every satang value in this contract is far below that
-    (฿90 trillion). The TypeScript side wraps these in the `Money` value object
-    (`bigint`) at the boundary rather than doing arithmetic on them directly.
+    **Why a string and not `type: integer`.** JSON has exactly one number type,
+    and IEEE-754 doubles carry integers exactly only up to 2^53 - 1. A bare
+    satang literal would reach JavaScript as a `number`, making precision loss a
+    property of the *type* rather than a rule the caller must remember.
+    Quoting the digits takes the value out of the number type entirely, so
+    TypeScript binds it as `string` and the `bigint` conversion inside the
+    `Money` value object is the only way to do arithmetic on it.
+
+    This is a **unification, not a new convention.** Three readers already
+    refuse anything but canonical digits, and all of them enforce
+    `^(0|[1-9][0-9]*)$`, which rejects `-1`, `+1`, `007`, `1.0` and `" 1"`:
+
+      * `parse_satang` in `apps/pos-desktop/src-tauri/src/commands.rs`
+      * `SATANG_PATTERN` in
+        `apps/pos-desktop/src/features/sales/infrastructure/tauriOfflineOrders.ts`
+      * the `typeof(...) = 'integer'` column CHECKs in
+        `apps/pos-desktop/src-tauri/migrations/0001_init.sql`
+
+    `Satang` below states that pattern in the contract instead of leaving it as
+    an unwritten implementation detail, so a generated client validates exactly
+    what the terminal's disk layer already rejects.
+
+    **The one signed money field.** `rounding_adjustment_satang` is the single
+    exception to the pattern above, and it is signed on purpose. Cash rounding
+    rounds the amount charged to the nearest value actually payable from the
+    drawer, and that value can sit on *either* side of the exact total — ฿45.53
+    may round up to ฿45.55 or down to ฿45.50. A non-negative field could only
+    express half of that. See `SignedSatang` and the arithmetic caveat recorded
+    on `Order`.
 
     ## Identifiers — UUIDv7
 
@@ -72,6 +96,14 @@ tags:
     description: Sellable items and their prices. Pulled down for local cache.
   - name: Inventory
     description: Stock levels per branch. Read-only on the client.
+  - name: Orders
+    description: |
+      Committed sales. Read-only over HTTP by design — a committed sale is never
+      restated in place, so corrections are a void or a refund, not an update.
+  - name: Sync
+    description: |
+      The offline drain. A terminal records events locally and pushes them when the
+      network returns; this is the endpoint that makes an offline sale real.
 
 paths:
   # ==========================================================================
@@ -164,6 +196,106 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
 
+  /orders/{id}:
+    get:
+      tags: [Orders]
+      operationId: getOrder
+      summary: Fetch one order
+      description: |
+        Returns a single order by id, with its lines and payments.
+
+        The id is the **terminal-generated UUIDv7**, not a server sequence. A sale
+        taken while offline must be fetchable by the identifier it already has, and
+        a server-assigned id would leave an offline order permanently unaddressable
+        until sync — which is precisely when a manager needs to see it.
+
+        Read-only by design. There is no `PUT` or `PATCH` here: a committed sale is
+        never restated in place. The terminal's own immutability trigger enforces
+        that locally, and a write endpoint here would let a remote caller violate a
+        rule the client is already forbidden to break. Corrections are new orders,
+        or a void, or a refund.
+
+        **`status` and `lifecycle_status` are both present.** `status` is the
+        three-value settled enum; `lifecycle_status` is the full eight-state
+        preparation ladder. Reading only `status` would make an order that is
+        merely `submitted` indistinguishable from one that does not exist.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+        - $ref: '#/components/parameters/BranchId'
+      responses:
+        '200':
+          description: The order, with lines and payments.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /sync/push:
+    post:
+      tags: [Sync]
+      operationId: pushSyncCommands
+      summary: Drain a terminal's outbox
+      description: |
+        Accepts a batch of events recorded while the terminal was offline and
+        applies them, then reports what happened to each one.
+
+        **The `Idempotency-Key` header is required.** A terminal that loses the
+        response to a successful push retries the identical batch, so without this
+        key a lost response means every sale in the batch is applied twice.
+
+        **Commands are applied in array order and must not be reordered.** The
+        terminal's outbox is an `AUTOINCREMENT` sequence, and replaying a
+        `shift_opened` after the `shift_closed` that ended it would corrupt the
+        till's day. Order is therefore semantic here, not incidental.
+
+        **One bad command does not fail the batch.** Each command carries its own
+        outcome in the response, because a terminal that loses a whole batch to one
+        malformed event can never drain that batch again — it will fail the same
+        way forever. Only a malformed *envelope* fails the request as a whole.
+
+        **No authentication in this revision.** `terminal_id` is client-asserted
+        and unverified, so this endpoint will accept events from a caller that has
+        not proved it owns that terminal. It is specified and implemented now
+        because the offline drain is the system's load-bearing path, but the
+        `401`/`403` responses below are aspirational: no credential is checked
+        yet. Do not expose this route publicly before device credentials land.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SyncPushRequest'
+      responses:
+        '200':
+          description: |
+            The batch was processed. Inspect each result to see what happened;
+            `200` means the request was well-formed, not that every command
+            was applied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SyncPushResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
 components:
 
   # ==========================================================================
@@ -239,6 +371,44 @@ components:
       style: form
       explode: false
 
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        Replay-safety key for the **whole drain attempt**.
+
+        Required, not optional, because the failure this prevents is not a rare
+        race: a terminal that loses the response to a successful push will retry
+        the identical batch, and without this key every command in it is applied
+        twice. That double-books a sale the customer was already charged for.
+
+        Deliberately a *header* rather than a body field. The server must be able
+        to reject a duplicate batch **before parsing the body**; a key that can
+        arrive inside the payload only after a multi-megabyte upload has been
+        received and parsed cannot prevent the work it exists to prevent.
+
+        This is distinct from each command's own `idempotency_key`, which dedupes
+        one event. The two levels are not redundant: the header stops a whole
+        batch being reprocessed, the per-command key stops a single event being
+        applied twice when two *different* batches overlap.
+      schema:
+        type: string
+        minLength: 8
+        maxLength: 128
+      example: a3f1c7e2-9d64-4b0a-9f31-6c2d5e7a1b48
+
+    OrderId:
+      name: id
+      in: path
+      required: true
+      description: |
+        The order to fetch. A UUIDv7, so it is the same identifier the terminal
+        generated offline — a server-assigned id would make this lookup useless
+        for the exact case it exists to serve, an order created with no network.
+      schema:
+        $ref: '#/components/schemas/UuidV7'
+
   # ==========================================================================
   # Reusable responses
   # ==========================================================================
@@ -269,6 +439,21 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
+    NotFound:
+      description: |
+        No such order.
+
+        Also returned when the order exists but belongs to a branch the calling
+        credential is not scoped to. A distinct `403` would leak the existence of
+        another branch's sales to a terminal that cannot read them, so the server
+        answers `404` for both and logs the real reason server-side.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+        example:
+          code: order_not_found
+          message: No order with that id in this branch.
 
   # ==========================================================================
   # Schemas
@@ -287,21 +472,65 @@ components:
       example: 018f3c2a-7b41-7c3d-9e10-5a2b8c4d6e01
 
     Satang:
+      type: string
+      pattern: '^(0|[1-9][0-9]*)$'
+      description: |
+        **MONEY — Satang (whole satang, quoted digits).** A count of satang
+        carried as a string. 1 Baht = 100 satang, so ฿45.50 is `"4550"`.
+
+        Never a float, never a decimal point, never a currency symbol, never a
+        bare JSON number. Two decimal places of *major* currency are already
+        carried by the scale factor of 100; a value of `"1250"` means ฿12.50
+        unambiguously.
+
+        The pattern admits **canonical non-negative digits only**. It rejects
+        `"-1"` (sign), `"+1"` (explicit plus), `"007"` (leading zeros), `"1.0"`
+        (decimal point), `" 1"` (whitespace) and `""` (empty). Each of those
+        rejections is load-bearing: two clients that disagree about whether
+        `"007"` is 7 satang will disagree about a customer's total at close.
+
+        String typing is what makes that guarantee enforceable. As
+        `type: integer` the schema would admit `"1.5"` and `1e3` implicitly via
+        JSON Schema's numeric coercion; as a string the pattern above is exact.
+
+        Range: ฿90 trillion is 2^53 satang, far beyond any single transaction
+        here, but the string form has no upper bound and no rounding at any
+        size.
+      example: '4550'
+
+    SignedSatang:
       type: integer
       format: int64
-      minimum: 0
       description: |
-        **MONEY — Satang (int64).** An integer count of satang. 1 Baht = 100
-        satang, so ฿45.50 is `4550`.
+        **MONEY — signed satang, for cash rounding only.** The one money field
+        in this contract that may be negative, used exclusively for
+        `rounding_adjustment_satang`.
 
-        Never a float, never a decimal point, never a currency symbol. Two
-        decimal places of *major* currency are already carried by the scale
-        factor of 100; a value of `1250` means ฿12.50 unambiguously.
+        Deliberately typed `integer`/`int64` rather than as a `Satang` string.
+        Rounding to the nearest payable denomination is a genuinely signed
+        operation: ฿45.53 can round *up* to ฿45.55 or *down* to ฿45.50, and a
+        `Satang` pattern would make the down case unrepresentable, forcing the
+        client to lie about the direction of the adjustment in order to keep the
+        sign. Negative is written with a leading `-` and no `+` form.
 
-        Range: 0 .. 2^53-1 is safe through JSON. 2^53 satang is ฿90 trillion,
-        which no single transaction in this system approaches. Values beyond
-        that must be transported as a string, not a number.
-      example: 4550
+        There is **no `minimum`** here, unlike every other money field, and that
+        absence is the whole point of the exception.
+
+        The single bound that does apply is on the *total*, not on this field:
+        `total_satang >= 0`. Rounding may move the amount charged down, but it may
+        not make the sale negative, because a refund in this system is a separate
+        document rather than an order that costs the customer money. That is
+        enforced by `CHECK (total_satang >= 0)` in
+        `0002_signed_rounding.sql`, which is the migration that dropped
+        `rounding_adjustment_satang >= 0` in the first place.
+
+        Note for a reader arriving from the signed-rounding migration: Rust's
+        `parse_satang` and the terminal's `SATANG_PATTERN` both still apply
+        `^(0|[1-9][0-9]*)$` to every `*_satang` field they read, with no signed
+        exception yet. A negative adjustment is therefore still refused at the
+        terminal's own boundary before it reaches this endpoint. That gap is on
+        the client side, not in this schema.
+      example: -3
 
     Quantity:
       type: string
@@ -557,8 +786,8 @@ components:
         unit_price_satang:
           allOf: [$ref: '#/components/schemas/Satang']
           description: |
-            **MONEY — Satang (int64).** Price for one unit, before tax and
-            before discount. ฿45.50 is `4550`.
+            **MONEY — Satang.** Price for one unit, before tax and before
+            discount. ฿45.50 is `"4550"`.
 
             Promotions do not modify this value. A discount is a separate
             resolved amount applied at checkout, so the list price stays
@@ -782,6 +1011,531 @@ components:
           type: string
           nullable: true
           description: Pagination cursor when the response is partial. `null` when complete.
+      additionalProperties: false
+
+    OrderStatus:
+      type: string
+      enum: [completed, void_requested, voided]
+      description: |
+        **SETTLEMENT STATE.** The three states an order can be *retired* into.
+
+        This is deliberately narrower than `OrderLifecycleStatus`. A GET of a
+        sale that has not settled yet cannot be answered with this enum, which is
+        why `Order` carries both: `status` answers "is this sale final, and if
+        not, is it being taken back?" while `lifecycle_status` answers "where in
+        preparation is this sale?".
+
+        The three values are terminal. Nothing leaves this set, so a client that
+        has seen `status` can cache the order as final and never re-poll.
+      example: completed
+
+    OrderLifecycleStatus:
+      type: string
+      enum: [draft, submitted, in_preparation, ready, served, completed, void_requested, voided]
+      description: |
+        **PREPARATION LIFECYCLE.** The full eight-state ladder, kept identical to
+        `local_orders.status` CHECK in
+        `apps/pos-desktop/src-tauri/migrations/0001_init.sql` so that no state a
+        terminal can persist is unrepresentable here.
+
+        The last three values are exactly `OrderStatus`, which is why the settled
+        enum above is a subset rather than a separate vocabulary.
+
+        `void_requested` precedes `voided`: the terminal may ask for a void while
+        offline, and the void is not an input fact until staff approve it. A
+        client must not treat `void_requested` as refunded cash.
+      example: in_preparation
+
+    OrderType:
+      type: string
+      enum: [dine_in, takeaway, delivery]
+      description: Sale type. Closed enum, matching `local_orders.type`.
+      example: dine_in
+
+    OrderSource:
+      type: string
+      enum: [pos_desktop, pos_mobile, admin]
+      description: |
+        Originating client. Lets the server attribute a back-office correction
+        differently from a till sale. Matches `local_orders.source`.
+      example: pos_desktop
+
+    OrderDiscountType:
+      type: string
+      nullable: true
+      enum: [member, promotion, manual_supervisor, staff]
+      description: |
+        Why the discount was applied, `null` when there was no discount.
+
+        Closed enum on purpose: an unauthorised discount must fail validation
+        rather than arrive as free text that the end-of-shift report groups under
+        an unknown label. Matches `local_orders.discount_type`.
+      example: member
+
+    OrderSyncState:
+      type: string
+      enum: [pending, synced, conflict, rejected]
+      description: |
+        Delivery state of this order's sync. Mutable and **not money** — the
+        terminal's money-immutability trigger must never block it.
+        Matches `local_orders.sync_state`.
+      example: synced
+
+    VatRateBp:
+      type: integer
+      minimum: 0
+      description: |
+        VAT rate in BASIS POINTS, 1 bp = 0.01%. Default 700 = 7.00%.
+
+        Basis points rather than a percentage so the rate is exact integer
+        arithmetic: 7 percent is `700`, never `6.999999999`. Matches
+        `local_orders.vat_rate_bp`.
+      example: 700
+
+    LoyaltyPoints:
+      type: integer
+      minimum: 0
+      description: |
+        Loyalty points earned on this sale. A count and not money, hence no
+        `_satang` suffix.
+      example: 12
+
+    Order:
+      type: object
+      description: |
+        A completed sale with its lines and its payments.
+
+        Every `*_satang` field here is a `Satang` string (`"4550"`), **except**
+        `rounding_adjustment_satang`, which is a `SignedSatang` integer because
+        cash rounding is signed.
+
+        **The money identity.** The VAT decomposition is pinned to `gross`, not
+        to the total:
+
+          gross            = subtotal_satang - discount_satang
+          taxable + tax    = gross
+          total_satang     = gross + service_charge_satang + rounding_adjustment_satang
+          total_satang >= 0
+
+        `taxable_satang` holds the NET — the VAT-exclusive portion extracted from
+        the VAT-inclusive `gross` — which is why `taxable + tax == gross` and not
+        `== total`. That distinction is what makes a **negative**
+        `rounding_adjustment_satang` safe: cash rounding is a settlement of the
+        tender and not consideration for goods, so it carries no VAT and never
+        enters the decomposition. A receipt whose VAT halves still describe the
+        goods identically whether the total was rounded up, down, or not at all.
+
+        `0002_signed_rounding.sql` writes the third identity the long way round —
+        `CHECK (taxable_satang + tax_satang = total_satang - service_charge_satang
+        - rounding_adjustment_satang)` — which is algebraically identical once the
+        total identity holds. Do not read the long form as implying that rounding
+        participates in the VAT base; it does not.
+      required:
+        - id
+        - branch_id
+        - terminal_id
+        - staff_user_id
+        - type
+        - status
+        - lifecycle_status
+        - source
+        - currency_code
+        - vat_rate_bp
+        - subtotal_satang
+        - discount_satang
+        - taxable_satang
+        - tax_satang
+        - service_charge_satang
+        - rounding_adjustment_satang
+        - total_satang
+        - loyalty_points_earned
+        - sync_state
+        - local_receipt_number
+        - created_at
+        - updated_at
+        - lines
+      properties:
+        id:
+          $ref: '#/components/schemas/UuidV7'
+        branch_id:
+          $ref: '#/components/schemas/UuidV7'
+        terminal_id:
+          $ref: '#/components/schemas/UuidV7'
+        staff_user_id:
+          $ref: '#/components/schemas/UuidV7'
+        type:
+          $ref: '#/components/schemas/OrderType'
+        status:
+          $ref: '#/components/schemas/OrderStatus'
+        lifecycle_status:
+          $ref: '#/components/schemas/OrderLifecycleStatus'
+        source:
+          $ref: '#/components/schemas/OrderSource'
+        currency_code:
+          $ref: '#/components/schemas/CurrencyCode'
+        vat_rate_bp:
+          $ref: '#/components/schemas/VatRateBp'
+        subtotal_satang:
+          allOf: [$ref: '#/components/schemas/Satang']
+          description: Sum of line totals before order-level discount.
+        discount_satang:
+          allOf: [$ref: '#/components/schemas/Satang']
+          description: Order-level discount, capped by `subtotal_satang`.
+        taxable_satang:
+          allOf: [$ref: '#/components/schemas/Satang']
+          description: The VAT base = `subtotal_satang - discount_satang`.
+        tax_satang:
+          allOf: [$ref: '#/components/schemas/Satang']
+          description: |
+            VAT in satang, derived from `taxable_satang` and `vat_rate_bp` as
+            `round_half_up(gross * 10000 / (10000 + vat_rate_bp))`.
+
+            Rounded **once per order**, never per line, which is why
+            `OrderLine.line_tax_satang` is pinned to zero. Not a SQLite CHECK yet
+            — the formula is marked `TODO(TAX-FORMULA)` in the migration.
+        service_charge_satang:
+          allOf: [$ref: '#/components/schemas/Satang']
+          description: |
+            Service charge. Zero when the branch has none, because a non-zero
+            default is a charge nobody can explain.
+        rounding_adjustment_satang:
+          allOf: [$ref: '#/components/schemas/SignedSatang']
+          description: |
+            Satang **added or subtracted** so the total is payable in the exact
+            cash and coin denominations in the drawer (Thai baht coins end in 5).
+
+            Signed, unlike every other money field, and the only negative money
+            value in this contract. See the identity caveat on this schema before
+            sending a negative value.
+        total_satang:
+          allOf: [$ref: '#/components/schemas/Satang']
+          description: The amount actually charged.
+        discount_type:
+          $ref: '#/components/schemas/OrderDiscountType'
+        loyalty_points_earned:
+          $ref: '#/components/schemas/LoyaltyPoints'
+        sync_state:
+          $ref: '#/components/schemas/OrderSyncState'
+        local_receipt_number:
+          type: string
+          description: |
+            The number printed on the till receipt, local and monotonic per
+            terminal. The server assigns the authoritative receipt number at
+            sync, so this value is what the customer is holding.
+        created_at:
+          type: string
+          format: date-time
+          description: RFC 3339 UTC.
+        updated_at:
+          type: string
+          format: date-time
+          description: RFC 3339 UTC.
+        lines:
+          type: array
+          minItems: 1
+          description: |
+            The sale's lines. `minItems: 1` because an order with no lines has no
+            meaningful total, and `total_satang` would be a rounding artefact
+            rather than a price.
+          items:
+            $ref: '#/components/schemas/OrderLine'
+        payments:
+          type: array
+          description: |
+            Payments tendered against this order. Not in the required list
+            because an order can exist, and be looked up, before payment is
+            recorded — and a zero-element array is meaningfully different from an
+            absent one.
+          items:
+            $ref: '#/components/schemas/Payment'
+      additionalProperties: false
+
+    OrderLine:
+      type: object
+      description: |
+        One line of a sale. Names are frozen at sale time, so a later catalogue
+        rename never rewrites a historical receipt.
+      required:
+        - id
+        - order_id
+        - variant_id
+        - name_th
+        - quantity
+        - unit_price_satang
+        - line_discount_satang
+        - line_tax_satang
+        - line_total_satang
+        - created_at
+      properties:
+        id:
+          $ref: '#/components/schemas/UuidV7'
+        order_id:
+          $ref: '#/components/schemas/UuidV7'
+        variant_id:
+          $ref: '#/components/schemas/UuidV7'
+          description: |
+            Catalogue variant. A plain id and **not** a foreign key, because the
+            catalogue is server-owned and a terminal must be able to record a
+            sale while offline with the catalogue unavailable.
+        product_id:
+          allOf: [$ref: '#/components/schemas/UuidV7']
+          nullable: true
+          description: Denormalised parent product, `null` if not known offline.
+        sku:
+          type: string
+          nullable: true
+          description: Denormalised SKU at sale time, `null` if not known offline.
+        name_th:
+          type: string
+          description: |
+            Thai name frozen at sale time. NOT NULL because the Thai name is what
+            the kitchen reads; the English name is optional.
+        name_en:
+          type: string
+          nullable: true
+          description: English name frozen at sale time.
+        quantity:
+          $ref: '#/components/schemas/Quantity'
+        unit_price_satang:
+          allOf: [$ref: '#/components/schemas/Satang']
+          description: |
+            Price of ONE unit, before line discount and before tax. This is the
+            VAT-INCLUSIVE menu price.
+        line_discount_satang:
+          allOf: [$ref: '#/components/schemas/Satang']
+          description: |
+            Discount applied to this line. Capped by `unit_price_satang *
+            quantity`, enforced as a SQLite CHECK so a discount cannot exceed the
+            line it discounts.
+        line_tax_satang:
+          allOf: [$ref: '#/components/schemas/Satang']
+          description: |
+            VAT attributable to this line. **Always `"0"`, and the terminal
+            enforces `= 0` with a CHECK.**
+
+            Not an oversight: VAT is rounded once per order, so there is no
+            per-line VAT to store. A non-zero value here would be a line-level
+            rounding the order-level figure does not contain, and the two would
+            disagree by a satang per line — drift a tax return cannot absorb. The
+            field is kept so the storage contract keeps its shape.
+        line_total_satang:
+          allOf: [$ref: '#/components/schemas/Satang']
+          description: |
+            This line's contribution to the order total =
+            `unit_price_satang * quantity - line_discount_satang + line_tax_satang`.
+        created_at:
+          type: string
+          format: date-time
+          description: RFC 3339 UTC.
+      additionalProperties: false
+
+    PaymentMethod:
+      type: string
+      enum: [cash, qr_promptpay]
+      description: |
+        How the customer paid.
+
+        Deliberately short and closed. PromptPay is spelled `qr_promptpay` rather
+        than `promptpay` because the leading `qr_` marks it as one of several
+        possible QR schemes; renaming it later would be a breaking change on a
+        field that is already in historical receipts.
+
+        Card payments are absent, not forgotten: this system has no card
+        terminal integration, and an enum that reserves a slot for an unimplemented
+        method invites a client to render a button that cannot work.
+      example: cash
+
+    Payment:
+      type: object
+      description: |
+        One payment tendered against an order.
+
+        **Server-authoritative and not yet mirrored on the terminal.** There is no
+        `payments` table in
+        `apps/pos-desktop/src-tauri/migrations/0001_init.sql`; cash tendering is
+        recorded as a field of the order. So a terminal cannot read a payment back
+        from local disk, and a `Payment` only ever exists server-side after sync.
+        Anything that needs to work offline must not depend on this schema.
+      required: [id, order_id, amount_satang, method]
+      properties:
+        id:
+          $ref: '#/components/schemas/UuidV7'
+        order_id:
+          $ref: '#/components/schemas/UuidV7'
+        amount_satang:
+          allOf: [$ref: '#/components/schemas/Satang']
+          description: |
+            Amount tendered in satang. Does not have to sum to
+            `Order.total_satang`: an over-tender produces change, and split
+            payment across several methods is legitimate.
+        method:
+          $ref: '#/components/schemas/PaymentMethod'
+      additionalProperties: false
+
+    SyncAggregateType:
+      type: string
+      enum: [order, shift, refund, void_request, receipt, stock_movement]
+      description: |
+        Which kind of domain object a queued event is about. Matches
+        `sync_outbox.aggregate_type`.
+      example: order
+
+    SyncEventType:
+      type: string
+      enum:
+        - order_committed
+        - shift_opened
+        - shift_closed
+        - receipt_printed
+        - refund_issued
+        - void_approved
+        - stock_movement_recorded
+      description: |
+        WHAT happened, as a closed vocabulary. Matches `sync_outbox.event_type`.
+
+        A new event type needs a forward migration, because adding a member here
+        is exactly the way a terminal's drain and the server's contract drift
+        apart.
+      example: order_committed
+
+    SyncAction:
+      type: string
+      enum: [push_order, push_shift, pull_catalog, pull_customers, pull_settings]
+      description: HOW to deliver the event. Matches `sync_outbox.action`.
+      example: push_order
+
+    SyncCommand:
+      type: object
+      description: |
+        One drained outbox event, replayed verbatim.
+
+        `payload` is a **JSON object, not a typed schema**. Modelling every
+        payload inline would mean a new event type forces a contract change in
+        lockstep with a terminal migration, which is precisely the coupling the
+        outbox exists to avoid: an old terminal draining a queue written by a new
+        build must be able to hand the server something the server recognises.
+        The terminal CHECKs `json_valid(payload) AND json_type(payload) = 'object'`
+        so at least the envelope is guaranteed here.
+      required: [id, aggregate_type, aggregate_id, event_type, action, idempotency_key, payload]
+      properties:
+        id:
+          $ref: '#/components/schemas/UuidV7'
+        aggregate_type:
+          $ref: '#/components/schemas/SyncAggregateType'
+        aggregate_id:
+          $ref: '#/components/schemas/UuidV7'
+        event_type:
+          $ref: '#/components/schemas/SyncEventType'
+        action:
+          $ref: '#/components/schemas/SyncAction'
+        idempotency_key:
+          type: string
+          description: |
+            Replay-safety key for the server-side dedup table, unique per
+            terminal. This is the **event-level** key, distinct from the
+            `Idempotency-Key` header, which dedupes the drain attempt as a whole.
+        payload:
+          type: object
+          description: The event body, as recorded offline.
+          additionalProperties: true
+      additionalProperties: false
+
+    SyncPushRequest:
+      type: object
+      description: |
+        A batch of outbox events drained by one terminal.
+
+        Ordered by the terminal's monotonic local `sequence`, and the contract
+        preserves that order because replaying a `shift_opened` after the
+        `shift_closed` that ended it would corrupt the till's day. The server
+        applies commands in array order and must not reorder them.
+      required: [terminal_id, commands]
+      properties:
+        terminal_id:
+          $ref: '#/components/schemas/UuidV7'
+        commands:
+          type: array
+          description: |
+            The drained events, in local sequence order. May be empty: a drain
+            that raced another drain must be a no-op success, not an error, or the
+            terminal will back off against a queue it has already emptied.
+          items:
+            $ref: '#/components/schemas/SyncCommand'
+      additionalProperties: false
+
+    SyncCommandOutcome:
+      type: string
+      enum: [applied, duplicate, rejected]
+      description: |
+        What the server did with one command.
+
+        `duplicate` is a **success**, not a failure: it means the command's
+        `idempotency_key` was already applied, which is the normal outcome of a
+        retry after a response lost in flight. A terminal must treat it as done,
+        or it will retry a command the server already has forever.
+
+        `rejected` is permanent and says the server will never take this command;
+        the terminal moves it to `failed_permanent` and stops trying.
+      example: applied
+
+    SyncCommandResult:
+      type: object
+      description: Per-command outcome, correlated by `id`.
+      required: [id, outcome]
+      properties:
+        id:
+          $ref: '#/components/schemas/UuidV7'
+          description: Matches the `id` of the submitted command.
+        outcome:
+          $ref: '#/components/schemas/SyncCommandOutcome'
+        error_code:
+          type: string
+          nullable: true
+          description: Machine-readable reason, present only when `outcome` is `rejected`.
+        error_message:
+          type: string
+          nullable: true
+          description: |
+            Human-readable reason. Must not be parsed; branch on `error_code`.
+      additionalProperties: false
+
+    SyncPushResponse:
+      type: object
+      description: |
+        Result of one drain attempt.
+
+        `results` is positional-by-`id`, not positional-by-index: a terminal
+        drains concurrently, so it must correlate by `id` rather than assuming
+        index `n` of the request came back at index `n`.
+      required: [results, applied, duplicates, rejected, pushed_at]
+      properties:
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/SyncCommandResult'
+        applied:
+          type: integer
+          minimum: 0
+          description: Count of commands newly applied.
+        duplicates:
+          type: integer
+          minimum: 0
+          description: Count of commands already applied under this idempotency key.
+        rejected:
+          type: integer
+          minimum: 0
+          description: Count of commands the server refused permanently.
+        pushed_at:
+          type: string
+          format: date-time
+          description: Server time this batch was processed, RFC 3339 UTC.
+        cursor:
+          type: string
+          nullable: true
+          description: |
+            Newest sync cursor the server holds after applying the batch. Hand it
+            to the next incremental pull so the terminal does not re-fetch what
+            this push already covered.
       additionalProperties: false
 
     Error:

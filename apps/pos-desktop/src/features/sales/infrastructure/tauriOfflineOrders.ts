@@ -41,7 +41,11 @@
 
 import { invoke } from '@tauri-apps/api/core';
 
-import { Money } from '../../payments/domain/money';
+import {
+  Money,
+  MoneyError,
+  satangFromWire as satangFromWireChecked,
+} from '../../payments/domain/money';
 import {
   OfflineOrdersError,
   sortByNewestFirst,
@@ -166,37 +170,21 @@ const SYNC_STATES = new Set<SyncState>(['pending', 'synced', 'conflict', 'reject
 /**
  * Parse a satang STRING from the wire into a `Money`.
  *
- * The grammar is the same one Rust enforces: `^(0|[1-9][0-9]*)$` and nothing
- * else. Rejecting rather than coercing is the whole point:
- *
- *   * `"4550 "` / `" 4550"` — whitespace a formatter added.
- *   * `"+4550"` / `"-4550"` — a sign. A refund is a separate row, not a negative
- *     sale.
- *   * `"4550.0"` — a float that happened to be whole. Laundering it through a
- *     string must not become a way around `Money.fromNumber`'s rejection.
- *   * `"4.55e3"`, `"0x11A"` — not base-ten digits.
- *   * `"04550"` — parses, and is exactly the shape a zero-padded formatter
- *     produces, so it is a bug worth reporting rather than absorbing.
- *
- * `BigInt()` accepts all of the above silently. That is why the grammar is
- * checked here instead of being delegated to the constructor.
+ * A thin wrapper over the shared `satangFromWire` in the money module. The
+ * grammar — `^(0|[1-9][0-9]*)$` — lives there rather than here because the Rust
+ * `parse_satang` enforces the same text, and a second copy in an adapter is how
+ * the catalogue boundary and the sync boundary end up accepting different
+ * spellings of one satang.
  */
-function satangFromWire(field: string, raw: unknown): Money {
-  if (typeof raw !== 'string') {
-    throw new OfflineOrdersError(
-      `${field} must arrive as a decimal-integer STRING, received ${typeof raw}. ` +
-        'Sending satang as a JSON number loses precision above 2^53 and fails silently.',
-    );
+function satangFromWireField(field: string, raw: unknown): Money {
+  try {
+    return satangFromWireChecked(field, raw);
+  } catch (cause) {
+    if (cause instanceof MoneyError) {
+      throw new OfflineOrdersError(cause.message);
+    }
+    throw cause;
   }
-
-  if (!/^(0|[1-9][0-9]*)$/.test(raw)) {
-    throw new OfflineOrdersError(
-      `${field} must match ^(0|[1-9][0-9]*)$, received ${JSON.stringify(raw)}. ` +
-        'A sign, decimal point, exponent, whitespace or leading zero is rejected.',
-    );
-  }
-
-  return Money.fromSatang(BigInt(raw));
 }
 
 /** Validate a non-money string field, naming the field if it is absent. */
@@ -245,7 +233,7 @@ function summaryFromWire(raw: unknown): OfflineOrderSummary {
     syncState: requiredEnum('syncState', wire.syncState, SYNC_STATES),
     createdAt: requiredString('createdAt', wire.createdAt),
     lineCount: requiredCount('lineCount', wire.lineCount),
-    total: satangFromWire('totalSatang', wire.totalSatang),
+    total: satangFromWireField('totalSatang', wire.totalSatang),
     currencyCode: requiredString('currencyCode', wire.currencyCode),
   });
 }

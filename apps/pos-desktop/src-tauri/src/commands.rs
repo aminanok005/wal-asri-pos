@@ -215,8 +215,10 @@ pub struct OrderSummary {
 /// how badly each one has bitten this codebase before:
 ///
 ///   * `"4550 "` / `" 4550"` — whitespace a formatter added.
-///   * `"+4550"` / `"-4550"` — a sign. Negative satang is never legitimate on a
-///     sale; a refund is a separate row with its own event type.
+///   * `"+4550"` / `"-4550"` — a sign. On a *price*, total, subtotal or tax, a
+///     negative is never legitimate: a refund is a separate row with its own event
+///     type. `rounding_adjustment_satang` is the single signed exception and has
+///     its own parser, [`parse_signed_satang`].
 ///   * `"4550.0"` — a float that happened to be whole. `Money.fromNumber` throws
 ///     on it in TypeScript, and the same value must not be laundered through a
 ///     string to get past that.
@@ -226,25 +228,96 @@ pub struct OrderSummary {
 ///     than absorbing.
 ///   * anything above `i64::MAX` — would silently wrap if cast.
 fn parse_satang(field: &str, raw: &str) -> Result<i64, CommandError> {
-  if raw.is_empty() {
-    return Err(CommandError::invalid(field, "is empty; satang must be a decimal integer"));
+  parse_satang_with(field, raw, false)
+}
+
+/// Parse the ONE signed money field, `rounding_adjustment_satang`.
+///
+/// Cash rounding moves the amount charged to the nearest value the drawer can
+/// actually pay, and that value sits on either side of the exact total: ฿45.53
+/// goes up to ฿45.55 or down to ฿45.50, and both are ordinary. The grammar is
+/// therefore `^-?(0|[1-9][0-9]*)$` — identical to [`parse_satang`] except that a
+/// single leading `-` is allowed.
+///
+/// This exists because the gap was silent rather than loud.
+/// `cashRounding::round_to_nearest_coin(4553, 25)` returns 4550, so the adjustment
+/// is `-3`; parsed with the unsigned grammar that `"-3"` was refused, and a ฿45.53
+/// cash sale could not be saved at all. Nothing warned — the feature simply did
+/// not work for the totals it was written for.
+///
+/// Everything else is still refused, and for the same reasons as the unsigned path:
+///
+///   * `"+3"` — an explicit plus. Only `-` is canonical, so `+3` and `3` would be
+///     two spellings of one value.
+///   * `"-0"` and `"-03"` — a sign followed by a non-canonical digit run. `-0` is a
+///     second spelling of zero for the same reason `"00"` is.
+///   * `"-"` and `"--3"` — a sign with no usable magnitude.
+///   * whitespace, decimal points and exponents, exactly as unsigned.
+///
+/// **Scope limit.** This parser makes a negative adjustment *representable* at
+/// the bridge. It does not make it *correct*: whether a given negative is
+/// economically sensible is not a question a string parser can answer, and the
+/// bounds live in SQL (`CHECK (total_satang >= 0)` in
+/// `0002_signed_rounding.sql`) rather than here. This function's only job is to
+/// refuse the spellings that are not integers.
+fn parse_signed_satang(field: &str, raw: &str) -> Result<i64, CommandError> {
+  parse_satang_with(field, raw, true)
+}
+
+/// The one implementation of the satang digit grammar.
+///
+/// `signed` admits a single leading `-`. One function rather than two near-copies
+/// because a grammar that exists twice is a grammar that eventually disagrees with
+/// itself, and a disagreement here is a money field one caller accepts and another
+/// refuses — the exact cross-language drift `migrations.test.ts` guards against on
+/// the SQL side.
+fn parse_satang_with(field: &str, raw: &str, signed: bool) -> Result<i64, CommandError> {
+  let (negative, digits) = match raw.strip_prefix('-') {
+    Some(rest) if signed => (true, rest),
+    _ => (false, raw),
+  };
+
+  if digits.is_empty() {
+    let detail = if negative {
+      "is a bare '-'; satang must be a decimal integer with a magnitude"
+    } else {
+      "is empty; satang must be a decimal integer"
+    };
+    return Err(CommandError::invalid(field, detail));
   }
-  if !raw.bytes().all(|b| b.is_ascii_digit()) {
+  if !digits.bytes().all(|b| b.is_ascii_digit()) {
     return Err(CommandError::invalid(
       field,
       &format!(
-        "must be plain base-ten digits, got {raw:?}; a sign, a decimal point, an exponent or \
+        "must be plain base-ten digits, got {raw:?}; a decimal point, an exponent or \
          surrounding whitespace is rejected so no value can reach SQLite as text"
       ),
     ));
   }
-  if raw.len() > 1 && raw.starts_with('0') {
+  if digits.len() > 1 && digits.starts_with('0') {
     return Err(CommandError::invalid(
       field,
       &format!("has a leading zero ({raw:?}); send the canonical integer form"),
     ));
   }
+  // `-0` parses to zero and is a second spelling of it, so it is refused for the
+  // same reason `"00"` is above.
+  if negative && digits == "0" {
+    return Err(CommandError::invalid(
+      field,
+      &format!("is {raw:?}; negative zero is a second spelling of zero, send \"0\""),
+    ));
+  }
 
+  // The whole string is parsed rather than the magnitude plus a manual negation.
+  // `i64::MIN` is the reason: its magnitude is 9223372036854775808, which is one
+  // larger than `i64::MAX`, so a positive i64 cannot hold it and negating after
+  // the fact would report `i64::MIN` as an overflow. Parsing the sign together
+  // with the digits gets that boundary right for free.
+  //
+  // Safe to hand `raw` rather than `digits`: by this point the grammar above has
+  // established that it is either all digits or a single `-` followed by digits,
+  // so there is no `+`, sign or whitespace left for the parser to reinterpret.
   raw
     .parse::<i64>()
     .map_err(|_| CommandError::invalid(field, &format!("{raw:?} does not fit in a signed 64-bit integer")))
@@ -317,7 +390,11 @@ fn write_order(conn: &mut Connection, input: &SaveOfflineOrderInput) -> Result<S
   let taxable = parse_satang("order.taxableSatang", &o.taxable_satang)?;
   let tax = parse_satang("order.taxSatang", &o.tax_satang)?;
   let service = parse_satang("order.serviceChargeSatang", &o.service_charge_satang)?;
-  let rounding = parse_satang("order.roundingAdjustmentSatang", &o.rounding_adjustment_satang)?;
+  // The ONLY signed money field. ฿45.53 rounding down to ฿45.50 is -3 satang, and
+  // `round_to_nearest_coin` produces exactly that, so parsing this with the
+  // unsigned grammar made a ฿45.53 cash sale unsavable. Every other money field
+  // above stays unsigned: a negative price, total or tax is a lost sign.
+  let rounding = parse_signed_satang("order.roundingAdjustmentSatang", &o.rounding_adjustment_satang)?;
   let total = parse_satang("order.totalSatang", &o.total_satang)?;
 
   if input.lines.is_empty() {
@@ -714,6 +791,75 @@ mod tests {
     assert!(parse_satang("f", &"9".repeat(30)).is_err());
   }
 
+  // ── the one signed money field ─────────────────────────────────────────────
+
+  #[test]
+  fn a_negative_rounding_adjustment_parses() {
+    // ฿45.53 rounds DOWN to ฿45.50 at a ฿0.25 step, so the adjustment is -3. This
+    // is the exact value `round_to_nearest_coin` produces, and it is what made a
+    // ฿45.53 cash sale unsavable while the feature read as working.
+    assert_eq!(parse_signed_satang("f", "-3").unwrap(), -3);
+    assert_eq!(parse_signed_satang("f", "-4550").unwrap(), -4550);
+    assert_eq!(parse_signed_satang("f", "-1").unwrap(), -1);
+  }
+
+  #[test]
+  fn the_signed_parser_still_accepts_a_non_negative_value() {
+    // A rounding adjustment of 0 is the overwhelmingly common case, so the signed
+    // parser must not be a second, subtly different dialect of the same grammar.
+    assert_eq!(parse_signed_satang("f", "0").unwrap(), 0);
+    assert_eq!(parse_signed_satang("f", "2").unwrap(), 2);
+    assert_eq!(parse_signed_satang("f", "4550").unwrap(), 4550);
+  }
+
+  #[test]
+  fn only_a_leading_minus_is_a_valid_sign() {
+    // `+3` and `3` would be two spellings of one value, so only the canonical `-`
+    // is admitted. `--3` is a sign with no usable magnitude.
+    assert!(parse_signed_satang("f", "+3").is_err());
+    assert!(parse_signed_satang("f", "-+3").is_err());
+    assert!(parse_signed_satang("f", "--3").is_err());
+    assert!(parse_signed_satang("f", "-").is_err());
+    assert!(parse_signed_satang("f", "").is_err());
+  }
+
+  #[test]
+  fn negative_zero_is_refused_as_a_second_spelling_of_zero() {
+    // Same reason "00" is refused on the unsigned path.
+    assert!(parse_signed_satang("f", "-0").is_err());
+    assert!(parse_satang("f", "0").is_ok());
+  }
+
+  #[test]
+  fn the_signed_parser_enforces_the_same_digit_rules_as_the_unsigned_one() {
+    // The whole reason the two share `parse_satang_with`. If either drifted, a
+    // money field would be accepted on one path and refused on the other.
+    for bad in ["-04550", "-4550.0", "-4.55e3", "- 4550", "-4550 ", "-0x11A", "-1_000"] {
+      assert!(parse_signed_satang("f", bad).is_err(), "{bad:?} was accepted");
+      assert!(parse_satang("f", bad).is_err(), "{bad:?} was accepted unsigned");
+    }
+  }
+
+  #[test]
+  fn the_unsigned_parser_still_refuses_every_negative() {
+    // The sign exception is scoped to ONE field. If this ever passes, a negative
+    // price or total has become writable and the exception has leaked.
+    for bad in ["-1", "-4550", "-0", "-"] {
+      assert!(parse_satang("f", bad).is_err(), "{bad:?} was accepted by the unsigned parser");
+    }
+  }
+
+  #[test]
+  fn i64_min_parses_rather_than_being_reported_as_an_overflow() {
+    // -9223372036854775808 fits in an i64 exactly. Its magnitude is one larger
+    // than i64::MAX, so parsing it as a positive i64 first would fail and the
+    // error would be a lie.
+    assert_eq!(parse_signed_satang("f", "-9223372036854775808").unwrap(), i64::MIN);
+    assert_eq!(parse_satang("f", "9223372036854775807").unwrap(), i64::MAX);
+    // One below i64::MIN genuinely does not fit.
+    assert!(parse_signed_satang("f", "-9223372036854775809").is_err());
+  }
+
   // ── the transaction ───────────────────────────────────────────────────────
 
   #[test]
@@ -730,8 +876,63 @@ mod tests {
   }
 
   #[test]
-  fn a_broken_line_leaves_nothing_behind() {
-    // THE test for SKILL.md §2.2. A line whose total does not satisfy the
+  fn a_cash_sale_rounded_down_commits_with_a_negative_adjustment() {
+    // THE test for the signed-rounding bridge fix, and it goes through the real
+    // save path rather than the parser alone.
+    //
+    // ฿45.53 is the motivating total: baht coins end in 5 satang, so at a ฿0.25
+    // step `round_to_nearest_coin` returns 4550 and the adjustment is -3. Before
+    // `parse_signed_satang` existed, the unsigned grammar refused "-3" and this
+    // exact sale could not be recorded at all — a feature that read as working
+    // and silently was not, for the totals it was written for.
+    //
+    // The figures below satisfy every CHECK in `0002_signed_rounding.sql`:
+    //   gross = 4553 - 0            = 4553
+    //   total = 4553 + 0 + (-3)     = 4550
+    //   taxable + tax = 4255 + 298 = 4553 = gross   (VAT is unaffected by rounding)
+    //   total >= 0
+    let mut c = conn();
+    let mut input = good_input();
+    input.order.subtotal_satang = "4553".into();
+    input.order.taxable_satang = "4255".into();
+    input.order.tax_satang = "298".into();
+    input.order.rounding_adjustment_satang = "-3".into();
+    input.order.total_satang = "4550".into();
+
+    write_order(&mut c, &input).expect("a sale rounded DOWN must commit");
+
+    let (rounding, total): (i64, i64) = c
+      .query_row(
+        "SELECT rounding_adjustment_satang, total_satang FROM local_orders WHERE id = ?1",
+        [&input.order.id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+      )
+      .expect("the order row should be readable");
+
+    // Stored as a NEGATIVE INTEGER, not as the text "-3". A value that reached
+    // SQLite as TEXT would defeat every `typeof(...) = 'integer'` CHECK the
+    // schema relies on to keep floats out of money columns.
+    assert_eq!(rounding, -3, "the adjustment must be stored as a signed integer");
+    assert_eq!(total, 4550);
+  }
+
+  #[test]
+  fn a_negative_price_is_still_refused_end_to_end() {
+    // The counterweight to the test above. The sign exception is scoped to
+    // `rounding_adjustment_satang`; if this ever commits, the exception has leaked
+    // into the other money columns.
+    let mut c = conn();
+    let mut input = good_input();
+    input.order.total_satang = "-4550".into();
+
+    let error = write_order(&mut c, &input).expect_err("a negative total must not commit");
+
+    assert_eq!(error.kind, CommandErrorKind::InvalidPayload);
+    assert_eq!(count(&c, "local_orders"), 0);
+  }
+
+  #[test]
+  fn a_broken_line_leaves_nothing_behind() {    // THE test for SKILL.md §2.2. A line whose total does not satisfy the
     // schema's arithmetic identity — exactly what a bug in the TypeScript cart
     // maths produces — is rejected by the CHECK on the line insert. The order
     // row was already written by then. If the three writes were not in one

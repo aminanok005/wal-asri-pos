@@ -38,7 +38,7 @@
  */
 
 import type { components } from '@wasri/api-types';
-import { Money } from '../../payments/domain/money';
+import { Money, SATANG_PATTERN } from '../../payments/domain/money';
 // ─────────────────────────────────────────────────────────────────────────────
 // Contract-derived types
 //
@@ -303,15 +303,22 @@ function indexActivePrices(
 /**
  * Convert a wire satang count into a `Money`, or reject it.
  *
- * `Number.isSafeInteger` is the whole check, and it is stricter than it looks.
- * It rejects `45.5` (not a whole number — a float already got in), `-1` and
- * every negative (a negative *price* is a refund, and putting one on a menu
- * button would silently credit the cashier on every tap), `NaN` and `Infinity`
- * (a parse artefact, which would otherwise become `BigInt(NaN)` and throw),
- * and anything past 2^53-1, where a double starts silently dropping satang.
- * Past that check the value is exact, so `BigInt` of it is lossless, and
- * `Money.fromSatang` takes a `bigint` and refuses a `number` — so this function
- * is the one and only door from wire money into domain money.
+ * The contract's `Satang` schema is `type: string` with pattern
+ * `^(0|[1-9][0-9]*)$`, so the wire value is quoted canonical digits — `"4550"`.
+ * Parsing goes to `bigint` directly and never touches `Number`, which is what
+ * makes this exact at any magnitude: there is no double on the path, so nothing
+ * can be silently rounded, and the 2^53 question does not arise here at all.
+ *
+ * The pattern is applied in full rather than relaxed to "all digits". Each
+ * rejection is load-bearing:
+ *
+ *   `""`     an empty price would put ฿0.00 on a menu button
+ *   `"007"`  a second spelling of 7 — two clients disagreeing about this
+ *            disagree about a customer's total, and it fails at the pull rather
+ *            than at close
+ *   `"-1"`   a negative price is a refund, and on a menu button it would credit
+ *            the cashier on every tap
+ *   `"1.0"`  a decimal, `4.55e3` an exponent, `" 1"` padded — none is satang
  *
  * The terminal is the last line of defence, not the first: the server is
  * authoritative and is expected to reject a bad price on write. This check
@@ -320,12 +327,10 @@ function indexActivePrices(
  * boots. Catch it here and one drink disappears; do not, and it sells at ฿0.00.
  */
 function toUnitPrice(wireSatang: Satang): Money | null {
-  // `typeof` first: the contract's type is a promise, not a guarantee, and a
-  // deserialiser that hands back a string must be rejected rather than coerced.
-  if (typeof wireSatang !== 'number' || !Number.isSafeInteger(wireSatang)) {
-    return null;
-  }
-  if (wireSatang < 0) {
+  // The contract's type is a promise, not a guarantee: a hand-written snapshot
+  // or a corrupted row can hand back anything, so the shape is checked before
+  // it is trusted rather than coerced.
+  if (typeof wireSatang !== 'string' || !SATANG_PATTERN.test(wireSatang)) {
     return null;
   }
   return Money.fromSatang(BigInt(wireSatang));

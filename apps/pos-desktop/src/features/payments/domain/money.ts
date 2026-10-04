@@ -45,6 +45,65 @@ export const MAX_FRACTION_DIGITS = 2;
 /** 1% expressed in basis points — used for Food Cost % and VAT rates. */
 export const BASIS_POINTS_PER_PERCENT = 100n;
 
+/**
+ * The wire grammar for satang: `^(0|[1-9][0-9]*)$`.
+ *
+ * This is the contract's `Satang` pattern verbatim — `contracts/openapi.yaml`,
+ * schema `Satang` — and the same grammar Rust enforces in
+ * `parse_satang` (`apps/pos-desktop/src-tauri/src/commands.rs`). Three copies of
+ * one rule is exactly the drift DOMAIN.md warns about, so it lives here, in the
+ * module every boundary can already reach, and the Rust side is the third
+ * translation of the same contract text.
+ *
+ * It is `^(0|[1-9][0-9]*)$` and not a looser "all digits" test because every
+ * rejected form is load-bearing:
+ *
+ *   * `""` — an empty amount; on a menu button it sells at ฿0.00
+ *   * `"+4550"` / `"-4550"` — a sign. A refund is a separate row, not a
+ *     negative sale.
+ *   * `"04550"` — parses, and is exactly the shape a zero-padded formatter
+ *     produces, so it is a bug worth reporting rather than absorbing. It is also
+ *     a second spelling of one value, which is how two clients end up disagreeing
+ *     about a customer's total at close rather than at the pull.
+ *   * `"4550.0"` — a float that happened to be whole. Laundering it through a
+ *     string must not become a way around the rejection of a fractional amount.
+ *   * `"4.55e3"`, `"0x11A"` — not base-ten digits.
+ *   * `"4550 "` / `" 4550"` — whitespace a formatter added.
+ *
+ * `BigInt()` accepts every one of those silently, which is why the grammar is
+ * checked before delegating rather than after.
+ */
+export const SATANG_PATTERN = /^(0|[1-9][0-9]*)$/;
+
+/**
+ * Parse a satang string from the wire into a `Money`, refusing anything the
+ * grammar rejects.
+ *
+ * The single door from wire money into domain money. Parsing goes to `bigint`
+ * and never touches `Number`, so it is exact at any magnitude and the 2^53
+ * question does not arise on this path at all.
+ *
+ * @param field Named in the thrown error so a bad pull says which field failed,
+ *   not merely that a number did.
+ */
+export function satangFromWire(field: string, raw: unknown): Money {
+  if (typeof raw !== 'string') {
+    throw new MoneyError(
+      `${field} must arrive as a decimal-integer STRING, received ${typeof raw}. ` +
+        'Sending satang as a JSON number loses precision above 2^53 and fails silently.',
+    );
+  }
+
+  if (!SATANG_PATTERN.test(raw)) {
+    throw new MoneyError(
+      `${field} must match ^(0|[1-9][0-9]*)$, received ${JSON.stringify(raw)}. ` +
+        'A sign, decimal point, exponent, whitespace or leading zero is rejected.',
+    );
+  }
+
+  return Money.fromSatang(BigInt(raw));
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Internal helpers
 // ─────────────────────────────────────────────────────────────────────────────

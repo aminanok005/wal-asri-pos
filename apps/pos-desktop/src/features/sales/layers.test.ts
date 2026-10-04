@@ -168,11 +168,22 @@ describe('infrastructure/ is the only layer allowed to reach for Tauri', () => {
     expect(source).toContain('function satangToWire(');
     expect(source).toContain('value.toString()');
 
-    // Inbound: every satang is parsed from a string and validated.
-    expect(source).toContain('function satangFromWire(');
-    expect(source).toMatch(/if \(typeof raw !== 'string'\)/);
+    // Inbound: the edge does not parse satang itself, it delegates to the one
+    // shared checker in the money module. That is the assertion that matters —
+    // a local second parser in an adapter is how the catalogue boundary and the
+    // sync boundary come to accept different spellings of one satang.
+    expect(source).toContain('satangFromWireChecked(');
 
-    // And it may never hand a `bigint` straight to `invoke`, nor ask
+    // And the shared checker it delegates to is where the guard now lives, so
+    // check it there too rather than trusting the delegation alone.
+    const moneySource = stripComments(
+      await Bun.file(new URL('../payments/domain/money.ts', SALES_DIR)).text(),
+    );
+    expect(moneySource).toContain('function satangFromWire(');
+    expect(moneySource).toMatch(/if \(typeof raw !== 'string'\)/);
+    expect(moneySource).toContain('SATANG_PATTERN');
+
+    // And the edge may never hand a `bigint` straight to `invoke`, nor ask
     // `Number()` to carry money in either direction.
     expect(source).not.toMatch(/JSON\.stringify\([^)]*satang/i);
     expect(source).not.toMatch(/Number\([^)]*[Ss]atang[^)]*\)/);

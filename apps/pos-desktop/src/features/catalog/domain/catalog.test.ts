@@ -68,8 +68,9 @@ function category(id: UuidV7, nameTh: string): Category {
 }
 
 /**
- * One price row. `satang` is a plain `number` on purpose — that is what the
- * contract generates, and the boundary is what is under test.
+ * One price row. `satang` is a `number` only so the call sites read as amounts;
+ * the contract's `Satang` schema is a quoted digit string, so it is stringified
+ * here at the single point where a fixture crosses into wire shape.
  */
 function price(o: {
   id: number;
@@ -82,7 +83,7 @@ function price(o: {
     id: uid(o.id),
     price_list_id: o.listId,
     product_variant_id: o.variantId,
-    unit_price_satang: o.satang,
+    unit_price_satang: String(o.satang),
     currency_code: 'THB',
     version: o.version ?? 1,
     updated_at: '2026-10-02T00:00:00Z',
@@ -124,11 +125,34 @@ function formatBaht(amount: Money): string {
 }
 /** One variant priced at whatever `satang` the test wants to attack. */
 function pricedAt(satang: number): CatalogIndex {
+  return pricedAtWire(String(satang));
+}
+
+/**
+ * One variant whose wire price is the given STRING, verbatim.
+ *
+ * Needed because `pricedAt` takes a `number`, and a `number` cannot express a
+ * satang count above 2^53-1 — the double rounds it before the boundary ever
+ * sees it. Testing the boundary at that magnitude therefore requires the input
+ * to arrive as the string it would actually be on the wire, which is the entire
+ * point of the string wire form.
+ */
+function pricedAtWire(spelling: string): CatalogIndex {
   const latte = variant(201, 'BEV-LATTE-12', PRODUCT_DRINKS);
   return buildCatalog(
     snapshot({
       variants: [latte],
-      price_list_entries: [price({ id: 401, listId: LIST_STANDARD, variantId: latte.id, satang })],
+      price_list_entries: [
+        {
+          id: uid(401),
+          price_list_id: LIST_STANDARD,
+          product_variant_id: latte.id,
+          unit_price_satang: spelling,
+          currency_code: 'THB',
+          version: 1,
+          updated_at: '2026-10-02T00:00:00Z',
+        },
+      ],
     }),
   );
 }
@@ -315,18 +339,39 @@ describe('the money boundary', () => {
     expect(index.entries).toHaveLength(0);
     expect(reasons(index)).toEqual(['invalid_price']);
   });
-  it('rejects a value past Number.MAX_SAFE_INTEGER, where a double starts dropping satang', () => {
-    const index = pricedAt(Number.MAX_SAFE_INTEGER + 2);
+  it('carries a value past 2^53 exactly, where the old numeric wire form dropped satang', () => {
+    // The string wire form is why this is now an acceptance rather than a
+    // rejection. Under `type: integer` this value arrived as a double and lost
+    // precision past 2^53-1, so the boundary had to refuse it. As quoted digits
+    // it goes straight to `bigint` and is exact.
+    //
+    // The input has to be spelled as a string: `Number.MAX_SAFE_INTEGER + 2` is
+    // itself rounded to ...992 by the double, so the loss happens in the
+    // arithmetic long before the boundary is reached. A `number` cannot even
+    // state the value this test is about.
+    const index = pricedAtWire('9007199254740993');
 
-    expect(index.entries).toHaveLength(0);
-    expect(reasons(index)).toEqual(['invalid_price']);
+    expect(reasons(index)).toEqual([]);
+    expect(index.entries[0]?.unitPrice.satang).toBe(9007199254740993n);
   });
 
-  it('accepts the largest satang count a JSON number can carry exactly', () => {
+  it('accepts the largest satang count a JSON number used to be able to carry', () => {
     const index = pricedAt(Number.MAX_SAFE_INTEGER);
 
     expect(reasons(index)).toEqual([]);
     expect(index.entries[0]?.unitPrice.satang).toBe(BigInt(Number.MAX_SAFE_INTEGER));
+  });
+
+  it('rejects a non-canonical spelling the pattern forbids', () => {
+    // A second spelling of one value is how two clients end up disagreeing about
+    // a customer's total at close rather than at the pull, so the grammar is
+    // checked rather than delegated to BigInt.
+    for (const spelling of ['04550', '-4550', '+4550', '4550.0', ' 4550', '']) {
+      const index = pricedAtWire(spelling);
+
+      expect(index.entries).toHaveLength(0);
+      expect(reasons(index)).toEqual(['invalid_price']);
+    }
   });
   it('one bad price does not take the rest of the menu with it', () => {
     const latte = variant(201, 'BEV-LATTE-12', PRODUCT_DRINKS);

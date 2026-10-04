@@ -205,11 +205,16 @@ export const DEMO_VARIANTS: readonly ProductVariant[] = Object.freeze([
 // ─────────────────────────────────────────────────────────────────────────────
 // Prices
 //
-// `unit_price_satang` is a plain `number` here because that is what the contract
-// generates and what `JSON.parse` produces. It is the one place a float can
-// enter this codebase, which is exactly why every literal below is a whole
-// integer: the boundary check in the domain exists for the pulls nobody watches,
-// not for a fixture that could have avoided the question entirely.
+// `unit_price_satang` is a quoted digit STRING — the contract's `Satang` schema
+// is `type: string`, pattern `^(0|[1-9][0-9]*)$`. That is now the strongest
+// boundary check in this codebase: a `number` cannot be assigned to the field at
+// all, where the previous `number` typing let a float through and relied on the
+// domain check to catch what JSON.parse produced.
+//
+// This fixture takes `satang` as a `number` only so the literals below stay
+// readable as amounts, and converts at this one point with `String()`. The
+// conversion is total because every literal is a whole integer, which is why
+// `String()` cannot produce a decimal or an exponent form here.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** The branch's one price list in play. */
@@ -228,7 +233,7 @@ function price(o: {
     id: uid(o.n),
     price_list_id: o.listId ?? DEMO_PRICE_LIST_ID,
     product_variant_id: o.variantId,
-    unit_price_satang: o.satang,
+    unit_price_satang: String(o.satang),
     currency_code: 'THB',
     version: 1,
     created_at: DEMO_PULLED_AT,
