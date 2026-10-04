@@ -41,6 +41,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -48,11 +49,14 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	cataloghttp "wal-asri-pos/services/api-backend/internal/catalog/adapter/http"
 	cataloguc "wal-asri-pos/services/api-backend/internal/catalog/usecase"
 	identity "wal-asri-pos/services/api-backend/internal/identity/domain"
 	money "wal-asri-pos/services/api-backend/internal/money/domain"
 	orderhttp "wal-asri-pos/services/api-backend/internal/order/adapter/http"
+	postgres "wal-asri-pos/services/api-backend/internal/order/adapter/postgres"
 	order "wal-asri-pos/services/api-backend/internal/order/domain"
 	orderuc "wal-asri-pos/services/api-backend/internal/order/usecase"
 	syncorder "wal-asri-pos/services/api-backend/internal/sync/adapter/order"
@@ -101,49 +105,37 @@ func run() error {
 	getCatalog := cataloguc.NewGetCatalog(unwiredCatalogRepository{}, clock)
 	cataloghttp.NewHandler(getCatalog, clock).Route(mux)
 
-	// ── sync ──────────────────────────────────────────────────────────────────
+	// ── sync, and the persistence it commits to ───────────────────────────────
 	//
-	// `POST /sync/push` is IMPLEMENTED and its route is registered, because
-	// contracts/openapi.yaml now declares it along with the Order, OrderLine and
-	// sync schemas. The drain interactor is real, the batch idempotency and the
-	// per-command outcomes are real, and the handler is exercised end to end by
-	// internal/order/adapter/http's tests.
+	// `POST /sync/push` is implemented and routed: contracts/openapi.yaml declares
+	// it along with the Order, OrderLine and sync schemas, the drain interactor is
+	// real, and the batch idempotency and per-command outcomes are real.
 	//
-	// What is NOT real is persistence. There is no store to commit an accepted
-	// sale into, so the ingester refuses with a transient error rather than
-	// pretending. That choice is the whole difference between this and the
-	// catalogue's placeholder, and it is deliberate:
+	// What sits UNDER it is chosen here, and the choice is the important part:
 	//
-	//	an empty slice / a silent 200  the terminal marks the sale done, prunes its
-	//	                             outbox row, and the customer has paid for
-	//	                             something the server will never have
-	//	an error / a loud 500        the terminal keeps the row, retries with
-	//	                             backoff, and the sale survives
+	//	real Postgres         DATABASE_URL is set. Sales are committed and the
+	//	                      schema's CHECKs are the last line of defence.
+	//	a LOUD refusal        DATABASE_URL is unset. Every submission fails 500, the
+	//	                      terminal keeps its outbox row and retries, and nothing
+	//	                      is ever acknowledged that was not stored.
 	//
-	// See internal/order/adapter/memory for the in-memory ports that prove the
-	// success path, and internal/order/adapter/postgres for why the real driver
-	// cannot be written yet: Go's standard library contains no PostgreSQL driver,
-	// and adding one is outside what this service is permitted to depend on.
-	ingest := orderuc.NewIngestOrder(orderuc.IngestOrderDeps{
-		Orders: unwiredOrderRepository{},
-		Rates:  unwiredBranchRates{},
-		Idem:   unwiredIdempotencyStore{},
-		Outbox: unwiredOutboxLedger{},
-		Now:    clock,
-	})
+	// The in-memory adapters are NOT an option for the fallback. They are excellent
+	// for tests and catastrophic in production: a process restart would take every
+	// acknowledged sale with it, and nothing would say so.
+	ingest, drainIdem, closePersistence, err := buildPersistence(clock, logger)
+	if err != nil {
+		return err
+	}
+	if closePersistence != nil {
+		defer closePersistence()
+	}
+
 	drain := syncuc.NewDrainOutbox(syncuc.DrainDeps{
 		Orders: syncorder.NewIngester(ingest),
-		Idem:   unwiredBatchIdempotency{},
+		Idem:   drainIdem,
 		Now:    clock,
 	})
 	orderhttp.NewHandler(drain, func() int64 { return clock().UnixNano() }).Route(mux)
-
-	logger.Warn("POST "+orderhttp.BasePath+"/sync/push is routed but refuses every submission",
-		"reason", "no persistence is wired: sqlc is HELD (SKILL.md 3.2/3.4), db/migrations is empty, "+
-			"and the Go standard library contains no PostgreSQL driver",
-		"implemented", "the drain interactor, batch idempotency, authoritative re-pricing and the HTTP handler",
-		"proven_by", "internal/order/adapter/http + internal/sync/usecase tests against in-memory ports",
-		"effect", "a terminal pushing a batch receives 500 and retries; no sale is acknowledged that was not stored")
 
 	srv := &http.Server{
 		Addr:         *addr,
@@ -213,16 +205,108 @@ func (unwiredCatalogRepository) PriceListEntries(context.Context, identity.UUIDv
 // above would not compile and the failure would point at the wrong file.
 var _ cataloguc.CatalogRepository = unwiredCatalogRepository{}
 
-// ── the sync placeholders ─────────────────────────────────────────────────────
+// ── buildPersistence ───────────────────────────────────────────────────────────
 //
-// Every one of these refuses with errUnwired, and the drain turns that into
-// ErrInfrastructure, which the handler maps to 500. So a terminal that pushes
-// during this state is told "retry", it keeps its outbox row, and the sale is
-// still there when persistence exists.
+// Chooses between real Postgres and a loud refusal, and returns the interactor plus
+// the drain's idempotency port.
 //
-// They are checked against their ports for the same reason the catalogue's is:
-// the route is registered now, so a port that drifts must fail HERE rather than
-// at the first real write.
+// A function rather than inline wiring because the two configurations have
+// DIFFERENT TYPES for the same ports, and a caller that had to know which one it got
+// would be a caller that could use the wrong one.
+//
+// ── WHY THE SCHEMA IS APPLIED HERE ────────────────────────────────────────────
+//
+// At startup, by the embedded runner, rather than by a separate `migrate` step.
+//
+// The SQL travels inside the binary via //go:embed in db/migrations, so a deployment
+// cannot ship a binary whose schema disagrees with it. That is the property worth
+// having, and it is only true if the binary applies its own migrations.
+//
+// Two instances starting simultaneously are handled by a Postgres advisory lock
+// inside the runner, so they queue rather than one of them failing on a duplicate
+// CREATE TABLE.
+//
+// Failing STARTUP on a migration error is deliberate. The alternative — log and carry
+// on — means serving orders into a schema that may be missing the CHECKs they depend
+// on, which is the specific failure the whole persistence layer exists to prevent.
+//
+// The drain's idempotency port is the SAME postgres type as the order's: one table,
+// one writer, and therefore one answer when two batches overlap. Two implementations
+// of one store would be two sources of truth for whether a sale was already applied.
+func buildPersistence(
+	clock func() time.Time,
+	logger *slog.Logger,
+) (*orderuc.IngestOrder, syncuc.BatchIdempotency, func(), error) {
+	dsn := os.Getenv(databaseURLEnv)
+	if dsn == "" {
+		logger.Warn("POST "+orderhttp.BasePath+"/sync/push is routed but will REFUSE every submission",
+			"reason", databaseURLEnv+" is unset, so there is nowhere to commit an accepted sale",
+			"effect", "a terminal pushing a batch receives 500 and retries; nothing is acknowledged that was not stored",
+			"fix", "set "+databaseURLEnv+" to this project's Postgres — note port 5433, not 5432, "+
+				"which belongs to the sibling project (dev/DEV-SETUP.md)",
+			"never", "this is deliberately NOT the in-memory adapters; a restart would take every "+
+				"acknowledged sale with it")
+		return orderuc.NewIngestOrder(orderuc.IngestOrderDeps{
+			Orders: unwiredOrderRepository{},
+			Rates:  unwiredBranchRates{},
+			Idem:   unwiredIdempotencyStore{},
+			Outbox: unwiredOutboxLedger{},
+			Now:    clock,
+		}), unwiredBatchIdempotency{}, nil, nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("opening the Postgres pool: %w", err)
+	}
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, nil, nil, fmt.Errorf(
+			"connecting to Postgres: %w. Check the host and port: this project is on 5433, and 5432 "+
+				"belongs to the sibling project pos-walasri (dev/DEV-SETUP.md)", err)
+	}
+	if err := postgres.Migrate(ctx, pool); err != nil {
+		pool.Close()
+		// Fatal on purpose: serving into a schema missing its money CHECKs is worse
+		// than not serving at all.
+		return nil, nil, nil, fmt.Errorf("applying the schema: %w", err)
+	}
+
+	store := postgres.NewIdempotencyStore(pool)
+	logger.Info("the sync endpoint is wired to Postgres",
+		"schema", "applied from the embedded db/migrations at startup",
+		"driver", "github.com/jackc/pgx/v5")
+
+	ingest := orderuc.NewIngestOrder(orderuc.IngestOrderDeps{
+		Orders: postgres.NewOrderRepository(pool),
+		Rates:  postgres.NewBranchRate(pool),
+		Idem:   store,
+		Outbox: postgres.NewOutboxLedger(pool),
+		Now:    clock,
+	})
+	return ingest, store, pool.Close, nil
+}
+
+// databaseURLEnv is the connection string's environment variable.
+//
+// Matches DEV-SETUP.md §4, which says the Go backend "connects over the host ports
+// instead, via DATABASE_URL / REDIS_URL in .env".
+const databaseURLEnv = "DATABASE_URL"
+
+// ── the refusing placeholders ──────────────────────────────────────────────────
+//
+// Used only when DATABASE_URL is unset. Every one refuses with errUnwired, and the
+// drain turns that into ErrInfrastructure, which the handler maps to 500 — so a
+// terminal that pushes in this state is told "retry", keeps its outbox row, and the
+// sale is still there when persistence exists.
+//
+// The drain's OrderIngester is the REAL adapter over the REAL interactor; only the
+// four ports underneath it refuse. A submission therefore travels the whole pipeline
+// and fails where the missing dependency actually is, rather than at a hand-written
+// guard at the edge that would go stale the moment a real store is wired in.
 
 type unwiredOrderRepository struct{}
 
@@ -251,13 +335,6 @@ func (unwiredOutboxLedger) Append(context.Context, syncdomain.SyncOutboxItem) er
 func (unwiredOutboxLedger) TransitionTo(context.Context, identity.UUIDv7, syncdomain.OutboxState, time.Time) error {
 	return errUnwired
 }
-
-// The drain's OrderIngester is the REAL adapter over the REAL interactor — only the
-// four ports underneath it refuse. So a submission in this state travels the whole
-// pipeline, reaches `rates.VATRateBp`, fails there as transient, and comes back as
-// 500 with no sale acknowledged. The failure is where the missing dependency
-// actually is, rather than a hand-written refusal at the edge that would go stale
-// the moment a real store is wired in.
 
 type unwiredBatchIdempotency struct{}
 

@@ -202,14 +202,43 @@ const (
 // to find.
 type OrderSource string
 
+// ── THE VOCABULARY IS THE CONTRACT'S, AND IT USED NOT TO BE ────────────────────
+//
+// These three values were `terminal`, `mobile` and `back_office`. Both
+// contracts/openapi.yaml (`OrderSource`) and the terminal's own
+// `0001_init.sql` CHECK said `pos_desktop`, `pos_mobile` and `admin`, and this Go
+// service would have written values its own schema rejected on the first insert.
+//
+// It drifted because nothing had ever compared them: the constants were referenced
+// only from tests, and the Postgres driver was a skeleton returning
+// ErrNotImplemented, so no round trip could surface the disagreement.
+//
+// The contract wins, because it is the declared Single Source of Truth and the
+// terminal's CHECK is already deployed on real devices — renaming the other way
+// would fork a vocabulary that two other layers have committed to. `IsValid` and the
+// test below now pin it, so a fourth vocabulary cannot appear quietly.
 const (
-	// OrderSourceTerminal is created on a POS terminal. Normal case.
-	OrderSourceTerminal OrderSource = "terminal"
-	// OrderSourceMobile is created on the mobile/tablet client.
-	OrderSourceMobile OrderSource = "mobile"
-	// OrderSourceBackOffice is entered by staff at the back office.
-	OrderSourceBackOffice OrderSource = "back_office"
+	// OrderSourcePosDesktop is created on the desktop POS terminal. Normal case.
+	OrderSourcePosDesktop OrderSource = "pos_desktop"
+	// OrderSourcePosMobile is created on the mobile/tablet client.
+	OrderSourcePosMobile OrderSource = "pos_mobile"
+	// OrderSourceAdmin is entered by staff at the back office.
+	OrderSourceAdmin OrderSource = "admin"
 )
+
+// knownOrderSources is the closed set, matching the contract's enum.
+var knownOrderSources = map[OrderSource]bool{
+	OrderSourcePosDesktop: true,
+	OrderSourcePosMobile:  true,
+	OrderSourceAdmin:      true,
+}
+
+// IsValid reports whether s is one of the three sources in the contract's enum.
+//
+// Closed on purpose. An unrecognised source is a client sending something the
+// contract does not describe, and storing it would put an ungroupable value in an
+// end-of-shift report that groups by source.
+func (s OrderSource) IsValid() bool { return knownOrderSources[s] }
 
 // Order is the order aggregate.
 //

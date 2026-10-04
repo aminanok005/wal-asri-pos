@@ -120,7 +120,7 @@ func terminalOrder(rateBp money.BasisPoints, n int) order.Order {
 		CreatedAt:        now,
 	}
 	o, err := order.NewOrder(uid(n+1), branch, uid(n+3), order.OrderTypeTakeaway,
-		order.OrderSourceTerminal, []order.OrderLine{line}, 0, 0, 0, rateBp, now)
+		order.OrderSourcePosDesktop, []order.OrderLine{line}, 0, 0, 0, rateBp, now)
 	if err != nil {
 		panic("bad order fixture: " + err.Error())
 	}

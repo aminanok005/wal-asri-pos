@@ -27,7 +27,7 @@ func uuidFor(ts time.Time) string {
 // orderFixture builds a priced order from the given lines.
 func orderFixture(t *testing.T, n int, lines []OrderLine, discount money.Satang, rateBp money.BasisPoints) Order {
 	t.Helper()
-	o, err := NewOrder(idAt(n), idAt(n+1), idAt(n+2), OrderTypeTakeaway, OrderSourceTerminal,
+	o, err := NewOrder(idAt(n), idAt(n+1), idAt(n+2), OrderTypeTakeaway, OrderSourcePosDesktop,
 		lines, discount, 0, 0, rateBp, base)
 	if err != nil {
 		t.Fatalf("NewOrder returned an unexpected error: %v", err)
@@ -737,4 +737,53 @@ func indexOf(haystack, needle string) int {
 		}
 	}
 	return -1
+}
+
+// TestOrderSource_VocabularyMatchesTheContractAndTheSchema guards a drift that
+// actually happened.
+//
+// The Go domain said `terminal`, `mobile`, `back_office`. Both
+// contracts/openapi.yaml (`OrderSource`) and the terminal's own `0001_init.sql`
+// CHECK said `pos_desktop`, `pos_mobile`, `admin`. This service would have written
+// values its own schema rejected on the very first insert.
+//
+// It survived because nothing compared them: the constants were referenced only from
+// tests, and the Postgres driver was a skeleton, so no round trip could surface the
+// disagreement. This test is here so a fourth vocabulary cannot appear quietly.
+func TestOrderSource_VocabularyMatchesTheContractAndTheSchema(t *testing.T) {
+	want := []OrderSource{
+		OrderSourcePosDesktop,
+		OrderSourcePosMobile,
+		OrderSourceAdmin,
+	}
+	if len(want) != 3 {
+		t.Fatalf("the expected source vocabulary has %d entries, want 3 — a new source needs the "+
+			"contract's enum and the terminal's SQL CHECK updated in the same change", len(want))
+	}
+	for _, s := range want {
+		if !s.IsValid() {
+			t.Errorf("%q is in the expected vocabulary but IsValid() says no", s)
+		}
+	}
+	// The values themselves, not just their count — a rename that keeps the count
+	// would pass a count-only assertion.
+	for _, tc := range []struct {
+		got  OrderSource
+		want string
+	}{
+		{OrderSourcePosDesktop, "pos_desktop"},
+		{OrderSourcePosMobile, "pos_mobile"},
+		{OrderSourceAdmin, "admin"},
+	} {
+		if string(tc.got) != tc.want {
+			t.Errorf("source = %q, want %q; this string is a column value and must match "+
+				"contracts/openapi.yaml and 0001_init.sql exactly", tc.got, tc.want)
+		}
+	}
+	// The values that were wrong before, so a reintroduction is caught.
+	for _, stale := range []OrderSource{"terminal", "mobile", "back_office", "", "POS_DESKTOP"} {
+		if stale.IsValid() {
+			t.Errorf("%q was accepted; it is not in the contract's enum", stale)
+		}
+	}
 }

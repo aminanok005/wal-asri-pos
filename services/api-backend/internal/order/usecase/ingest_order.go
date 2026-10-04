@@ -317,6 +317,12 @@ func (i *IngestOrder) Execute(ctx context.Context, req IngestRequest) (Result, e
 		TerminalID:     req.TerminalID,
 		CreatedAt:      now,
 		DueAt:          now,
+		// processed_at is set because the item is appended ALREADY TERMINAL, not
+		// transitioned into that state. Without it the ledger row contradicts itself:
+		// the schema CHECKs `(state IN ('ACKNOWLEDGED','CONFLICT_HELD')) =
+		// (processed_at IS NOT NULL)`, and a terminal state with a NULL processed_at
+		// is a row claiming it finished without saying when.
+		ProcessedAt: &now,
 	}
 	if err := i.outbox.Append(ctx, item); err != nil {
 		return Result{}, fmt.Errorf("order %s: recording the outbox item: %w", priced.ID, err)
@@ -382,6 +388,9 @@ func (i *IngestOrder) holdForConflict(
 		TerminalID:     terminalID,
 		CreatedAt:      now,
 		DueAt:          now,
+		// Set for the same reason as the ACKNOWLEDGED item above: appended already
+		// terminal, so the ledger requires the timestamp of that decision.
+		ProcessedAt: &now,
 	}
 	if err := i.outbox.Append(ctx, item); err != nil {
 		return Result{}, fmt.Errorf("order %s: recording the held outbox item: %w", priced.ID, err)
