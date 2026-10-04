@@ -1,0 +1,229 @@
+/*
+ * sales-terminal.css — the cashier's screen: header, checkout, and the two-column
+ * split that puts the catalog grid beside the cart panel.
+ *
+ * The tiles and cart rows themselves are styled in their own components'
+ * stylesheets. This file owns ARRANGEMENT — how the two sit relative to each
+ * other, and the chrome that belongs to this screen alone.
+ *
+ * @see tokens.css — every colour and tap size used below
+ */
+
+.sales-terminal {
+  padding: 20px;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: 'Noto Sans Thai', system-ui, sans-serif;
+  font-size: 15px;
+}
+
+/* ── Header ─────────────────────────────────────────────────────────────── */
+
+.sales-terminal__header {
+  margin-bottom: 16px;
+}
+
+.sales-terminal__header h1 {
+  margin: 0 0 12px;
+  font-size: 24px;
+  line-height: 1.2;
+}
+
+.sales-terminal__context {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  margin-bottom: 12px;
+  color: var(--mut);
+  font-size: 14px;
+}
+
+.sales-terminal__fulfilment {
+  display: flex;
+  gap: 6px;
+}
+
+/*
+ * Styled as a neutral pair, NOT as a selected/unselected toggle. These two
+ * buttons have no handler and no state: rendering one at full accent weight
+ * would tell a cashier their choice is recorded when nothing records it.
+ */
+.sales-terminal__fulfilment-button {
+  min-height: var(--tap-sm);
+  padding: 6px 14px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--card);
+  color: var(--ink);
+  font: inherit;
+  font-size: 13px;
+  cursor: default;
+}
+
+/* Unreferenced. Reserved for the day the pair becomes a real toggle. */
+.sales-terminal__fulfilment-button.is-selected {
+  background: var(--acc);
+  border-color: var(--acc);
+  color: #fff;
+}
+
+/*
+ * `tabular-nums` on every money figure in the app: it makes each digit the same
+ * width, so a subtotal changing from ฿45.50 to ฿140.50 does not shift the layout
+ * under a thumb reaching for the pay button. This is a FONT rule — it changes how
+ * a glyph is drawn, never the value. The number was produced upstream by
+ * `Money.toString()` in integer satang; no CSS here recomputes or reformats it.
+ */
+.sales-terminal__totals {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  margin: 0 0 16px;
+  padding: 12px 14px;
+  border-radius: 14px;
+  background: var(--bg);
+  color: var(--mut);
+  font-size: 13px;
+}
+
+.sales-terminal__totals [data-testid='sales-subtotal'] {
+  font-size: 20px;
+  font-weight: 800;
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── Checkout ───────────────────────────────────────────────────────────── */
+
+.sales-terminal__checkout {
+  margin-bottom: 16px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: var(--card);
+}
+
+.sales-terminal__tax-breakdown {
+  display: grid;
+  gap: 6px;
+  margin: 0 0 14px;
+}
+
+/*
+ * Each label/figure pair is a <div> inside a <dl>, so the split is made with flex
+ * on that div. `dt` stays before `dd` in source order, which is the order a screen
+ * reader reads them aloud.
+ */
+.sales-terminal__tax-breakdown > div {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+}
+
+.sales-terminal__tax-breakdown dt {
+  color: var(--mut);
+  font-size: 13px;
+}
+
+.sales-terminal__tax-breakdown dd {
+  margin: 0;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The gross — what the customer is actually asked for. */
+.sales-terminal__tax-breakdown [data-testid='checkout-subtotal'] {
+  font-size: 20px;
+  font-weight: 800;
+}
+
+/*
+ * The one control that takes money gets the accent and the full 48px+ height.
+ * 56px is the prototype's own `.go` height.
+ */
+.sales-terminal__pay {
+  width: 100%;
+  min-height: var(--tap-pay);
+  border: 0;
+  border-radius: 16px;
+  background: var(--acc);
+  color: #fff;
+  font: inherit;
+  font-size: 17px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+  transition: opacity 0.15s ease;
+}
+
+.sales-terminal__pay:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.sales-terminal__receipt,
+.sales-terminal__error {
+  margin: 14px 0 0;
+  padding: 10px 12px;
+  border-radius: 12px;
+  font-size: 14px;
+}
+
+.sales-terminal__receipt {
+  background: var(--accs);
+  color: var(--acc);
+}
+
+.sales-terminal__error {
+  border: 1px solid var(--danger);
+  color: var(--danger);
+}
+
+/* ── The two columns ────────────────────────────────────────────────────── */
+
+.sales-terminal__body {
+  display: grid;
+  /*
+   * `minmax(0, 1fr)` on the catalogue column, not `1fr`. A grid track sized `1fr`
+   * is floored at its content's min-content width by default, so a long Thai
+   * product name or SKU could push the track wider than the space available and
+   * scroll the whole page sideways. The explicit 0 removes that floor.
+   */
+  grid-template-columns: minmax(0, 1fr) 360px;
+  gap: 16px;
+  align-items: start;
+}
+
+/*
+ * Fold to one column at the prototype's own breakpoint. Below it the 360px cart
+ * column plus a usable catalogue no longer both fit. The prototype hides its nav
+ * rail instead, which is not available here — this app's nav is a horizontal
+ * strip — so the columns stack: catalogue flows full width, cart panel follows
+ * below it, in the order a cashier works in.
+ */
+@media (max-width: 900px) {
+  .sales-terminal__body {
+    grid-template-columns: 1fr;
+  }
+
+  /*
+   * The cart panel stops being a sticky sidebar. Stacked, `position: sticky` with
+   * `max-height: 100vh` would pin a full-height box over the content beneath it.
+   */
+  .sales-terminal__body > .cart-view {
+    position: static;
+    max-height: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sales-terminal *,
+  .sales-terminal *::before,
+  .sales-terminal *::after {
+    transition: none !important;
+    animation: none !important;
+  }
+}

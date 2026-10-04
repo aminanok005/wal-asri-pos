@@ -1,0 +1,50 @@
+/*
+ * index.css — the single import point for every stylesheet in the terminal.
+ * `main.tsx` imports this file and nothing else, so CSS load order is decided in
+ * one readable place rather than by whichever component mounts first.
+ *
+ * Order below is dependency order: tokens first because everything reads from it,
+ * then components, then the screens that arrange them.
+ */
+
+@import './tokens.css';
+@import '../../catalog/ui/styles/catalog-grid.css';
+@import './cart-view.css';
+@import './sales-terminal.css';
+@import './offline-orders.css';
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: 'Noto Sans Thai', system-ui, sans-serif;
+  font-size: 15px;
+}
+
+/*
+ * A visible focus ring on everything focusable. A cashier who cannot see where
+ * they are while tabbing the menu cannot sell at all.
+ */
+:focus-visible {
+  outline: 2px solid var(--acc);
+  outline-offset: 2px;
+}
+
+/*
+ * `font: inherit` stops a <button> falling back to the UA font, which would render
+ * Thai labels in a different typeface from the Thai text beside them.
+ */
+button {
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition: none !important;
+    animation: none !important;
+  }
+}

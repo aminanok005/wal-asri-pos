@@ -1,0 +1,71 @@
+/*
+ * tokens.css — the design system. Every colour, font and tap size in the
+ * terminal resolves to a property here; component files declare no hex codes.
+ *
+ * Palette copied verbatim from the V4 prototype at the repo root
+ * (`GreenTable POS V4.html` lines 7-9). Prototype variant B is not carried
+ * across: it lives behind a UI toggle, which is a different decision from
+ * following the OS preference.
+ */
+
+:root {
+  --bg: #f3f1ed;
+  --card: #fff;
+  --ink: #1f2420;
+  --mut: #7b827c;
+  --line: #e8e4dc;
+  --acc: #ff5a1f;
+  --accs: #fff0e8;
+
+  /* Not in the prototype — invented here. Needs design sign-off before commit. */
+  --danger: #c8372a;
+
+  /* 48px is the prototype's own stepper size; 56px is its pay button. */
+  --tap: 48px;
+  --tap-sm: 44px;
+  --tap-pay: 56px;
+
+  padding-top: env(safe-area-inset-top, 0px);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+/*
+ * `:not([data-theme='light'])` is copied from the prototype. Nothing in this app
+ * sets data-theme, so the guard is currently inert — it is here so a future theme
+ * switcher cannot be defeated by a stray `data-theme="light"` on <html>.
+ */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    --bg: #121212;
+    --card: #1d1d1d;
+    --ink: #f2f2ee;
+    --mut: #9a9a94;
+    --line: #2f2f2f;
+    --acc: #ff7a45;
+    --accs: #35231a;
+    --danger: #ff6b5a;
+  }
+}
+
+:root[data-theme='dark'] {
+  --bg: #121212;
+  --card: #1d1d1d;
+  --ink: #f2f2ee;
+  --mut: #9a9a94;
+  --line: #2f2f2f;
+  --acc: #ff7a45;
+  --accs: #35231a;
+  --danger: #ff6b5a;
+}
+
+/*
+ * `box-sizing` is NOT inherited — a declaration on :root reaches <html> and
+ * nothing below it. The prototype writes it on `:root` and again on `*`; only the
+ * `*` does the work. Hoisting this into `:root` looks like a tidy-up and silently
+ * reverts every width in the app.
+ */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}

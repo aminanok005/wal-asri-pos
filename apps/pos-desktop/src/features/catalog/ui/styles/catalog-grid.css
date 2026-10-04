@@ -1,0 +1,101 @@
+/*
+ * catalog-grid.css — the menu tiles.
+ *
+ * Presentation only. Whether a variant is sellable was settled by `buildCatalog`
+ * before `CatalogGrid` drew anything; nothing below can add a tile, remove one, or
+ * change a price.
+ *
+ * @see ./CatalogGrid.tsx — where every "sellable" verdict was reached
+ */
+
+/*
+ * A border in --acc rather than a solid fill: this warns the shift lead that the
+ * menu is short, and must not compete with the pay button for attention.
+ */
+.catalog-grid__warning {
+  margin: 0 0 14px;
+  padding: 10px 12px;
+  border: 1px solid var(--acc);
+  border-radius: 12px;
+  background: var(--card);
+  color: var(--ink);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.catalog-grid__tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 12px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.catalog-grid__tile {
+  display: flex;
+}
+
+.catalog-grid__tile-button {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  /* `flex: 1` + `width: 100%` makes every tile in a row the same height whatever
+     its Thai name's length. */
+  flex: 1;
+  width: 100%;
+  min-height: var(--tap);
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--card);
+  color: var(--ink);
+  font: inherit;
+  text-align: start;
+  cursor: pointer;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.catalog-grid__tile-button:hover {
+  border-color: var(--acc);
+}
+
+.catalog-grid__tile-name {
+  font-size: 15px;
+  font-weight: 600;
+  /* Thai stacks a vowel or tone mark ABOVE its consonant in a taller glyph box. A
+     Latin-tight line-height would clip the mark on a name like `กาแฟ`. */
+  line-height: 1.5;
+}
+
+.catalog-grid__tile-price {
+  color: var(--acc);
+  font-size: 17px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.catalog-grid__tile-sku {
+  color: var(--mut);
+  font-size: 11px;
+}
+
+/* A real answer, not a loading state — kept visually distinct from the things on
+   screen that mean "still loading". */
+.catalog-grid__empty {
+  margin: 0;
+  padding: 28px 0;
+  color: var(--mut);
+  text-align: center;
+  font-size: 13px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .catalog-grid *,
+  .catalog-grid *::before,
+  .catalog-grid *::after {
+    transition: none !important;
+    animation: none !important;
+  }
+}

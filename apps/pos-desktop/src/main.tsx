@@ -68,6 +68,9 @@ import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 
 import { AppShell } from './app/AppShell';
+// Single CSS import point: index.css pulls in tokens and every component sheet,
+// so load order is decided there and nowhere else.
+import './features/sales/ui/styles/index.css';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // The mount

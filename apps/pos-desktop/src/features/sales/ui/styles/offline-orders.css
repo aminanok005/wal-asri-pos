@@ -1,0 +1,172 @@
+/*
+ * offline-orders.css — the screen a shift lead reads when something is wrong.
+ *
+ * Presentation only: rows arrive from the repository already ordered and paged,
+ * and this file neither re-sorts nor filters them. Hover states stop at a colour
+ * change and never set `cursor: pointer` — the screen is read-only, and a row
+ * that looked pressable would promise an action it cannot perform.
+ *
+ * @see ./OfflineOrdersView.tsx — the screen these classes belong to
+ */
+
+.offline-orders {
+  padding: 20px;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: 'Noto Sans Thai', system-ui, sans-serif;
+  font-size: 15px;
+}
+
+.offline-orders__heading {
+  margin: 0 0 16px;
+  font-size: 24px;
+  line-height: 1.2;
+}
+
+/*
+ * Loading, error and empty look nothing alike on purpose. Loading and empty both
+ * mean "no rows" and call for opposite responses — one means wait, the other
+ * means this till recorded no sales.
+ */
+.offline-orders__loading,
+.offline-orders__empty {
+  margin: 0;
+  padding: 28px 0;
+  color: var(--mut);
+  text-align: center;
+  font-size: 13px;
+}
+
+.offline-orders__error {
+  margin: 0;
+  padding: 12px 14px;
+  border: 1px solid var(--danger);
+  border-radius: 12px;
+  background: var(--card);
+  color: var(--danger);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+/* ── Rows ───────────────────────────────────────────────────────────────── */
+
+.offline-orders__list {
+  margin: 0 0 16px;
+  padding: 0;
+  list-style: none;
+}
+
+/*
+ * A bordered card per order rather than a hairline list, unlike the cart's rows:
+ * a row here is one committed transaction with its own lifecycle, not one item
+ * just rung up.
+ */
+.offline-orders__row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 4px 12px;
+  margin-bottom: 8px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--card);
+}
+
+.offline-orders__row:last-child {
+  margin-bottom: 0;
+}
+
+.offline-orders__row-receipt {
+  font-weight: 700;
+  font-size: 15px;
+}
+
+/* Middot separator, so a screen reader reads these as distinct fields rather
+   than running two Thai labels together. */
+.offline-orders__row-status,
+.offline-orders__row-sync {
+  color: var(--mut);
+  font-size: 12px;
+}
+
+.offline-orders__row-status::before,
+.offline-orders__row-sync::before {
+  content: '· ';
+}
+
+/*
+ * `pending` and `synced` are healthy and stay muted. `conflict` is the one a lead
+ * must escalate, and it is the only rung that earns an accent — deliberately not
+ * `--danger`, because a conflict is two systems disagreeing, not a failed sale,
+ * and colouring it as an error invites voiding a perfectly good order.
+ * `rejected` is the server refusing the write outright, and is a real failure.
+ *
+ * Selected on the `data-sync-state` attribute the tests already read, rather than
+ * a second parallel set of classes that could disagree with it.
+ */
+.offline-orders__row-sync[data-sync-state='conflict'] {
+  color: var(--acc);
+  font-weight: 600;
+}
+
+.offline-orders__row-sync[data-sync-state='rejected'] {
+  color: var(--danger);
+  font-weight: 600;
+}
+
+/*
+ * The stored timestamp, verbatim. `tabular-nums` aligns the ISO-8601 digits down
+ * the column so a gap in the sequence is visible at a glance; the VALUE is not
+ * touched, because converting it here would be a second unit conversion to
+ * disagree with the one the SQL layer already made.
+ */
+.offline-orders__row-created {
+  grid-column: 1;
+  color: var(--mut);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.offline-orders__row-lines {
+  grid-column: 1;
+  color: var(--mut);
+  font-size: 12px;
+}
+
+.offline-orders__row-total {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+  align-self: center;
+  font-size: 18px;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+}
+
+.offline-orders__summary {
+  margin: 0;
+  color: var(--mut);
+  font-size: 13px;
+}
+
+/* Below 560px the right-hand total column squeezes to nothing; it moves under the
+   receipt instead, where the figure matters more than the alignment. */
+@media (max-width: 560px) {
+  .offline-orders__row {
+    grid-template-columns: 1fr;
+  }
+
+  .offline-orders__row-total {
+    grid-column: 1;
+    grid-row: auto;
+    margin-top: 6px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .offline-orders *,
+  .offline-orders *::before,
+  .offline-orders *::after {
+    transition: none !important;
+    animation: none !important;
+  }
+}

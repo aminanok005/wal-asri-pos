@@ -1,0 +1,268 @@
+/*
+ * cart-view.css — the basket panel.
+ *
+ * Presentation only: whether quantity 0 removes a line, whether three scans merge
+ * into one row, and what the subtotal is were all answered by `../domain/cart`
+ * before this file sees an element. `tabular-nums` changes how digits are DRAWN,
+ * never their value.
+ *
+ * @see ./sales-terminal.css — where this panel sits in the two-column layout
+ */
+
+.cart-view {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  /*
+   * Sticky so the basket stays visible while a long catalogue scrolls past — the
+   * point of giving it its own column. `min-width: 0` matters because this panel
+   * IS a grid item (child of `.sales-terminal__body`), and a grid item's default
+   * `min-width: auto` refuses to shrink below its content's min-content width —
+   * here the long Thai product names.
+   */
+  position: sticky;
+  top: 0;
+  max-height: 100vh;
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: var(--card);
+}
+
+.cart-view__header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+}
+
+.cart-view__header h2 {
+  margin: 0;
+  font-size: 18px;
+}
+
+/* "Clear cart" stays quiet: one accidental press destroys every line in the
+   basket and there is no undo. It keeps a full tap size — clearing should take
+   one deliberate press, not a hunt. */
+.cart-view__header button {
+  min-height: var(--tap-sm);
+  padding: 6px 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--bg);
+  color: var(--mut);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.cart-view__header button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.cart-view__header button:not(:disabled):hover {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+/*
+ * `SalesTerminalView` passes EMPTY_CATALOGUE, so this renders nothing on the
+ * terminal — the component skips the whole region for an empty list rather than
+ * drawing a dead strip with a label. These rules stay because the component is
+ * also usable standalone, where the strip IS the add-buttons.
+ */
+.cart-view__catalogue {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.cart-view__add {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-height: var(--tap-sm);
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--accs);
+  color: var(--ink);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.cart-view__add:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.cart-view__add-price {
+  color: var(--acc);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── Lines ──────────────────────────────────────────────────────────────── */
+
+.cart-view__items {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* A hairline separator rather than a boxed card: this is a list of things already
+   rung up, and cards would make each line read as its own transaction. */
+.cart-view__item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 6px;
+  border-bottom: 1px solid var(--line);
+}
+
+.cart-view__item:last-child {
+  border-bottom: 0;
+}
+
+/* `min-width: 0` so a long Thai name wraps instead of pushing the quantity
+   stepper off the panel — the stepper is the only way to change the quantity. */
+.cart-view__item-main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+
+.cart-view__item-name {
+  font-size: 14px;
+  /* Thai stacks a vowel or tone mark ABOVE its consonant in a taller glyph box. A
+     Latin-tight line-height would clip the mark on a name like `น้ำเปล่า`. */
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.cart-view__item-sku {
+  color: var(--mut);
+  font-size: 11px;
+}
+
+.cart-view__item-quantity {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+
+/* The − and + steppers, at the prototype's own 48x48. Under 48px these are the
+   likeliest controls to be missed on a touchscreen, and a missed tap lands on the
+   neighbouring stepper: an item the customer did not ask for. */
+.cart-view__item-quantity button {
+  width: var(--tap);
+  height: var(--tap);
+  border: 0;
+  border-radius: 12px;
+  background: var(--accs);
+  color: var(--acc);
+  font: inherit;
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.cart-view__item-count {
+  min-width: 2ch;
+  text-align: center;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.cart-view__item-prices {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+  flex: none;
+}
+
+.cart-view__item-unit {
+  color: var(--mut);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.cart-view__item-total {
+  font-size: 14px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Delete: full tap size, muted by default. It is destructive on a row the cashier
+   can also empty by pressing −, so it need not shout to be found. */
+.cart-view__item-remove {
+  flex: none;
+  min-width: var(--tap);
+  min-height: var(--tap);
+  padding: 0 8px;
+  border: 1px solid transparent;
+  border-radius: 12px;
+  background: none;
+  color: var(--mut);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.cart-view__item-remove:hover {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+/* ── Summary ────────────────────────────────────────────────────────────── */
+
+/* Pinned to the bottom of the flex column so the subtotal stays in one place as
+   lines are added. A subtotal that moves is one a cashier must re-find mid-sale. */
+.cart-view__summary {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 10px;
+  flex: none;
+  padding: 12px;
+  border-radius: 14px;
+  background: var(--bg);
+  font-size: 13px;
+}
+
+.cart-view__summary-label {
+  color: var(--mut);
+}
+
+.cart-view__summary-value {
+  font-size: 20px;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+}
+
+.cart-view__empty {
+  margin: 0;
+  padding: 28px 0;
+  color: var(--mut);
+  text-align: center;
+  font-size: 13px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cart-view *,
+  .cart-view *::before,
+  .cart-view *::after {
+    transition: none !important;
+    animation: none !important;
+  }
+}
