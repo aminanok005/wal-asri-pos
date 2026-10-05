@@ -45,9 +45,8 @@ import (
 
 // testPool opens a pool, migrates, and returns it.
 //
-// A fresh schema per test would be ideal but is slow; instead each test uses
-// distinct ids and the append-only triggers make cross-test interference visible
-// rather than silent.
+// Each test starts from truncated tables, so the suite is re-runnable and no test
+// inherits another's rows.
 func testPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	dsn := os.Getenv("WASRI_TEST_DATABASE_URL")
@@ -66,7 +65,21 @@ func testPool(t *testing.T) *pgxpool.Pool {
 	if err := postgres.Migrate(ctx, pool); err != nil {
 		t.Fatalf("migrating: %v", err)
 	}
+	resetTables(t, pool)
 	return pool
+}
+
+// resetTables empties every table a test writes, making the suite re-runnable.
+//
+// TRUNCATE, not DELETE: the schema refuses DELETE on orders and order_lines via the
+// append-only triggers, and TRUNCATE correctly bypasses those row triggers.
+func resetTables(t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+	const q = `TRUNCATE TABLE order_lines, orders, idempotency_keys, sync_outbox_items, branches
+	           RESTART IDENTITY CASCADE`
+	if _, err := pool.Exec(context.Background(), q); err != nil {
+		t.Fatalf("truncating the transactional tables: %v", err)
+	}
 }
 
 func uid(s string) identity.UUIDv7 {
@@ -77,6 +90,10 @@ func uid(s string) identity.UUIDv7 {
 	return id
 }
 
+// sync_outbox_items is cleared too: its insert is ON CONFLICT DO NOTHING, so a
+// stale row makes the next run a SILENT no-op. schema_migrations is NOT cleared —
+// that would make Migrate re-apply 0001 over existing tables.
+//
 // ─────────────────────────────────────────────────────────────────────────────
 // Migration
 // ─────────────────────────────────────────────────────────────────────────────
