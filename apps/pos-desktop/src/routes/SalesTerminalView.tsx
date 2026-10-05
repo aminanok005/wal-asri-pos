@@ -44,6 +44,7 @@ import { DEFAULT_VAT_RATE_BP } from '../features/sales/domain/tax';
 import { CartView } from '../features/sales/ui/CartView';
 import type { CartCatalogueItem } from '../features/sales/ui/CartView';
 import { toWireInput } from '../features/sales/infrastructure/tauriOfflineOrders';
+import { buildOrderSyncPayload } from '../features/sales/infrastructure/orderSyncPayload';
 import type { CheckoutFigures } from '../features/sales/infrastructure/tauriOfflineOrders';
 import { formatAdjustment, roundingRowText } from './moneyFormat';
 // Cash rounding, the receipt IR, and the printer port. Each is imported from its
@@ -306,55 +307,90 @@ export function SalesTerminalView({
         totalSatang: rounding.payable,
       };
 
-      const payload = toWireInput({
-        order: {
-          id: nextCartLineId(),
-          branchId: 'branch-siam',
-          terminalId: 'terminal-01',
-          staffUserId: 'staff-01',
-          orderType: 'dine_in',
-          status: 'submitted',
-          source: null,
-          currency: null,
-          // `vat_rate_bp` is the ONE satang-shaped value that is NOT a string in
-          // the Rust struct: it is `Option<i64>` with a 0..10000 bound, so it fits
-          // a double exactly and serialises as a JSON number. Every MONEY field
-          // is a string; a rate is a percentage, not an amount.
-          vatRateBp: Number(DEFAULT_VAT_RATE_BP),
-          discountSatang: 0n,
-          idempotencyKey: `idem-${nextCartLineId()}`,
-          localReceiptNumber: `R-${units.toString()}`,
-          createdAt: new Date().toISOString(),
-        },
-        lines: cart.items.map((item) => ({
-          id: item.id,
-          variantId: item.variant.id,
-          productId: null,
-          sku: item.variant.sku,
-          nameTh: item.variant.name_th,
-          // `exactOptionalPropertyTypes` is on, so an optional field may be
-          // `null` but NOT `undefined`. `name_en` is optional on the contract
-          // type, so `?? null` converts "absent" into the explicit null the Rust
-          // `Option<String>` expects.
-          nameEn: item.variant.name_en ?? null,
-          quantity: item.quantity.toString(),
-          unitPriceSatang: item.unitPrice.satang,
-          lineDiscountSatang: 0n,
-          lineTaxSatang: 0n, // VAT is per order — the schema rejects anything else
-          lineTotalSatang: item.unitPrice.multiply(item.quantity).satang,
-          createdAt: new Date().toISOString(),
-        })),
-        outbox: {
-          id: nextCartLineId(),
-          aggregateType: null,
-          eventType: null,
-          action: null,
-          payload: JSON.stringify({ order_id: 'pending' }),
-          idempotencyKey: `idem-outbox-${nextCartLineId()}`,
-          createdAt: new Date().toISOString(),
-        },
-        figures,
-      });
+      // ONE order id and ONE instant, shared by the local row, its lines and the
+// payload the server will receive. Two calls to `nextCartLineId()` would let the
+// event the server ingests describe a different order than the one on disk.
+const orderId = nextCartLineId();
+const committedAt = new Date().toISOString();
+
+const payload = toWireInput({
+  order: {
+    id: orderId,
+    branchId: 'branch-siam',
+    terminalId: 'terminal-01',
+    staffUserId: 'staff-01',
+    orderType: 'dine_in',
+    status: 'submitted',
+    source: 'pos_desktop',
+    currency: null,
+    // `vat_rate_bp` is the ONE satang-shaped value that is NOT a string in the
+    // Rust struct: a rate, not an amount, so it is a JSON number on both wires.
+    vatRateBp: Number(DEFAULT_VAT_RATE_BP),
+    discountSatang: 0n,
+    idempotencyKey: `idem-${orderId}`,
+    localReceiptNumber: `R-${units.toString()}`,
+    createdAt: committedAt,
+  },
+  lines: cart.items.map((item) => ({
+    id: item.id,
+    variantId: item.variant.id,
+    productId: null,
+    sku: item.variant.sku,
+    nameTh: item.variant.name_th,
+    // `exactOptionalPropertyTypes` is on, so an optional field may be `null`
+    // but NOT `undefined`. `name_en` is optional on the contract type, so `?? null`
+    // converts "absent" into the explicit null the Rust `Option<String>` expects.
+    nameEn: item.variant.name_en ?? null,
+    quantity: item.quantity.toString(),
+    unitPriceSatang: item.unitPrice.satang,
+    lineDiscountSatang: 0n,
+    lineTaxSatang: 0n, // VAT is per order — the schema rejects anything else
+    lineTotalSatang: item.unitPrice.multiply(item.quantity).satang,
+    createdAt: committedAt,
+  })),
+  outbox: {
+    id: nextCartLineId(),
+    // Left null so the Rust adapter applies its own defaults — the schema's CHECK
+    // constraints are the one definition of these vocabularies, not this file.
+    aggregateType: null,
+    eventType: null,
+    action: null,
+    // The REAL order, in the shape the Go ingester parses. The previous
+    // `{"order_id":"pending"}` placeholder carried no money and no id, and
+    // `DisallowUnknownFields` would have refused it — permanently.
+    payload: buildOrderSyncPayload({
+      id: orderId,
+      branchId: 'branch-siam',
+      terminalId: 'terminal-01',
+      type: 'dine_in',
+      status: 'submitted',
+      source: 'pos_desktop',
+      subtotalSatang: figures.subtotalSatang,
+      discountSatang: 0n,
+      taxableSatang: figures.taxableSatang,
+      taxSatang: figures.taxSatang,
+      serviceChargeSatang: figures.serviceChargeSatang,
+      roundingAdjustmentSatang: figures.roundingAdjustmentSatang,
+      totalSatang: figures.totalSatang,
+      vatRateBp: Number(DEFAULT_VAT_RATE_BP),
+      createdAt: committedAt,
+      lines: cart.items.map((item, sequence) => ({
+        id: item.id,
+        orderId,
+        productVariantId: item.variant.id,
+        quantity: item.quantity.toString(),
+        unitPriceSatang: item.unitPrice.satang,
+        lineDiscountSatang: 0n,
+        lineTotalSatang: item.unitPrice.multiply(item.quantity).satang,
+        sequence,
+        createdAt: committedAt,
+      })),
+    }),
+    idempotencyKey: `idem-outbox-${orderId}`,
+    createdAt: committedAt,
+  },
+  figures,
+});
 
       const saved = await repo.save(payload);
 
