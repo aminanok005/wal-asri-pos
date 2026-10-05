@@ -339,22 +339,15 @@ jobs:
       # suite — 127 untagged tests plus the 6 integration ones, 133 in total —
       # and there is no second invocation to forget.
       #
-      # `WASRI_TEST_DATABASE_URL` points at the service container above. It is set
-      # for the whole job rather than per-step so a future step that needs the
-      # database cannot forget it. The integration tests SKIP when it is unset,
-      # so the suite degrades to "unit tests only" rather than to a red build —
-      # which is the safe direction to fail, but it does mean a typo in this URL
-      # would silently reduce coverage instead of breaking loudly. The count in the
-      # step below is what catches that.
-      - name: go test (unit + integration)
-        env:
-          WASRI_TEST_DATABASE_URL: >-
-            postgres://wasri_user:walasri_local_dev_pw@127.0.0.1:5433/walasri_db?sslmode=disable
-        run: go test -v -tags=integration ./...
-
-      # Fails if the integration tests silently SKIPPED, which is the failure mode
-      # of an unset or malformed WASRI_TEST_DATABASE_URL: green, and quietly
-      # testing nothing against the schema.
+      # `WASRI_TEST_DATABASE_URL` points at the service container above. The
+      # integration tests SKIP when it is unset, so the suite degrades to "unit
+      # tests only" rather than to a red build — which is the safe direction to
+      # fail, but it does mean a typo in this URL would silently reduce coverage
+      # instead of breaking loudly. The SKIP assertion below is what catches that.
+      #
+      # The suite runs ONCE here, not twice: the assertion step used to re-run
+      # `go test` purely to grep its own output, doubling the wall-clock and the
+      # DB round-trips against a live database for no added signal.
       #
       # It asserts on the tests BY NAME rather than on a total count, for two
       # reasons. A global count rots — adding an unrelated test changes it, and
@@ -364,9 +357,9 @@ jobs:
       # green run needs to be able to conclude that the money CHECKs were
       # exercised, not merely that a lot of tests passed.
       #
-      # Keep this list in step with integration_test.go. A new integration test
-      # belongs here in the same commit.
-      - name: Assert the integration suite actually ran
+      # A new integration test must be added to the six names below in the same
+      # commit that adds it, or this gate stops proving that test actually ran.
+      - name: go test (unit + integration, run once and asserted)
         env:
           WASRI_TEST_DATABASE_URL: >-
             postgres://wasri_user:walasri_local_dev_pw@127.0.0.1:5433/walasri_db?sslmode=disable
@@ -376,6 +369,7 @@ jobs:
             echo "$output"
             exit 1
           }
+          printf '%s\n' "$output"
 
           skipped="$(printf '%s\n' "$output" | grep -cE '^(--- SKIP|    --- SKIP)' || true)"
           if [ "$skipped" -ne 0 ]; then
