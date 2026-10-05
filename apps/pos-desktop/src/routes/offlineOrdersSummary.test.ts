@@ -30,6 +30,7 @@ function order(
     createdAt: '2026-10-02T09:00:00.000Z',
     lineCount: 2,
     total: Money.fromSatang(5250n),
+    roundingAdjustmentSatang: Money.fromSatang(0n),
     currencyCode: 'THB',
   };
 }

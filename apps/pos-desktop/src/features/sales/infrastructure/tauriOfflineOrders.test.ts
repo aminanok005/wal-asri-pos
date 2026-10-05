@@ -84,6 +84,40 @@ describe('toWireInput — satang crosses as a STRING', () => {
     expect(order.serviceChargeSatang).toBe('0');
   });
 
+  // ── Signed rounding ───────────────────────────────────────────────────────
+  // The one order-level field that may carry a minus sign, and the one whose
+  // mishandling is invisible until a shift lead reconciles a drawer.
+  it('serialises a NEGATIVE rounding adjustment as "-3", not "3" or "-3n"', () => {
+    const { order } = wire({ roundingAdjustmentSatang: -3n });
+
+    expect(order.roundingAdjustmentSatang).toBe('-3');
+    expect(typeof order.roundingAdjustmentSatang).toBe('string');
+
+    // The sign is the data. Dropping it would report a till that was 6 satang
+    // out instead of one that balanced; keeping it as a BigInt would not even
+    // survive the trip — `JSON.stringify(-3n)` throws.
+    expect(JSON.parse(JSON.stringify({ ...order })).roundingAdjustmentSatang).toBe('-3');
+  });
+
+  it('serialises a POSITIVE rounding adjustment with its sign too', () => {
+    expect(wire({ roundingAdjustmentSatang: 3n }).order.roundingAdjustmentSatang).toBe('3');
+    expect(wire({ roundingAdjustmentSatang: 0n }).order.roundingAdjustmentSatang).toBe('0');
+  });
+
+  it('keeps the sign through a full JSON round-trip of the save payload', () => {
+    // This is the object handed to `invoke('save_offline_order')` — so this
+    // assertion is the closest a unit test gets to "it is on disk correctly".
+    // The disk leg itself is pinned in test/migrations.test.ts and in Rust's
+    // `history_returns_a_negative_rounding_adjustment_with_its_sign`.
+    const payload = wire({ roundingAdjustmentSatang: -3n, totalSatang: 4547n });
+    const roundTripped = JSON.parse(JSON.stringify(payload)) as {
+      order: { roundingAdjustmentSatang: string; totalSatang: string };
+    };
+
+    expect(roundTripped.order.roundingAdjustmentSatang).toBe('-3');
+    expect(roundTripped.order.totalSatang).toBe('4547');
+  });
+
   it('survives JSON round-trip with exact precision', () => {
     // The whole reason money is a string: this value is NOT representable as a
     // JS number, and a JSON number would come back subtly changed with no

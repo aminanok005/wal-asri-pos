@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { Money, MoneyError, SATANG_PER_UNIT } from './money';
+import { Money, MoneyError, SATANG_PER_UNIT, satangFromWire, signedSatangFromWire } from './money';
 
 describe('construction', () => {
   it('parses decimal strings exactly', () => {
@@ -202,5 +202,60 @@ describe('constants', () => {
   it('exposes 100 satang per unit', () => {
     expect(SATANG_PER_UNIT).toBe(100n);
     expect(Money.fromSatang(SATANG_PER_UNIT).toString()).toBe('1.00');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The SIGNED wire grammar.
+//
+// These two grammars exist side by side on purpose: `satangFromWire` must keep
+// refusing a minus sign so no ORDER TOTAL can arrive negative, while
+// `signedSatangFromWire` must accept one for `rounding_adjustment_satang`.
+// The test below that asserts BOTH behaviours is the load-bearing one — if
+// someone "simplifies" this into a single permissive pattern, the unsigned
+// assertions fail and the drift is caught here rather than at a till.
+// ─────────────────────────────────────────────────────────────────────────────
+describe('satangFromWire vs signedSatangFromWire', () => {
+  it('accepts the negative adjustment that cash rounding actually produces', () => {
+    // ฿45.52 rounds DOWN to ฿45.50 — the drawer has no 2-satang coin.
+    expect(signedSatangFromWire('roundingAdjustmentSatang', '-3').satang).toBe(-3n);
+    expect(signedSatangFromWire('f', '-4550').satang).toBe(-4550n);
+    expect(signedSatangFromWire('f', '0').satang).toBe(0n);
+    expect(signedSatangFromWire('f', '3').satang).toBe(3n);
+  });
+
+  it('renders the sign back out, so nothing is lost in either direction', () => {
+    // The wire string and the Money must describe the same signed value — this
+    // is the "data not corrupted into other characters" guarantee, pinned.
+    expect(signedSatangFromWire('f', '-3').toString()).toBe('-0.03');
+    expect(signedSatangFromWire('f', '-3').isNegative()).toBe(true);
+    expect(signedSatangFromWire('f', '-3').isZero()).toBe(false);
+  });
+
+  it('still REFUSES a minus sign on the unsigned grammar', () => {
+    // Reusing `satangFromWire` for the rounding field would throw here — which
+    // is exactly why the history screen needed its own signed parser rather
+    // than a reuse. Documented as a failing expectation so the reason for the
+    // second function can never quietly become redundant.
+    expect(() => satangFromWire('totalSatang', '-3')).toThrow(MoneyError);
+    expect(() => satangFromWire('totalSatang', '-4550')).toThrow(MoneyError);
+    expect(satangFromWire('totalSatang', '4550').satang).toBe(4550n);
+  });
+
+  it('agrees with Rust parse_signed_satang on every rejected spelling', () => {
+    // commands.rs:801-821 pins the same table. A `+` must fail here too: two
+    // parsers that disagreed would store one answer and display another.
+    expect(() => signedSatangFromWire('f', '+3')).toThrow(MoneyError);
+    expect(() => signedSatangFromWire('f', '-03')).toThrow(MoneyError);
+    expect(() => signedSatangFromWire('f', '-3.0')).toThrow(MoneyError);
+    expect(() => signedSatangFromWire('f', '- 3')).toThrow(MoneyError);
+    expect(() => signedSatangFromWire('f', '')).toThrow(MoneyError);
+    expect(() => signedSatangFromWire('f', 3)).toThrow(MoneyError);
+  });
+
+  it('names the field that failed, so a bad row is reportable', () => {
+    expect(() => signedSatangFromWire('roundingAdjustmentSatang', 'oops')).toThrow(
+      /roundingAdjustmentSatang/,
+    );
   });
 });

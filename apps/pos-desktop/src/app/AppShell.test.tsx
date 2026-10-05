@@ -134,6 +134,7 @@ const SEEDED_ORDER: OfflineOrderSummary = {
   createdAt: '2026-10-03T09:30:00.000Z',
   lineCount: 1,
   total: Money.fromSatang(4550n),
+  roundingAdjustmentSatang: Money.fromSatang(0n),
   currencyCode: 'THB',
 };
 

@@ -104,6 +104,56 @@ export function satangFromWire(field: string, raw: unknown): Money {
   return Money.fromSatang(BigInt(raw));
 }
 
+/**
+ * `^(0|[1-9][0-9]*)$` with one optional leading `-` — the signed twin of
+ * [`SATANG_PATTERN`].
+ *
+ * WHY THIS IS A SEPARATE GRAMMAR AND NOT A LOOSENER ──────────────────────────
+ * Every TOTAL crossing this boundary must stay unsigned, and [`SATANG_PATTERN`]
+ * is what enforces that; loosening it to accept `-` would hand every order
+ * total, subtotal and line price a way to arrive negative. So the two rules are
+ * kept apart on purpose and each field picks one.
+ *
+ * The signed form exists for exactly one field: `rounding_adjustment_satang`.
+ * Cash rounding is DIRECTIONAL — ฿45.47 becomes ฿45.50 (+3) because the drawer
+ * has no 1-satang coin, and ฿45.52 becomes ฿45.50 (−3) because it has no 2-satang
+ * coin either. The sign is the whole information: dropping it would tell the
+ * shift report the till was short by 6 satang instead of exact, which is a
+ * reconciliation error rather than a display nit.
+ *
+ * Mirrors Rust's `parse_signed_satang` (commands.rs), including rejecting `+3`:
+ * two parsers that disagreed about `"+3"` would put one boundary's answer in
+ * the database and the other's on screen.
+ */
+export const SIGNED_SATANG_PATTERN = /^-?(0|[1-9][0-9]*)$/;
+
+/**
+ * Parse a SIGNED satang string from the wire into a `Money`.
+ *
+ * Same contract as [`satangFromWire`] — string in, exact `bigint` underneath,
+ * no `Number` — except that one leading `-` is part of the accepted grammar.
+ *
+ * @param field Named in the thrown error, so a bad pull names the field rather
+ *   than merely reporting that a number did not parse.
+ */
+export function signedSatangFromWire(field: string, raw: unknown): Money {
+  if (typeof raw !== 'string') {
+    throw new MoneyError(
+      `${field} must arrive as a decimal-integer STRING, received ${typeof raw}. ` +
+        'Sending satang as a JSON number loses precision above 2^53 and fails silently.',
+    );
+  }
+
+  if (!SIGNED_SATANG_PATTERN.test(raw)) {
+    throw new MoneyError(
+      `${field} must match ^-?(0|[1-9][0-9]*)$, received ${JSON.stringify(raw)}. ` +
+        'A `+`, decimal point, exponent, whitespace or leading zero is rejected.',
+    );
+  }
+
+  return Money.fromSatang(BigInt(raw));
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Internal helpers
 // ─────────────────────────────────────────────────────────────────────────────

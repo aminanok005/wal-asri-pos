@@ -45,6 +45,7 @@ import { CartView } from '../features/sales/ui/CartView';
 import type { CartCatalogueItem } from '../features/sales/ui/CartView';
 import { toWireInput } from '../features/sales/infrastructure/tauriOfflineOrders';
 import type { CheckoutFigures } from '../features/sales/infrastructure/tauriOfflineOrders';
+import { formatAdjustment, roundingRowText } from './moneyFormat';
 // Cash rounding, the receipt IR, and the printer port. Each is imported from its
 // own layer and none of them may be reimplemented here — see the checkout
 // handler for why that matters more than usual on this screen.
@@ -174,26 +175,18 @@ const PAYMENT_METHODS: readonly { readonly id: PaymentMethod; readonly label: st
 /**
  * Sign a satang adjustment the way a Thai customer expects to read it.
  *
- * Exported so the formatting is directly testable. That matters because a
- * component test cannot reach it: every price in the demo menu is an exact
- * multiple of 25 satang, so no basket the screen can build ever rounds. See
- * `SalesTerminalPrint.test.ts` for the full note.
+ * The implementation moved to `./moneyFormat` when the offline history screen
+ * needed the same rendering; importing it from THIS file would have pulled the
+ * whole checkout route into that screen's module graph. Re-exported here so
+ * every existing importer — and the tests that reach it through this path —
+ * keeps working unchanged.
  *
- * `bigint` throughout — a `number` here would reintroduce exactly the float the
- * rest of the money path exists to keep out.
+ * Still directly testable, which still matters: a component test cannot reach
+ * it, because every price in the demo menu is an exact multiple of 25 satang and
+ * no basket the screen can build ever rounds. See `SalesTerminalPrint.test.ts`
+ * for the full note.
  */
-export function formatAdjustment(satang: bigint): string {
-  if (satang === 0n) return '฿0.00';
-  const magnitude = satang < 0n ? -satang : satang;
-  const whole = magnitude / 100n;
-  const frac = (magnitude % 100n).toString().padStart(2, '0');
-  return satang < 0n ? `-฿${whole}.${frac}` : `+฿${whole}.${frac}`;
-}
-
-/** The whole rounding line, as the cashier reads it. `payable` is "45.50". */
-export function roundingRowText(adjustment: bigint, payable: string): string {
-  return `ปัดเศษ ${formatAdjustment(adjustment)} → ฿${payable}`;
-}
+export { formatAdjustment, roundingRowText };
 
 export function SalesTerminalView({
   repository,

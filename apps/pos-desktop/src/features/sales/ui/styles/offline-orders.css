@@ -92,14 +92,49 @@
 }
 
 /* The two rungs a shift lead must act on, matching the row badges below. */
-.offline-orders__sync-item[data-sync-state='conflict'] .offline-orders__sync-label {
+/*
+ * Colour by rung, on the chip's own background so the label and its count both
+ * read at a glance. `data-sync-state` is the attribute the tests already assert
+ * on; a parallel set of classes could disagree with it.
+ *
+ * `pending` is the accent (waiting on the server), `synced` the only green,
+ * `conflict` the accent again because it must be escalated but is NOT a failure,
+ * and `rejected` the danger red — the server refused the write outright.
+ */
+.offline-orders__sync-item[data-sync-state='pending'] {
+  background: var(--accs);
+}
+
+.offline-orders__sync-item[data-sync-state='pending'] .offline-orders__sync-label {
   color: var(--acc);
   font-weight: 600;
 }
 
+.offline-orders__sync-item[data-sync-state='synced'] {
+  background: var(--oks);
+}
+
+.offline-orders__sync-item[data-sync-state='synced'] .offline-orders__sync-label {
+  color: var(--ok);
+  font-weight: 600;
+}
+
+.offline-orders__sync-item[data-sync-state='conflict'] {
+  background: var(--accs);
+}
+
+.offline-orders__sync-item[data-sync-state='conflict'] .offline-orders__sync-label {
+  color: var(--acc);
+  font-weight: 700;
+}
+
+.offline-orders__sync-item[data-sync-state='rejected'] {
+  background: color-mix(in srgb, var(--danger) 12%, var(--card));
+}
+
 .offline-orders__sync-item[data-sync-state='rejected'] .offline-orders__sync-label {
   color: var(--danger);
-  font-weight: 600;
+  font-weight: 700;
 }
 
 /*
@@ -171,6 +206,11 @@
  * Selected on the `data-sync-state` attribute the tests already read, rather than
  * a second parallel set of classes that could disagree with it.
  */
+.offline-orders__row-sync[data-sync-state='synced'] {
+  color: var(--ok);
+  font-weight: 600;
+}
+
 .offline-orders__row-sync[data-sync-state='conflict'] {
   color: var(--acc);
   font-weight: 600;
@@ -200,6 +240,27 @@
   font-size: 12px;
 }
 
+/*
+ * The cash-rounding adjustment — the one signed amount on the row.
+ *
+ * Column 1 with the other small metadata, and muted for the same reason
+ * `created` and `lines` are: this is a field a shift lead reconciles the drawer
+ * against, so it has to be readable, but it appears on only the few sales that
+ * actually rounded and must never compete with the total beside it.
+ *
+ * `tabular-nums` so the digits line up with the other numeric metadata on the
+ * row. Deliberately NOT coloured by `data-rounding-sign`: a positive and a
+ * negative adjustment are both correct outcomes of rounding, not good and bad
+ * states, so tinting them would invent an urgency the shift report should not
+ * infer. The sign is already in the text as `-฿0.03` / `+฿0.03`.
+ */
+.offline-orders__row-rounding {
+  grid-column: 1;
+  color: var(--mut);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
 .offline-orders__row-total {
   grid-column: 2;
   grid-row: 1 / span 2;
@@ -215,16 +276,36 @@
   font-size: 13px;
 }
 
-/* Below 560px the right-hand total column squeezes to nothing; it moves under the
-   receipt instead, where the figure matters more than the alignment. */
+/*
+ * Below 560px the row stops being a grid and becomes a wrapping flex line.
+ *
+ * Grid was the wrong tool here: the children are `<span>`s whose DOM order
+ * already reads correctly (receipt, status, sync, timestamp, count, total), and
+ * collapsing to `1fr` just stacks all six on their own lines while the explicit
+ * `grid-column: 1` on the timestamp and the `grid-row: 1 / span 2` on the total
+ * still had to be undone by hand. Flex lets them flow and wrap naturally, so the
+ * middot separators between receipt/status/sync keep doing their job on one line.
+ *
+ * `flex: 1 0 100%` on the total claims its own line rather than sitting beside a
+ * truncated ฿amount — the figure is the point of the row.
+ */
 @media (max-width: 560px) {
   .offline-orders__row {
-    grid-template-columns: 1fr;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 4px 12px;
+  }
+
+  .offline-orders__row-created,
+  .offline-orders__row-lines,
+  .offline-orders__row-total {
+    grid-column: auto;
+    grid-row: auto;
   }
 
   .offline-orders__row-total {
-    grid-column: 1;
-    grid-row: auto;
+    flex: 1 0 100%;
     margin-top: 6px;
   }
 }

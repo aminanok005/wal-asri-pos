@@ -182,6 +182,77 @@
   color: var(--danger);
 }
 
+/* ── Payment method ──────────────────────────────────────────────────────── */
+
+.sales-terminal__payment {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0 0 14px;
+  padding: 0;
+  border: 0;
+}
+
+.sales-terminal__payment legend {
+  padding: 0;
+  color: var(--mut);
+  font-size: 13px;
+}
+
+/*
+ * The radio is kept visible and clickable rather than hidden behind the label:
+ * a till is used by someone who is not looking at the screen, and an invisible
+ * control has no affordance to aim at. The label wraps both, so the whole chip is
+ * the hit target and the native radio still carries the checked state.
+ */
+.sales-terminal__payment-option {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: var(--tap-sm);
+  padding: 6px 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--card);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.sales-terminal__payment-option:has(input:checked) {
+  border-color: var(--acc);
+  background: var(--accs);
+  color: var(--acc);
+  font-weight: 600;
+}
+
+.sales-terminal__payment-option:has(input:disabled) {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* ── Cash rounding ───────────────────────────────────────────────────────── */
+
+/*
+ * The adjustment line, which renders only when the adjustment is non-zero.
+ *
+ * The element's text is one string — `ปัดเศษ -฿0.03 → ฿45.47` — so the sign
+ * cannot be styled separately from the label around it. What this rule does
+ * instead is give the whole line its own framed treatment, so a cashier reads it
+ * as a distinct line in the checkout and not as a fourth row of the VAT table
+ * above it. `tabular-nums` keeps the two ฿figures aligned while the digits change.
+ */
+.sales-terminal__rounding {
+  margin: 0 0 14px;
+  padding: 10px 12px;
+  border-left: 3px solid var(--acc);
+  border-radius: 10px;
+  background: var(--accs);
+  color: var(--acc);
+  font-size: 14px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
 /* ── The two columns ────────────────────────────────────────────────────── */
 
 .sales-terminal__body {

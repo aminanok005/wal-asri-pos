@@ -35,6 +35,7 @@ import type {
 } from '../features/sales/application/offlineOrders';
 import type { Money } from '../features/payments/domain/money';
 import { ALL_SYNC_STATES, summariseSyncStates } from './offlineOrdersSummary';
+import { formatAdjustment } from './moneyFormat';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Props
@@ -327,6 +328,26 @@ export function OfflineOrdersView(props: OfflineOrdersViewProps): JSX.Element {
               <span className="offline-orders__row-created">{order.createdAt}</span>
               <span className="offline-orders__row-lines">{`${order.lineCount} รายการ`}</span>
               <span className="offline-orders__row-total">{formatBaht(order.total)}</span>
+              {/* The cash-rounding adjustment, SIGNED, and ONLY when it is not
+                  zero. This is the field a shift lead reconciles the drawer
+                  against: +3 means the customer was charged 3 satang more than
+                  the goods so the drawer could hold whole baht, −3 means 3 less.
+                  Hiding the sign would turn an exact till into one that looks
+                  6 satang out.
+                  Rendered through `formatAdjustment` (shared with checkout) rather
+                  than `formatBaht`, because `formatBaht` would emit `฿-0.03` —
+                  the sign inside the currency symbol — and a blank span instead of
+                  a row is what `0n` would give, which is correct: a sale that did
+                  not round carries no rounding line at all. */}
+              {!order.roundingAdjustmentSatang.isZero() && (
+                <span
+                  className="offline-orders__row-rounding"
+                  data-testid="offline-order-rounding"
+                  data-rounding-sign={order.roundingAdjustmentSatang.isNegative() ? 'negative' : 'positive'}
+                >
+                  {`ปัดเศษ ${formatAdjustment(order.roundingAdjustmentSatang.satang)}`}
+                </span>
+              )}
             </li>
           ))}
         </ul>

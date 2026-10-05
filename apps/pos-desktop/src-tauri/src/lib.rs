@@ -61,6 +61,11 @@ pub mod escpos;
 // LAN printer transport (TCP) and the command that joins it to the compiler.
 pub mod printer_commands;
 pub mod printer_port;
+// The local outbox state machine: pending → in_flight → done, plus the
+// background drain that walks it. Pure SQLite state transitions — no HTTP — so
+// the lifecycle is testable against a real migrated database. See the module
+// header for why the key is transmitted raw and the states are lowercase.
+pub mod sync_outbox;
 // Proves the receipt printer's code page can encode the Thai this POS actually
 // uses — especially ๐–๙, which post-date windows-874 and were the likeliest
 // unmappable characters. See the module for why this runs before any receipt.

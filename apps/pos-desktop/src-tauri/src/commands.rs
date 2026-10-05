@@ -202,6 +202,12 @@ pub struct OrderSummary {
   /// A string, for the reason at the module header. The TypeScript adapter wraps
   /// it in `Money` at the edge.
   pub total_satang: String,
+  /// `local_orders.rounding_adjustment_satang` — SIGNED, unlike everything else
+  /// in this struct. Cash rounding moves the payable in both directions
+  /// (4547 → 4550 is +3; 4552 → 4550 is −3), so this is the one field where the
+  /// sign carries the meaning. Serialized as a string for the same precision
+  /// reason as `total_satang`, minus sign included.
+  pub rounding_adjustment_satang: String,
   pub currency_code: String,
 }
 
@@ -590,7 +596,7 @@ fn query_recent(conn: &Connection, limit: i64) -> Result<Vec<OrderSummary>, Comm
   let mut stmt = conn
     .prepare(
       "SELECT o.id, o.local_receipt_number, o.status, o.sync_state, o.created_at,
-              o.total_satang, o.currency,
+              o.total_satang, o.rounding_adjustment_satang, o.currency,
               (SELECT COUNT(*) FROM local_order_lines l WHERE l.order_id = o.id) AS line_count
        FROM local_orders o
        ORDER BY o.created_at DESC, o.id DESC
@@ -607,8 +613,12 @@ fn query_recent(conn: &Connection, limit: i64) -> Result<Vec<OrderSummary>, Comm
         sync_state: row.get(3)?,
         created_at: row.get(4)?,
         total_satang: row.get::<_, i64>(5)?.to_string(),
-        currency_code: row.get(6)?,
-        line_count: row.get(7)?,
+        // i64 and NOT u64: this column carries a minus sign, and reading it as
+        // an unsigned type would either error or silently flip −3 into a huge
+        // positive number. `to_string()` is what preserves the sign on the wire.
+        rounding_adjustment_satang: row.get::<_, i64>(6)?.to_string(),
+        currency_code: row.get(7)?,
+        line_count: row.get(8)?,
       })
     })
     .map_err(|e| CommandError::storage("read history", e))?;
@@ -1057,6 +1067,47 @@ mod tests {
     assert_eq!(rows[0].total_satang, "4550");
     assert_eq!(rows[0].currency_code, "THB");
     assert_eq!(rows[0].sync_state, "pending");
+  }
+
+  /// A NEGATIVE rounding adjustment must survive disk → history projection with
+  /// its sign intact.
+  ///
+  /// This is the round-DOWN direction, and it is the case that breaks if the
+  /// column is read as unsigned: −3 read through a `u64` does not come back as
+  /// −3, and a shift lead reconciling a drawer that was 3 satang SHORT would be
+  /// shown a 6-satang error instead.
+  ///
+  /// The figures satisfy BOTH identities in migration 0002:
+  ///   total = 4550 − 0 + 0 + (−3) = 4547
+  ///   taxable + tax = 4547 − 0 − (−3) = 4550   (4252 + 298)
+  /// Getting either wrong would fail the CHECK rather than run, which is the
+  /// point of having written them down here.
+  #[test]
+  fn history_returns_a_negative_rounding_adjustment_with_its_sign() {
+    let mut c = conn();
+
+    let mut input = good_input();
+    input.order.total_satang = "4547".into();
+    input.order.rounding_adjustment_satang = "-3".into();
+    // Distinct replay keys — `sync_outbox.idempotency_key` is UNIQUE, and this
+    // database starts empty, so reusing anything would be refused.
+    input.order.idempotency_key = "idem-negative-rounding".into();
+    input.outbox.idempotency_key = "idem-outbox-negative-rounding".into();
+    input.outbox.id = "outbox-negative-rounding".into();
+
+    write_order(&mut c, &input).expect("checkout that rounded DOWN");
+
+    let rows = query_recent(&c, 50).expect("history");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+      rows[0].rounding_adjustment_satang, "-3",
+      "the minus sign must survive the round trip through SQLite and to_string()"
+    );
+    // The payable is ฿45.47 — LOWER than the ฿45.50 subtotal. If these two ever
+    // disagreed the history screen would show an adjustment that does not
+    // reconcile with the total beside it.
+    assert_eq!(rows[0].total_satang, "4547");
+    assert_eq!(rows[0].currency_code, "THB");
   }
 
   #[test]

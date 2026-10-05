@@ -19,6 +19,9 @@
 
   /* Not in the prototype — invented here. Needs design sign-off before commit. */
   --danger: #c8372a;
+  /* Also invented here: `synced` is the one healthy outcome with no colour yet. */
+  --ok: #1f7a4d;
+  --oks: #e6f4ec;
 
   /* 48px is the prototype's own stepper size; 56px is its pay button. */
   --tap: 48px;
@@ -44,6 +47,8 @@
     --acc: #ff7a45;
     --accs: #35231a;
     --danger: #ff6b5a;
+    --ok: #4ec98a;
+    --oks: #14291d;
   }
 }
 
@@ -56,6 +61,8 @@
   --acc: #ff7a45;
   --accs: #35231a;
   --danger: #ff6b5a;
+  --ok: #4ec98a;
+  --oks: #14291d;
 }
 
 /*

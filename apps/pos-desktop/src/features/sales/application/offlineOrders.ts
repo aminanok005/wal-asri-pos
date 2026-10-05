@@ -168,6 +168,23 @@ export interface OfflineOrderSummary {
    * irresistible, and SKILL.md §2.1 exists to forbid precisely that.
    */
   readonly total: Money;
+  /**
+   * **MONEY — SIGNED Satang (int64), as a `Money`.** From
+   * `local_orders.rounding_adjustment_satang`.
+   *
+   * The ONLY signed amount on this projection, and deliberately so. Cash
+   * rounding moves the payable in both directions: a ฿45.47 basket rounds UP to
+   * ฿45.50 (+3) because the drawer has no 1-satang coin, and a ฿45.52 basket
+   * rounds DOWN (−3) because it has no 2-satang coin. The sign is the entire
+   * content of the field — a history screen that showed `3` for both would be
+   * reporting a 6-satang discrepancy on a shift that in fact balanced.
+   *
+   * Parsed with `signedSatangFromWire`, NOT `satangFromWire`: the unsigned
+   * grammar rejects `-3` by design, so reusing it here would throw while
+   * mapping the row and blank the whole history list the first time a till
+   * rounded down.
+   */
+  readonly roundingAdjustmentSatang: Money;
   /** `local_orders.currency` — ISO-4217 alpha-3. `'THB'` on every Thai branch. */
   readonly currencyCode: string;
 }

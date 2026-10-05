@@ -53,6 +53,7 @@ function summary(
     createdAt,
     lineCount: 2,
     total: Money.fromSatang(5250n),
+    roundingAdjustmentSatang: Money.fromSatang(0n),
     currencyCode: 'THB',
     ...overrides,
   };

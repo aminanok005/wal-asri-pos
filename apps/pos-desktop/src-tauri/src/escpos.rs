@@ -55,6 +55,7 @@
 //!
 //!   ESC @      (1B 40)   initialise — clears modes, resets the code page.
 //!   ESC t n    (1B 74 n) select character code table; n=20 for Thai.
+//!   ESC 3 n    (1B 33 n) line spacing in n dots; n=35 so Thai stacked marks fit.
 //!   GS V m n   (1D 56 m n) cut paper; 66 0 is the full cut with auto-feed.
 //!   ESC p m t1 t2       cash drawer pulse on pin 2, 25ms on / 250ms off.
 //!   LF         (0A)       line feed.
@@ -87,6 +88,32 @@ pub const ESC_DRAWER_PIN2: &[u8] = b"\x1b\x70\x00\x19\xfa";
 
 /// Line feed — end of one text line.
 const LF: u8 = 0x0A;
+
+/// `ESC 3 n` (1B 33 n) — line spacing in dots, for Thai text.
+///
+/// WHY 35 AND NOT THE PRINTER DEFAULT ─────────────────────────────────────────
+/// `ESC @` leaves the line spacing at the printer's power-on default, which is
+/// commonly 1/6 inch ≈ 24–34 dots depending on the unit's DPI. That default is
+/// sized for Latin text, where nothing sits above the x-height or below the
+/// baseline. Thai routinely does BOTH on one glyph: `สิทธิ์` stacks `ิ` above the
+/// consonant with `ทฺ`-style sara ii plus a tone mark on top of it, and `น้ำ`
+/// puts `้` over `่`-adjacent sara am. At the default spacing those marks are
+/// either clipped by the next line or collide with it, which is the classic
+/// "Thai looks smudged on the receipt" complaint.
+///
+/// 35 dots clears that stack on the 203 dpi units this target assumes
+/// (1/6" ≈ 34 dots, so this is ~1 line of Latin height plus the accent band),
+/// while staying inside the 30–35 dot envelope the hardware spec allows for
+/// `ESC 3`. It is deliberately NOT larger: every line feed, including the ones
+/// emitted before the cut, advances by this amount, so a bigger value wastes
+/// paper on a 58 mm roll and can push the last line past the cutter.
+///
+/// WHY IT IS EMITTED PER RECEIPT, NOT ONCE AT CONNECT ─────────────────────────
+/// Same argument as `ESC @`: a receipt must not depend on the state the
+/// previous customer's job left behind. `ESC 2` (the other printer's default,
+/// 1/6") would silently undo this if anything reset mid-job, so the spacing is
+/// re-asserted in every preamble.
+pub const ESC_LINE_SPACING_THAI: &[u8] = b"\x1b\x33\x23"; // ESC 3 35
 
 /// Horizontal alignment for a line of text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -220,9 +247,9 @@ fn encode_line(line: &ReceiptLine, index: usize) -> Result<Vec<u8>, CompileError
 
 /// Compile a receipt IR into an ESC/POS byte stream.
 ///
-/// The stream is, in order: initialise, select the Thai code page, the body
-/// lines, a few line feeds so the last line clears the cutter, the cut, and
-/// optionally the drawer pulse.
+/// The stream is, in order: initialise, select the Thai code page, set the line
+/// spacing to 35 dots, the body lines, a few line feeds so the last line clears
+/// the cutter, the cut, and optionally the drawer pulse.
 ///
 /// The code page is selected explicitly on every receipt even though `ESC @`
 /// precedes it. That is intentional: `ESC @` resets the code page to the
@@ -239,6 +266,12 @@ pub fn compile(ir: &ReceiptIr) -> Result<Vec<u8>, CompileError> {
   // ── 1. Initialise, then explicitly select Thai ────────────────────────────
   out.extend_from_slice(ESC_INIT);
   out.extend_from_slice(crate::cp874::THAI_CODE_PAGE_SELECT);
+  // Line spacing AFTER the code page, never between ESC @ and ESC t: the
+  // existing contract pins `ESC t 20` to bytes[2..5] so that Thai is in effect
+  // before any glyph is encoded, and re-ordering would break that guarantee for
+  // no benefit. Spacing only affects where the NEXT line lands, so it is free
+  // to follow.
+  out.extend_from_slice(ESC_LINE_SPACING_THAI);
 
   // ── 2. Shop name, centred, then the receipt number ────────────────────────
   let header = ReceiptLine {
@@ -340,6 +373,60 @@ mod tests {
       &bytes[2..5],
       b"\x1b\x74\x14",
       "ESC t 20 must immediately follow, before any Thai is sent"
+    );
+  }
+
+  /// The Thai page-select and the Thai line-spacing must BOTH be on the wire,
+  /// and the spacing must sit AFTER the page select.
+  ///
+  /// These two are asserted together on purpose. Either one alone is a trap:
+  /// a stream with `ESC t 20` but no `ESC 3 n` encodes Thai correctly and then
+  /// stacks the tone marks into the line above; a stream with `ESC 3 n` but no
+  /// `ESC t 20` spaces beautifully and prints mojibake. Only the pair satisfies
+  /// the hardware spec, so the test refuses to pass on half of it.
+  #[test]
+  fn the_preamble_selects_the_thai_page_and_then_sets_thai_line_spacing() {
+    let bytes = compile(&ir_with_line("สิทธิ์ น้ำ")).unwrap();
+
+    // bytes[0..2]  = ESC @
+    // bytes[2..5]  = ESC t 20  (1B 74 14) — Thai code page
+    // bytes[5..8]  = ESC 3 35  (1B 33 23) — line spacing in dots
+    assert_eq!(&bytes[2..5], b"\x1b\x74\x14", "must select the Thai code page");
+    assert_eq!(
+      &bytes[5..8],
+      b"\x1b\x33\x23",
+      "must set line spacing with ESC 3 n, n = 35 (0x23) dots"
+    );
+
+    // The byte at index 6 is the ESC 3 selector itself, so a reader of the
+    // stream can locate the command without knowing the length of ESC t.
+    assert_eq!(bytes[5], 0x1B, "ESC must lead the line-spacing command");
+    assert_eq!(bytes[6], 0x33, "0x33 is the '3' in `ESC 3 n`");
+    assert!(
+      (30..=35).contains(&bytes[7]),
+      "n must be inside the 30–35 dot band the Thai font needs, got {}",
+      bytes[7]
+    );
+  }
+
+  /// The spacing must be re-asserted on EVERY receipt, not just the first.
+  #[test]
+  fn line_spacing_is_emitted_per_receipt_not_once() {
+    let first = compile(&ir_with_line("น้ำ")).unwrap();
+    let second = compile(&ir_with_line("น้ำ")).unwrap();
+
+    assert_eq!(
+      &first[5..8],
+      &second[5..8],
+      "a second receipt must not inherit the previous job's spacing"
+    );
+    assert!(
+      first.windows(3).any(|w| w == b"\x1b\x33\x23"),
+      "the first receipt must carry ESC 3 35"
+    );
+    assert!(
+      second.windows(3).any(|w| w == b"\x1b\x33\x23"),
+      "the second receipt must ALSO carry ESC 3 35"
     );
   }
 

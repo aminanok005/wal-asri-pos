@@ -45,6 +45,7 @@ import {
   Money,
   MoneyError,
   satangFromWire as satangFromWireChecked,
+  signedSatangFromWire as signedSatangFromWireChecked,
 } from '../../payments/domain/money';
 import {
   OfflineOrdersError,
@@ -187,6 +188,31 @@ function satangFromWireField(field: string, raw: unknown): Money {
   }
 }
 
+/**
+ * Same boundary role as [`satangFromWireField`], but for a SIGNED field.
+ *
+ * Split rather than flagged with a boolean because the two grammars are the
+ * actual difference: `satangFromWire` must keep rejecting `-` so that no total
+ * can arrive negative, while `roundingAdjustmentSatang` must accept it or the
+ * history screen throws on the first rounded-down sale. One function with a
+ * `signed?: boolean` parameter would be a boolean trap — every future call site
+ * would have to remember which mode each money field is in, and getting it
+ * wrong throws only at runtime, only for the rows that happen to round down.
+ *
+ * The `MoneyError` → `OfflineOrdersError` translation is preserved so the view
+ * still reports a field name rather than a bare parse failure.
+ */
+function signedSatangFromWireField(field: string, raw: unknown): Money {
+  try {
+    return signedSatangFromWireChecked(field, raw);
+  } catch (cause) {
+    if (cause instanceof MoneyError) {
+      throw new OfflineOrdersError(cause.message);
+    }
+    throw cause;
+  }
+}
+
 /** Validate a non-money string field, naming the field if it is absent. */
 function requiredString(field: string, raw: unknown): string {
   if (typeof raw !== 'string' || raw.length === 0) {
@@ -234,6 +260,13 @@ function summaryFromWire(raw: unknown): OfflineOrderSummary {
     createdAt: requiredString('createdAt', wire.createdAt),
     lineCount: requiredCount('lineCount', wire.lineCount),
     total: satangFromWireField('totalSatang', wire.totalSatang),
+    // SIGNED — the one field on this projection whose minus sign means
+    // something. Delegates to the signed grammar, because `satangFromWire`
+    // rejects `-3` and would throw here, taking the whole history list with it.
+    roundingAdjustmentSatang: signedSatangFromWireField(
+      'roundingAdjustmentSatang',
+      wire.roundingAdjustmentSatang,
+    ),
     currencyCode: requiredString('currencyCode', wire.currencyCode),
   });
 }

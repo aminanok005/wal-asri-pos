@@ -133,6 +133,7 @@ function summary(
     createdAt,
     lineCount: 2,
     total: Money.fromSatang(5250n),
+    roundingAdjustmentSatang: Money.fromSatang(0n),
     currencyCode: 'THB',
     ...overrides,
   };
@@ -325,6 +326,67 @@ describe('OfflineOrdersView — one row per order', () => {
 // ─────────────────────────────────────────────────────────────────────────────
 // 3. Empty
 // ─────────────────────────────────────────────────────────────────────────────
+
+describe('OfflineOrdersView — signed cash rounding', () => {
+  // A sale that rounded DOWN: the ฿45.50 basket became ฿45.47 on the drawer, so
+  // the adjustment is −3. The sign is the whole point of the field.
+  const ORDER_ROUNDED = summary('018f3c2a-0000-7000-8000-0000000c1', '2026-10-02T11:00:00.000Z', {
+    localReceiptNumber: 'R-3001',
+    total: Money.fromSatang(4547n),
+    roundingAdjustmentSatang: Money.fromSatang(-3n),
+  });
+
+  it('shows the NEGATIVE adjustment with its sign, not its absolute value', async () => {
+    await renderView({ repository: createInMemoryOfflineOrdersRepository([ORDER_ROUNDED]) });
+
+    const rounding = rowFor('R-3001').querySelector('[data-testid="offline-order-rounding"]');
+    expect(rounding).not.toBeNull();
+
+    // `-฿0.03`, sign OUTSIDE the baht symbol. `฿-0.03` would be the sign inside
+    // the currency, and `฿0.03` would be the sign dropped — the failure this
+    // test exists to catch.
+    expect(rounding?.textContent ?? '').toContain('ปัดเศษ -฿0.03');
+    expect(rounding?.getAttribute('data-rounding-sign')).toBe('negative');
+
+    // The payable shown beside it must reconcile with the adjustment:
+    // 4547 + 3 = 4550. A screen showing −฿0.03 next to ฿45.50 would be lying.
+    expect(rowText('R-3001')).toContain('฿45.47');
+    expect(rowText('R-3001')).not.toContain('฿-0.03');
+  });
+
+  it('shows a POSITIVE adjustment with a plus, so the direction is never guessed', async () => {
+    const up = summary('018f3c2a-0000-7000-8000-0000000c2', '2026-10-02T12:00:00.000Z', {
+      localReceiptNumber: 'R-3002',
+      total: Money.fromSatang(4550n),
+      roundingAdjustmentSatang: Money.fromSatang(3n),
+    });
+
+    await renderView({ repository: createInMemoryOfflineOrdersRepository([up]) });
+
+    const rounding = rowFor('R-3002').querySelector('[data-testid="offline-order-rounding"]');
+    expect(rounding?.textContent ?? '').toContain('ปัดเศษ +฿0.03');
+    expect(rounding?.getAttribute('data-rounding-sign')).toBe('positive');
+  });
+
+  it('renders NO rounding line at all when the sale did not round', async () => {
+    // A blank span would be a bug, not a nicety: `ปัดเศษ ฿0.00` on an untouched
+    // sale trains staff to ignore the row where a real adjustment appears.
+    await renderView({ repository: createInMemoryOfflineOrdersRepository(SHIFT) });
+
+    const anyRounding = view().querySelector('[data-testid="offline-order-rounding"]');
+    expect(anyRounding).toBeNull();
+    expect(view().textContent ?? '').not.toContain('ปัดเศษ');
+  });
+
+  it('keeps the rounding line inside its own row, so it cannot move between sales', async () => {
+    await renderView({
+      repository: createInMemoryOfflineOrdersRepository([...SHIFT, ORDER_ROUNDED]),
+    });
+
+    expect(rowFor('R-3001').querySelector('[data-testid="offline-order-rounding"]')).not.toBeNull();
+    expect(rowFor('R-1001').querySelector('[data-testid="offline-order-rounding"]')).toBeNull();
+  });
+});
 
 describe('OfflineOrdersView — empty state', () => {
   it('says no orders are recorded here, and does NOT say it is still loading', async () => {
