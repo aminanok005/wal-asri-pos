@@ -22,6 +22,10 @@
   /* Also invented here: `synced` is the one healthy outcome with no colour yet. */
   --ok: #1f7a4d;
   --oks: #e6f4ec;
+  /* Invented here too: low stock must not borrow `--acc`, which is the pay
+     button's accent and the withheld-menu warning's. Needs design sign-off. */
+  --warn: #b4590f;
+  --warns: #fdf1e3;
 
   /* 48px is the prototype's own stepper size; 56px is its pay button. */
   --tap: 48px;
@@ -49,6 +53,8 @@
     --danger: #ff6b5a;
     --ok: #4ec98a;
     --oks: #14291d;
+    --warn: #f0a04b;
+    --warns: #3a2410;
   }
 }
 
@@ -63,6 +69,8 @@
   --danger: #ff6b5a;
   --ok: #4ec98a;
   --oks: #14291d;
+  --warn: #f0a04b;
+  --warns: #3a2410;
 }
 
 /*
