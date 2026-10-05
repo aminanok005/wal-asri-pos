@@ -346,7 +346,27 @@ func TestIngestOrder_PersistsToPostgresAndDeduplicatesOnRetry(t *testing.T) {
 		t.Fatalf("seeding the branch: %v", err)
 	}
 
-	now := time.Date(2026, 10, 4, 9, 0, 0, 0, time.UTC)
+	// The clock comes from the real world, NOT from a hardcoded date.
+	//
+	// This is the only fixture in this file whose timestamp has to stay correct as
+	// wall-clock time passes, and the reason is that the idempotency record it
+	// produces is filtered by the DATABASE's clock rather than this one.
+	// `NewIdempotencyRecord` stamps `ExpiresAt = now + 24h`, while
+	// `IdempotencyStore.Lookup` selects `WHERE key_hash = $1 AND expires_at > now()`
+	// — and that `now()` is Postgres', not Go's.
+	//
+	// A hardcoded `now` therefore makes this test a time bomb. Measured against this
+	// project's database on 2026-10-05: the row stored from a fixture pinned to
+	// 2026-10-04T09:00:00Z came back with expires_at = 2026-10-05 09:00:00 while the
+	// database's own now() was 2026-10-05 11:56:16 — 2h56m PAST expiry. So
+	// `expires_at > now()` evaluated FALSE, the stored record was treated as absent,
+	// the retry took the DecisionProceed path, Append hit the duplicate primary key,
+	// and Execute returned a bare error that left `second.Response` empty next to a
+	// populated `first.Response`.
+	//
+	// Truncated to the second only so the stored timestamps stay readable; the
+	// 24-hour window is open by roughly a day no matter what the real clock reads.
+	now := time.Now().UTC().Truncate(time.Second)
 	orders := postgres.NewOrderRepository(pool)
 	rates := postgres.NewBranchRate(pool)
 	idem := postgres.NewIdempotencyStore(pool)
