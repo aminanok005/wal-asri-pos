@@ -41,13 +41,11 @@
 //! interceptor would stop working silently. The terminal-side guarantee is
 //! already covered by `idempotency_key TEXT NOT NULL UNIQUE`.
 //!
-//! ── WHY THERE IS NO HTTP IN THIS FILE ───────────────────────────────────────
-//! `ARCHITECTURE-DEMO.md` plans this worker as "drain outbox → POST /sync/push",
-//! but the crate has no HTTP client dependency and the push contract is not
-//! settled. So delivery is a parameter, not a hard-coded call: [`drain_tick`]
-//! takes the transport as a closure. The part that could corrupt a ledger if it
-//! were wrong — the state machine — is exercised against real SQLite, while no
-//! URL, auth header or request body is invented here to be wrong later.
+//! ── WHERE THE BATCH ACTUALLY GOES ───────────────────────────────────────────
+//! The transport is a closure, so this module holds no HTTP client and the state
+//! machine is testable against a real migrated database with no socket. The
+//! implementation that speaks `POST /api/v1/sync/push` lives in
+//! [`crate::sync_http`]; wiring the two together happens in the composition root.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -80,6 +78,14 @@ pub struct ClaimedEvent {
   pub id: String,
   /// The RAW replay key. Send it as-is — see the module header.
   pub idempotency_key: String,
+  /// The closed vocabularies `contracts/openapi.yaml` requires on every
+  /// command. Carried through unchanged: re-deriving them here would be a
+  /// second copy of a `CHECK` constraint the schema already enforces, and the
+  /// two copies would drift the first time a vocabulary gained a value.
+  pub aggregate_type: String,
+  pub aggregate_id: String,
+  pub event_type: String,
+  pub action: String,
   /// The JSON body, exactly as checkout wrote it.
   pub payload: String,
   /// `attempt_count` AFTER this claim, so the first delivery reports 1 and a
@@ -87,15 +93,59 @@ pub struct ClaimedEvent {
   pub attempt_count: i64,
 }
 
-/// Outcome of one delivery attempt, reported back to [`drain_tick`].
+/// What the server did with ONE command.
+///
+/// `contracts/openapi.yaml` defines exactly three, and the middle one is the
+/// trap: `Duplicate` is a SUCCESS, not a failure. It means this event's
+/// idempotency key was already applied — the normal outcome of a retry after a
+/// response lost in flight. Treating it as a failure makes the terminal retry a
+/// command the server already has, forever.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeliveryOutcome {
-  /// 2xx — the server durably accepted it.
-  Accepted,
-  /// Will succeed on retry: timeout, 5xx, connection refused.
-  Transient,
-  /// Will never succeed on retry: 4xx validation, unparseable payload.
-  Permanent,
+pub enum CommandOutcome {
+  /// Newly applied.
+  Applied,
+  /// Already applied under this idempotency key. Counts as done.
+  Duplicate,
+  /// PERMANENT refusal. Retrying it unchanged will fail identically.
+  Rejected,
+}
+
+/// One per-command result, correlated back to the event by `id`.
+///
+/// Correlation is by `id` and never by array index: the contract states the
+/// results are "positional-by-`id`", because a terminal drains concurrently and
+/// index `n` of the request is not guaranteed to come back at index `n`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandResult {
+  /// The `sync_outbox.id` this result belongs to.
+  pub event_id: String,
+  pub outcome: CommandOutcome,
+  /// The server's `error_message`, present only for `Rejected`. Shown to a
+  /// shift lead — never parsed, per the contract's own note on `message`.
+  pub error: Option<String>,
+}
+
+/// The result of pushing one batch.
+///
+/// NOT one outcome per command: `200` does not mean the batch was applied, it
+/// means the ENVELOPE was well-formed. A single `Rejected` command inside a
+/// successful batch is the case this type exists to keep visible.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BatchOutcome {
+  /// 2xx. Per-command results. An event missing from `results` is NOT assumed
+  /// to have succeeded — see [`drain_tick`].
+  Processed(Vec<CommandResult>),
+  /// The batch may well have been applied but we cannot prove it: a timeout, a
+  /// connection reset, a 5xx, or a response we could not read. Retry the
+  /// INTACT batch — the idempotency key is what makes that safe.
+  Retryable { reason: String },
+  /// The server refused the envelope itself (4xx: no Idempotency-Key, no
+  /// terminal, unparseable body). Nothing was applied.
+  ///
+  /// Retried anyway rather than failed permanently: a malformed envelope is
+  /// this CLIENT's bug, and a client bug fixed by the next app update must not
+  /// be able to strand a shift's real sales in `failed_permanent`.
+  Refused { reason: String },
 }
 
 /// Atomically advance every READY row from `pending` to `in_flight`.
@@ -124,23 +174,35 @@ pub fn claim_ready(
 ) -> Result<Vec<ClaimedEvent>, rusqlite::Error> {
   let tx = conn.transaction()?;
 
-  let candidates: Vec<(i64, String, String, String, i64)> = {
+  let candidates: Vec<(i64, String, String, String, String, String, String, String, i64)> = {
     let mut stmt = tx.prepare(
-      "SELECT sequence, id, idempotency_key, payload, attempt_count
+      "SELECT sequence, id, idempotency_key, payload,
+              aggregate_type, aggregate_id, event_type, action,
+              attempt_count
          FROM sync_outbox
         WHERE status = 'pending' AND next_attempt_at <= ?1
         ORDER BY sequence
         LIMIT ?2",
     )?;
     let rows = stmt.query_map(params![now, limit], |row| {
-      Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+      Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+      ))
     })?;
     rows.collect::<Result<Vec<_>, _>>()?
   };
 
   let mut claimed = Vec::with_capacity(candidates.len());
 
-  for (sequence, id, idempotency_key, payload, attempt_count) in candidates {
+  for (sequence, id, idempotency_key, payload, aggregate_type, aggregate_id, event_type, action, attempt_count) in candidates {
     let taken = tx.execute(
       "UPDATE sync_outbox
           SET status = 'in_flight', attempt_count = attempt_count + 1
@@ -154,6 +216,10 @@ pub fn claim_ready(
         id,
         idempotency_key,
         payload,
+        aggregate_type,
+        aggregate_id,
+        event_type,
+        action,
         // +1 because the UPDATE above just bumped the column: this is the
         // attempt number of the delivery the caller is about to make.
         attempt_count: attempt_count + 1,
@@ -188,22 +254,28 @@ pub fn mark_done(
   Ok(changed == 1)
 }
 
-/// `in_flight` → `pending`, scheduled to be retried at `next_attempt_at`.
+/// `in_flight` → `pending`, scheduled to be retried at `next_attempt_at`, with
+/// the reason recorded in `last_error`.
 ///
-/// Used for a [`DeliveryOutcome::Transient`] result. The row KEEPS its
-/// incremented `attempt_count`, so backoff and the [`MAX_ATTEMPTS`] ceiling
-/// still see the true history — a retry that reset the counter would retry
-/// forever.
+/// Used for [`BatchOutcome::Retryable`], [`BatchOutcome::Refused`], and for a
+/// command the server returned no result for. The row KEEPS its incremented
+/// `attempt_count`, so backoff and the [`MAX_ATTEMPTS`] ceiling still see the
+/// true history — a retry that reset the counter would retry forever.
+///
+/// `last_error` is what a shift lead reads when an event will not drain. A row
+/// that silently returns to `pending` looks identical to one that is merely
+/// waiting its turn.
 pub fn retry_later(
   conn: &mut Connection,
   sequence: i64,
   next_attempt_at: &str,
+  reason: &str,
 ) -> Result<bool, rusqlite::Error> {
   let changed = conn.execute(
     "UPDATE sync_outbox
-        SET status = 'pending', next_attempt_at = ?2
+        SET status = 'pending', next_attempt_at = ?2, last_error = ?3
       WHERE sequence = ?1 AND status = 'in_flight'",
-    params![sequence, next_attempt_at],
+    params![sequence, next_attempt_at, reason],
   )?;
   Ok(changed == 1)
 }
@@ -251,18 +323,55 @@ fn attempts_of(conn: &Connection, sequence: i64) -> i64 {
     .expect("row exists")
 }
 
-/// One full drain cycle: claim → deliver → settle each row.
+/// Read one row's `last_error`.
+#[cfg(test)]
+fn last_error_of(conn: &Connection, sequence: i64) -> Option<String> {
+  conn
+    .query_row(
+      "SELECT last_error FROM sync_outbox WHERE sequence = ?1",
+      params![sequence],
+      |row| row.get(0),
+    )
+    .expect("row exists")
+}
+
+/// One full drain cycle: claim → push the batch → settle each row.
+///
+/// This is the ACK / ROLLBACK decision point, and it is deliberately NOT
+/// "200 means delete".
+///
+/// ── WHY A ROW IS MARKED `done` AND NEVER DELETED ────────────────────────────
+/// `200` means the ENVELOPE was well-formed, not that every command was
+/// applied — `internal/order/adapter/http/sync_handler.go` says so in its own
+/// package doc: "Some commands may still have been REJECTED, and the caller
+/// must read `results[].outcome` to find out." A batch of 10 orders where one
+/// is malformed answers 200. Deleting the batch on the status code alone would
+/// erase that one real sale with no record that it ever existed.
+///
+/// So the terminal's `done` state is the server's PROOF that the event landed
+/// — the `0001_init.sql` comment says exactly that, and adds
+/// `CHECK (status <> 'done' OR processed_at IS NOT NULL)` so a row cannot be
+/// marked done without the timestamp that proves when. Pruning acknowledged
+/// rows is a separate retention decision that an operator makes from the
+/// evidence this state preserves; it is not something a status code may do on
+/// the terminal's behalf.
+///
+/// ── THE THREE ARROWS ────────────────────────────────────────────────────────
+/// * `applied` / `duplicate` → `done`
+/// * `rejected`              → `failed_permanent` (the server will never take it)
+/// * retryable / refused     → `pending`, with the reason in `last_error`
+///
+/// And the case with no arrow: **a command the server did not mention**. It is
+/// retried, not assumed successful — the response was 2xx, which proves only
+/// that the envelope parsed. Assuming the rest landed is how a terminal loses
+/// an order it was told nothing about.
+///
+/// Rows settle INDEPENDENTLY. One `rejected` must not hold up the orders behind
+/// it, or a single malformed event wedges a whole shift's queue — the exact
+/// failure the contract's per-command outcome exists to prevent.
 ///
 /// The transport is a closure so the state machine is testable without a
-/// socket, and so an eventual HTTP client is a plug rather than a rewrite.
-///
-/// Rows settle INDEPENDENTLY: one `Permanent` rejection must not stop the rows
-/// behind it, or a single malformed payload would wedge the entire queue. Each
-/// settlement is best-effort (`let _ =`) because a failed UPDATE on row N must
-/// not abandon rows N+1… — the next tick re-reads whatever is still
-/// `in_flight`.
-///
-/// Returns the events that were claimed, which is what makes a tick observable.
+/// socket, and so the HTTP client is a plug rather than a rewrite.
 pub fn drain_tick<F>(
   conn: &mut Connection,
   limit: i64,
@@ -270,24 +379,51 @@ pub fn drain_tick<F>(
   deliver: &mut F,
 ) -> Result<Vec<ClaimedEvent>, rusqlite::Error>
 where
-  F: FnMut(&ClaimedEvent) -> DeliveryOutcome,
+  F: FnMut(&[ClaimedEvent]) -> BatchOutcome,
 {
   let claimed = claim_ready(conn, limit, now)?;
 
-  for event in &claimed {
-    match deliver(event) {
-      DeliveryOutcome::Accepted => {
-        let _ = mark_done(conn, event.sequence, now);
+  if claimed.is_empty() {
+    return Ok(claimed);
+  }
+
+  let retry_at = add_minute(now);
+
+  match deliver(&claimed) {
+    BatchOutcome::Processed(results) => {
+      for event in &claimed {
+        match results.iter().find(|result| result.event_id == event.id) {
+          // `duplicate` is a SUCCESS. It is the expected answer when a previous
+          // response was lost, and marking it anything else retries forever.
+          Some(result) if matches!(result.outcome, CommandOutcome::Applied | CommandOutcome::Duplicate) => {
+            mark_done(conn, event.sequence, now)?;
+          }
+          Some(result) => {
+            fail_permanent(
+              conn,
+              event.sequence,
+              result.error.as_deref().unwrap_or("rejected by server"),
+            )?;
+          }
+          // Silence from the server about a command that was sent is not proof
+          // of anything. Retry it.
+          None => {
+            log::warn!(
+              target: "sync_outbox",
+              "no result for outbox event {}; scheduling a retry", event.id
+            );
+            retry_later(conn, event.sequence, &retry_at, "server returned no result for this command")?;
+          }
+        }
       }
-      DeliveryOutcome::Transient => {
-        // One minute past `now`, so the row is NOT re-claimed by this same tick.
-        // A graduated schedule belongs to the transport's retry policy; what the
-        // state machine owes the schema is only that a transient failure returns
-        // the row to `pending` with a FUTURE `next_attempt_at`.
-        let _ = retry_later(conn, event.sequence, &add_minute(now));
-      }
-      DeliveryOutcome::Permanent => {
-        let _ = fail_permanent(conn, event.sequence, "rejected by server as non-retryable");
+    }
+
+    // Both retry: the batch is intact and nothing was applied, so retrying the
+    // same events with the same idempotency keys is the correct and safe move.
+    BatchOutcome::Retryable { reason } | BatchOutcome::Refused { reason } => {
+      log::warn!(target: "sync_outbox", "outbox batch not delivered: {reason}");
+      for event in &claimed {
+        retry_later(conn, event.sequence, &retry_at, &reason)?;
       }
     }
   }
@@ -317,7 +453,7 @@ pub fn spawn_drain(
   app: tauri::AppHandle,
   interval: std::time::Duration,
   limit: i64,
-  mut deliver: impl FnMut(&ClaimedEvent) -> DeliveryOutcome + Send + 'static,
+  mut deliver: impl FnMut(&[ClaimedEvent]) -> BatchOutcome + Send + 'static,
 ) -> tauri::async_runtime::JoinHandle<()> {
   tauri::async_runtime::spawn(async move {
     let worker = tauri::async_runtime::spawn_blocking(move || loop {
@@ -679,12 +815,15 @@ mod tests {
     let seq = enqueue(&c, "evt-1", "key-1", "2026-10-05T11:00:00Z");
     claim_ready(&mut c, 10, NOW).expect("claim");
 
-    assert!(retry_later(&mut c, seq, "2026-10-05T12:01:00Z").expect("retry"));
+    assert!(retry_later(&mut c, seq, "2026-10-05T12:01:00Z", "connection reset").expect("retry"));
 
     assert_eq!(status_of(&c, seq), "pending");
     // If this reset to 0 the row would be retried forever — the entire point of
     // MAX_ATTEMPTS is defeated by a counter that forgets.
     assert_eq!(attempts_of(&c, seq), 1, "the attempt must be remembered");
+
+    // `last_error` is what a shift lead reads to find out why it is stuck.
+    assert_eq!(last_error_of(&c, seq), Some("connection reset".to_string()));
 
     // And because next_attempt_at moved into the FUTURE, it is not
     // immediately re-claimed.
@@ -720,57 +859,150 @@ mod tests {
 
   // ── The whole tick ────────────────────────────────────────────────────────
 
+  /// THE LOAD-BEARING TEST: a 200 with mixed per-command outcomes.
+  ///
+  /// This is the batch the Go handler describes — "the batch was well-formed and
+  /// processed. Some commands may still have been REJECTED." Deleting on the
+  /// status code would have thrown away `bad`, a real sale, with no record.
+  /// Asserting the four statuses separately is what makes that impossible to
+  /// regress into.
   #[test]
-  fn drain_tick_settles_each_row_by_its_outcome_independently() {
+  fn drain_tick_maps_each_command_outcome_to_its_own_state() {
     let mut c = conn();
-    let accepted = enqueue(&c, "ok", "key-ok", "2026-10-05T11:00:00Z");
-    let transient = enqueue(&c, "flaky", "key-flaky", "2026-10-05T11:00:00Z");
-    let permanent = enqueue(&c, "bad", "key-bad", "2026-10-05T11:00:00Z");
+    let applied = enqueue(&c, "applied", "key-applied", "2026-10-05T11:00:00Z");
+    let dup = enqueue(&c, "dup", "key-dup", "2026-10-05T11:00:00Z");
+    let bad = enqueue(&c, "bad", "key-bad", "2026-10-05T11:00:00Z");
+    let silent = enqueue(&c, "silent", "key-silent", "2026-10-05T11:00:00Z");
 
     let mut seen: Vec<String> = Vec::new();
     let claimed = {
-      let mut deliver = |event: &ClaimedEvent| {
-        seen.push(event.idempotency_key.clone());
-        match event.id.as_str() {
-          "ok" => DeliveryOutcome::Accepted,
-          "flaky" => DeliveryOutcome::Transient,
-          _ => DeliveryOutcome::Permanent,
-        }
+      let mut deliver = |batch: &[ClaimedEvent]| {
+        seen = batch.iter().map(|event| event.idempotency_key.clone()).collect();
+        BatchOutcome::Processed(vec![
+          CommandResult { event_id: "applied".into(), outcome: CommandOutcome::Applied, error: None },
+          // `duplicate` — a SUCCESS, not a failure.
+          CommandResult { event_id: "dup".into(), outcome: CommandOutcome::Duplicate, error: None },
+          CommandResult {
+            event_id: "bad".into(),
+            outcome: CommandOutcome::Rejected,
+            error: Some("payload is not an order".into()),
+          },
+          // `silent` is deliberately absent from the response.
+        ])
       };
       drain_tick(&mut c, 10, NOW, &mut deliver).expect("tick")
     };
 
-    assert_eq!(claimed.len(), 3);
-    // All three were delivered — a Permanent rejection on `bad` must not have
-    // stopped the rows behind it.
-    assert_eq!(seen.len(), 3);
+    assert_eq!(claimed.len(), 4);
+    // The keys travelled with their payloads, in the order they were claimed.
+    assert_eq!(seen, vec!["key-applied", "key-dup", "key-bad", "key-silent"]);
 
-    assert_eq!(status_of(&c, accepted), "done");
-    assert_eq!(status_of(&c, transient), "pending", "retryable");
-    assert_eq!(status_of(&c, permanent), "failed_permanent");
+    assert_eq!(status_of(&c, applied), "done");
+    assert_eq!(status_of(&c, dup), "done", "duplicate IS done");
+    assert_eq!(status_of(&c, bad), "failed_permanent");
+    assert_eq!(
+      last_error_of(&c, bad),
+      Some("payload is not an order".into()),
+      "the server's reason is what a shift lead reads"
+    );
+    // The one the server said nothing about is retried, NOT assumed applied.
+    assert_eq!(status_of(&c, silent), "pending");
 
-    // The retried row is scheduled for the FUTURE, so the next tick claims
-    // nothing and the transient row waits its turn.
-    assert!(drain_tick(&mut c, 10, NOW, &mut |_: &ClaimedEvent| {
-      DeliveryOutcome::Accepted
+    // Nothing was deleted — every row is still on disk, including the rejected
+    // one. Deleting on `200` would have removed `bad` entirely.
+    let remaining: i64 = c
+      .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
+      .expect("count");
+    assert_eq!(remaining, 4, "no row may be deleted on acknowledgement");
+  }
+
+  #[test]
+  fn a_done_row_carries_the_timestamp_that_proves_it_landed() {
+    let mut c = conn();
+    let seq = enqueue(&c, "ok", "key-ok", "2026-10-05T11:00:00Z");
+
+    drain_tick(&mut c, 10, NOW, &mut |_: &[ClaimedEvent]| {
+      BatchOutcome::Processed(vec![CommandResult {
+        event_id: "ok".into(),
+        outcome: CommandOutcome::Applied,
+        error: None,
+      }])
+    })
+    .expect("tick");
+
+    let processed_at: Option<String> = c
+      .query_row(
+        "SELECT processed_at FROM sync_outbox WHERE sequence = ?1",
+        params![seq],
+        |row| row.get(0),
+      )
+      .expect("read");
+    // The schema's `CHECK (status <> 'done' OR processed_at IS NOT NULL)` would
+    // have refused the UPDATE otherwise — the proof is not optional.
+    assert_eq!(processed_at.as_deref(), Some(NOW));
+  }
+
+  #[test]
+  fn a_retryable_batch_returns_every_row_to_pending_with_the_reason() {
+    let mut c = conn();
+    let a = enqueue(&c, "evt-1", "key-1", "2026-10-05T11:00:00Z");
+    let b = enqueue(&c, "evt-2", "key-2", "2026-10-05T11:00:00Z");
+
+    drain_tick(&mut c, 10, NOW, &mut |_: &[ClaimedEvent]| {
+      BatchOutcome::Retryable { reason: "HTTP 500 from upstream".into() }
+    })
+    .expect("tick");
+
+    // NOT stuck in `in_flight`: that is the deadlock the task warns about.
+    assert_eq!(status_of(&c, a), "pending");
+    assert_eq!(status_of(&c, b), "pending");
+    assert_eq!(last_error_of(&c, a), Some("HTTP 500 from upstream".into()));
+
+    // And nothing is immediately re-claimed, because next_attempt_at moved.
+    assert!(drain_tick(&mut c, 10, NOW, &mut |_: &[ClaimedEvent]| {
+      BatchOutcome::Processed(vec![])
     })
     .expect("second tick")
     .is_empty());
   }
 
+  /// A 4xx envelope refusal is THIS CLIENT's bug, not the sale's fault. It
+  /// retries rather than failing permanently, so a fix shipped in the next app
+  /// update can still drain the shift's real sales.
   #[test]
-  fn drain_tick_leaves_the_queue_empty_once_every_row_is_settled() {
+  fn a_refused_envelope_retries_rather_than_stranding_real_sales() {
+    let mut c = conn();
+    let seq = enqueue(&c, "evt-1", "key-1", "2026-10-05T11:00:00Z");
+
+    drain_tick(&mut c, 10, NOW, &mut |_: &[ClaimedEvent]| {
+      BatchOutcome::Refused { reason: "400 idempotency_key_required".into() }
+    })
+    .expect("tick");
+
+    assert_eq!(status_of(&c, seq), "pending", "must be recoverable, not failed");
+    assert_eq!(last_error_of(&c, seq), Some("400 idempotency_key_required".into()));
+  }
+
+  #[test]
+  fn drain_tick_leaves_the_queue_empty_once_every_row_is_accepted() {
     let mut c = conn();
     enqueue(&c, "evt-1", "key-1", "2026-10-05T11:00:00Z");
 
-    let first = drain_tick(&mut c, 10, NOW, &mut |_: &ClaimedEvent| {
-      DeliveryOutcome::Accepted
-    })
-    .expect("tick");
-    let second = drain_tick(&mut c, 10, NOW, &mut |_: &ClaimedEvent| {
-      DeliveryOutcome::Accepted
-    })
-    .expect("tick");
+    let mut accepted = |batch: &[ClaimedEvent]| {
+      BatchOutcome::Processed(
+        batch
+          .iter()
+          .map(|event| CommandResult {
+            event_id: event.id.clone(),
+            outcome: CommandOutcome::Applied,
+            error: None,
+          })
+          .collect(),
+      )
+    };
+
+    let first = drain_tick(&mut c, 10, NOW, &mut accepted).expect("tick");
+    let second = drain_tick(&mut c, 10, NOW, &mut accepted).expect("tick");
 
     assert_eq!(first.len(), 1);
     assert!(second.is_empty(), "nothing left to claim");

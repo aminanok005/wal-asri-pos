@@ -66,10 +66,81 @@ pub mod printer_port;
 // the lifecycle is testable against a real migrated database. See the module
 // header for why the key is transmitted raw and the states are lowercase.
 pub mod sync_outbox;
+// The HTTP transport for the drain: POST /api/v1/sync/push. Knows the wire
+// format and nothing about the state machine; `sync_outbox::drain_tick` takes
+// it as a closure, so the ledger logic stays testable without a socket.
+pub mod sync_http;
 // Proves the receipt printer's code page can encode the Thai this POS actually
 // uses — especially ๐–๙, which post-date windows-874 and were the likeliest
 // unmappable characters. See the module for why this runs before any receipt.
 pub mod thai_coverage;
+
+/// How often the drain wakes to look for work.
+///
+/// 15 seconds: long enough that an idle till does no steady network chatter,
+/// short enough that a shift's sales reach the back office while the manager is
+/// still looking at the till.
+const DRAIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// How many events one tick may claim.
+///
+/// Bounded because every tick holds the connection mutex that checkout also
+/// needs; a backlog of a week must be drained in slices, not in one long lock.
+const DRAIN_BATCH_LIMIT: i64 = 64;
+
+/// Start the background outbox drain, IF this terminal has been told where the
+/// backend is.
+///
+/// ── WHY IT IS OPT-IN RATHER THAN DEFAULTED ───────────────────────────────────
+/// The app holds no server address, and inventing one — a localhost, a guessed
+/// LAN IP, a placeholder host — would be worse than not starting at all: the
+/// drain would claim rows, fail to reach a host that does not exist, and
+/// reschedule them every 15 seconds for the life of the install.
+///
+/// So the address comes from the environment, and an unset variable means "this
+/// terminal is not configured to sync yet", which is a legitimate state for a
+/// shop whose server has not been deployed. Nothing is claimed, nothing is lost,
+/// and the outbox waits — those rows are already durable in SQLite.
+///
+/// Deliberately not a compile-time constant and not a Tauri command: a till's
+/// backend address is per-deployment, so it belongs to the environment the
+/// terminal is launched in, exactly as the SQLCipher key already does.
+fn start_sync_drain(app: &tauri::AppHandle) {
+  let Ok(base_url) = std::env::var("WAL_ASRI_SYNC_URL") else {
+    log::info!(
+      target: "sync_outbox",
+      "WAL_ASRI_SYNC_URL is not set; the offline outbox will not drain until this terminal is pointed at a server"
+    );
+    return;
+  };
+
+  let Ok(terminal_id) = std::env::var("WAL_ASRI_TERMINAL_ID") else {
+    log::warn!(
+      target: "sync_outbox",
+      "WAL_ASRI_SYNC_URL is set but WAL_ASRI_TERMINAL_ID is not; refusing to drain — `terminal_id` is client-asserted and an empty one would attribute another till's sales to this one"
+    );
+    return;
+  };
+
+  if terminal_id.trim().is_empty() {
+    log::warn!(target: "sync_outbox", "WAL_ASRI_TERMINAL_ID is empty; refusing to drain");
+    return;
+  }
+
+  let sink = std::sync::Arc::new(sync_http::HttpBatchSink::new(sync_http::SyncConfig::new(
+    base_url.trim(),
+    terminal_id.trim(),
+  )));
+
+  log::info!(target: "sync_outbox", "offline outbox drain starting");
+
+  sync_outbox::spawn_drain(
+    app.clone(),
+    DRAIN_INTERVAL,
+    DRAIN_BATCH_LIMIT,
+    move |batch| sink.push(batch),
+  );
+}
 
 /// Entry point for both desktop and mobile (the `#[cfg_attr(mobile, ...)]`
 /// attribute below is what the template emits; on desktop it is a no-op).
@@ -94,6 +165,7 @@ pub fn run() {
       // corrupt file is reported at launch instead of at the first sale.
       let conn = db::open_database(app.handle()).map_err(std::io::Error::other)?;
       app.manage(Mutex::new(conn));
+      start_sync_drain(app.handle());
       Ok(())
     })
     .invoke_handler(tauri::generate_handler![

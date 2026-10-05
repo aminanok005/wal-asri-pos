@@ -102,6 +102,7 @@ rusqlite = { version = "=0.40.2", features = ["bundled-sqlcipher"] }
 # number generator, and rand's dependency tree would be the heaviest in the
 # manifest for that single call.
 getrandom = "0.3"
+ureq = { version = "3.4.2", features = ["json", "rustls"] }
 
 [profile.release]
 # The template ships no [profile] section. We add one because a POS terminal
