@@ -65,6 +65,8 @@ var forbiddenInDomain = []struct {
 	{"internal/catalog/adapter", "modules may not depend on another module's adapter"},
 	{"internal/sync/usecase", "modules may not depend on another module's application layer"},
 	{"internal/sync/adapter", "modules may not depend on another module's adapter"},
+	{"internal/inventory/usecase", "modules may not depend on another module's application layer"},
+	{"internal/inventory/adapter", "modules may not depend on another module's adapter"},
 	{"cmd/", "a domain package may not import the composition root"},
 	{"services/api-backend/internal/order/usecase", "as above, with the full module path"},
 }

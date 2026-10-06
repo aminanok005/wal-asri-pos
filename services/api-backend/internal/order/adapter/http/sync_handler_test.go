@@ -34,6 +34,7 @@ type world struct {
 	rates  *memory.Rates
 	idem   *memory.Idempotency
 	outbox *memory.Outbox
+	stock  *memory.Stock
 	mux    *http.ServeMux
 	now    time.Time
 }
@@ -62,9 +63,10 @@ func newWorld(t *testing.T, vatRateBp money.BasisPoints) *world {
 	rates.Set(testBranch, vatRateBp)
 	idem := memory.NewIdempotency(clock)
 	outbox := memory.NewOutbox()
+	stock := memory.NewStock()
 
 	ingest := orderuc.NewIngestOrder(orderuc.IngestOrderDeps{
-		Orders: orders, Rates: rates, Idem: idem, Outbox: outbox, Now: clock,
+		Orders: orders, Rates: rates, Idem: idem, Outbox: outbox, Stock: stock, Now: clock,
 	})
 	drain := syncuc.NewDrainOutbox(syncuc.DrainDeps{
 		Orders: syncorder.NewIngester(ingest),
@@ -76,7 +78,10 @@ func newWorld(t *testing.T, vatRateBp money.BasisPoints) *world {
 	mux := http.NewServeMux()
 	orderhttp.NewHandler(drain, func() int64 { return now.UnixNano() }).Route(mux)
 
-	return &world{orders: orders, rates: rates, idem: idem, outbox: outbox, mux: mux, now: now}
+	return &world{
+		orders: orders, rates: rates, idem: idem, outbox: outbox, stock: stock,
+		mux: mux, now: now,
+	}
 }
 
 // orderID and lineID build distinct, well-formed UUIDv7s from a small counter.

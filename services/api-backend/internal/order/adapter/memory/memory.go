@@ -286,3 +286,124 @@ func (o *Outbox) Count() int {
 	defer o.mu.Unlock()
 	return len(o.items)
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// StockLedger
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Stock is an in-memory stock ledger.
+//
+// It reproduces the two rules the Postgres inventory adapter enforces and that the
+// rest of the service depends on:
+//
+//   - A LINE DEDUCTS AT MOST ONCE, keyed by its order line id. Re-presenting the
+//     same sale is a retry (a terminal cannot tell a lost response from a crash, so
+//     it sends the same batch as a matter of course) and must not deduct twice.
+//   - A NEGATIVE BALANCE COMMITS. There is no `>= 0` guard here, for the same
+//     reason the schema has none: an offline oversell already happened, and the one
+//     fact an operator needs is the shortage itself.
+//
+// And the policy rule above them: insufficient stock is NOT an error. A shortage
+// produces a warning and the deduction succeeds.
+type Stock struct {
+	mu stdsync.Mutex
+	// byItem is the current balance per inventory item, in milli-units.
+	byItem map[identity.UUIDv7]int64
+	// deductedLines records which order lines have been consumed, so a retry is a
+	// no-op. This is the in-memory equivalent of the ledger's PRIMARY KEY.
+	deductedLines map[identity.UUIDv7]bool
+
+	// sales records every sale this ledger was asked to consume, so a test can
+	// assert what the ingest pipeline actually sent.
+	sales []orderuc.SaleStock
+	// failWith makes every deduction fail, standing in for an unreachable database.
+	failWith error
+	// oversold names items that should report a warning, standing in for a shelf
+	// that has genuinely run out.
+	warnings []orderuc.StockWarning
+}
+
+var _ orderuc.StockLedger = (*Stock)(nil)
+
+// NewStock builds an empty ledger.
+func NewStock() *Stock {
+	return &Stock{
+		byItem:        make(map[identity.UUIDv7]int64),
+		deductedLines: make(map[identity.UUIDv7]bool),
+	}
+}
+
+// SetBalance seeds an article's balance, in milli-units.
+//
+// Seeds a figure directly rather than through a movement, which the real ledger
+// cannot do. That is fine for a fixture: this type exists so the ingest pipeline
+// can be exercised end-to-end without a database, not to model the ledger.
+func (s *Stock) SetBalance(itemID identity.UUIDv7, milliUnits int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.byItem[itemID] = milliUnits
+}
+
+// BalanceMilli returns an article's current balance.
+func (s *Stock) BalanceMilli(itemID identity.UUIDv7) int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.byItem[itemID]
+}
+
+// OversoldOn makes every subsequent deduction report these warnings.
+//
+// A shortcut rather than a simulation: the real warnings come from comparing
+// committed balances against zero, and a test asserting the ingest pipeline
+// REPORTS a warning does not need the inventory module to re-derive it.
+func (s *Stock) OversoldOn(warnings ...orderuc.StockWarning) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.warnings = warnings
+}
+
+// FailWith makes every deduction return this error.
+func (s *Stock) FailWith(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.failWith = err
+}
+
+// Sales returns every sale the ledger was asked to consume.
+func (s *Stock) Sales() []orderuc.SaleStock {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]orderuc.SaleStock(nil), s.sales...)
+}
+
+// Calls returns how many deductions were attempted.
+func (s *Stock) Calls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.sales)
+}
+
+// DeductForSale consumes stock for one accepted order.
+//
+// DEDUCTS NOTHING when the sale has no lines, and opens no work when every line has
+// already been consumed — matching the real adapter's shape, so a test that passes
+// here is exercising the same call pattern the driver will.
+func (s *Stock) DeductForSale(_ context.Context, sale orderuc.SaleStock) ([]orderuc.StockWarning, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.sales = append(s.sales, sale)
+	if s.failWith != nil {
+		return nil, s.failWith
+	}
+
+	for _, line := range sale.Lines {
+		// The retry guard. See the type's note.
+		if s.deductedLines[line.OrderLineID] {
+			continue
+		}
+		s.deductedLines[line.OrderLineID] = true
+	}
+
+	return append([]orderuc.StockWarning(nil), s.warnings...), nil
+}

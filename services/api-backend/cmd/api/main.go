@@ -54,8 +54,11 @@ import (
 	cataloghttp "wal-asri-pos/services/api-backend/internal/catalog/adapter/http"
 	cataloguc "wal-asri-pos/services/api-backend/internal/catalog/usecase"
 	identity "wal-asri-pos/services/api-backend/internal/identity/domain"
+	inventorypostgres "wal-asri-pos/services/api-backend/internal/inventory/adapter/postgres"
+	inventoryuc "wal-asri-pos/services/api-backend/internal/inventory/usecase"
 	money "wal-asri-pos/services/api-backend/internal/money/domain"
 	orderhttp "wal-asri-pos/services/api-backend/internal/order/adapter/http"
+	orderinventory "wal-asri-pos/services/api-backend/internal/order/adapter/inventory"
 	postgres "wal-asri-pos/services/api-backend/internal/order/adapter/postgres"
 	order "wal-asri-pos/services/api-backend/internal/order/domain"
 	orderuc "wal-asri-pos/services/api-backend/internal/order/usecase"
@@ -251,7 +254,12 @@ func buildPersistence(
 			Rates:  unwiredBranchRates{},
 			Idem:   unwiredIdempotencyStore{},
 			Outbox: unwiredOutboxLedger{},
-			Now:    clock,
+			// The stock ledger refuses too, and for the same reason as the four
+			// above: a sale acknowledged without its stock recorded is a shelf that
+			// silently drifts. A terminal pushing in this state is told "retry", keeps
+			// its outbox row, and the deduction happens once persistence exists.
+			Stock: unwiredStockLedger{},
+			Now:   clock,
 		}), unwiredBatchIdempotency{}, nil, nil
 	}
 
@@ -276,16 +284,34 @@ func buildPersistence(
 	}
 
 	store := postgres.NewIdempotencyStore(pool)
+
+	// The stock deduction, wired over the SAME pool and therefore the same
+	// transaction-visible schema the orders land in.
+	//
+	// Sharing the pool rather than opening a second one is deliberate: the
+	// deduction reads `inventory_items` and writes `stock_movements`, and a second
+	// pool would mean a second set of connections against the same database for no
+	// benefit. It also means the migration above has already applied
+	// 0002_inventory.sql — the store would fail on a missing table otherwise, and
+	// failing at startup is far better than failing on the first sale of the shift.
+	stockStore := inventorypostgres.NewStockStore(pool)
 	logger.Info("the sync endpoint is wired to Postgres",
 		"schema", "applied from the embedded db/migrations at startup",
-		"driver", "github.com/jackc/pgx/v5")
+		"driver", "github.com/jackc/pgx/v5",
+		"stock", "quantities are BIGINT milli-units; a negative balance commits and is reported "+
+			"as a warning rather than refused")
 
 	ingest := orderuc.NewIngestOrder(orderuc.IngestOrderDeps{
 		Orders: postgres.NewOrderRepository(pool),
 		Rates:  postgres.NewBranchRate(pool),
 		Idem:   store,
 		Outbox: postgres.NewOutboxLedger(pool),
-		Now:    clock,
+		Stock: orderinventory.NewStockLedger(inventoryuc.NewDeductSale(inventoryuc.DeductSaleDeps{
+			Items: stockStore,
+			Store: stockStore,
+			Now:   clock,
+		})),
+		Now: clock,
 	})
 	return ingest, store, pool.Close, nil
 }
@@ -345,10 +371,28 @@ func (unwiredBatchIdempotency) Save(context.Context, syncdomain.IdempotencyRecor
 	return errUnwired
 }
 
+// unwiredStockLedger refuses every deduction.
+//
+// It refuses rather than skipping, and the distinction is the whole point. A
+// ledger that silently succeeded would let the endpoint acknowledge sales whose
+// stock was never recorded — the shelves would drift by exactly the amount the shop
+// sold, with nothing anywhere recording that they had.
+//
+// So a terminal pushing in this state gets the same 500 every other unwired port
+// produces, keeps its outbox row, and retries. Once DATABASE_URL is set the real
+// ledger takes over and the retry deducts exactly once: a movement's id is its
+// order line's id, so re-presenting the same sale collides with itself.
+type unwiredStockLedger struct{}
+
+func (unwiredStockLedger) DeductForSale(context.Context, orderuc.SaleStock) ([]orderuc.StockWarning, error) {
+	return nil, errUnwired
+}
+
 var (
 	_ orderuc.OrderRepository  = unwiredOrderRepository{}
 	_ orderuc.BranchRateSource = unwiredBranchRates{}
 	_ orderuc.IdempotencyStore = unwiredIdempotencyStore{}
 	_ orderuc.OutboxLedger     = unwiredOutboxLedger{}
+	_ orderuc.StockLedger      = unwiredStockLedger{}
 	_ syncuc.BatchIdempotency  = unwiredBatchIdempotency{}
 )

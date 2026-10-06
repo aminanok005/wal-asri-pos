@@ -36,7 +36,10 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	identity "wal-asri-pos/services/api-backend/internal/identity/domain"
+	inventorypostgres "wal-asri-pos/services/api-backend/internal/inventory/adapter/postgres"
+	inventoryuc "wal-asri-pos/services/api-backend/internal/inventory/usecase"
 	money "wal-asri-pos/services/api-backend/internal/money/domain"
+	orderinventory "wal-asri-pos/services/api-backend/internal/order/adapter/inventory"
 	postgres "wal-asri-pos/services/api-backend/internal/order/adapter/postgres"
 	order "wal-asri-pos/services/api-backend/internal/order/domain"
 	orderuc "wal-asri-pos/services/api-backend/internal/order/usecase"
@@ -47,6 +50,32 @@ import (
 //
 // Each test starts from truncated tables, so the suite is re-runnable and no test
 // inherits another's rows.
+//
+// ── THE ADVISORY LOCK, AND WHY IT IS NOT OPTIONAL ─────────────────────────────
+//
+// `go test` runs PACKAGES IN PARALLEL (default `-p = NumCPU`), and this suite now
+// shares one database with the inventory suite at
+// internal/inventory/adapter/postgres. Both truncate at the start of every test, and
+// `resetTables` includes `branches ... CASCADE` — which now cascades into
+// inventory_items, stock_movements and stock_balances too.
+//
+// So without a lock the two packages interleave: one suite truncates while the
+// other is mid-assertion, and the failure is a missing row in a test that was
+// correct a moment earlier. That is the worst kind of failure to debug, because it
+// is intermittent and it blames the wrong test.
+//
+// The lock is taken on a SINGLE ACQUIRED CONNECTION for the whole test and released
+// by closing it, because `pg_advisory_lock` is session-scoped and `pg_advisory_xact_lock`
+// would release at COMMIT — which for a test that runs many transactions would mean
+// holding it for almost none of them.
+//
+// ⚠️ THE KEY MUST NOT BE `postgres.Migrate`'s OWN LOCK. `testPool` calls Migrate,
+// which takes its advisory lock (`migrationLockKey`) on a DIFFERENT connection of the
+// same pool. Reusing that key here would make this test block waiting for a lock its
+// own pool is already holding — a self-deadlock that hangs the suite rather than
+// failing it. The key below is a different, stable, arbitrary constant.
+const testSuiteLockKey int64 = 0x77616c62_0002 // "walb" + 2, distinct from Migrate's 0001
+
 func testPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	dsn := os.Getenv("WASRI_TEST_DATABASE_URL")
@@ -65,14 +94,44 @@ func testPool(t *testing.T) *pgxpool.Pool {
 	if err := postgres.Migrate(ctx, pool); err != nil {
 		t.Fatalf("migrating: %v", err)
 	}
+	acquireSuiteLock(t, pool)
 	resetTables(t, pool)
 	return pool
+}
+
+// acquireSuiteLock takes the cross-package test lock for the duration of one test.
+//
+// NOT `context.Background()` with a timeout: a competing suite's test is usually
+// milliseconds long, and a timeout here would turn "wait your turn" into a flaky
+// failure. The lock is released when the connection closes, which `t.Cleanup` does.
+func acquireSuiteLock(t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+	ctx := context.Background()
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquiring a connection to take the test-suite lock: %v", err)
+	}
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, testSuiteLockKey); err != nil {
+		conn.Release()
+		t.Fatalf("taking the test-suite advisory lock: %v", err)
+	}
+	// Releasing rather than relying on the pool dropping the session: it makes the
+	// lifetime explicit, so a reader can see the lock is held for exactly one test.
+	t.Cleanup(func() {
+		_, _ = conn.Exec(context.WithoutCancel(ctx), `SELECT pg_advisory_unlock($1)`, testSuiteLockKey)
+		conn.Release()
+	})
 }
 
 // resetTables empties every table a test writes, making the suite re-runnable.
 //
 // TRUNCATE, not DELETE: the schema refuses DELETE on orders and order_lines via the
 // append-only triggers, and TRUNCATE correctly bypasses those row triggers.
+//
+// `branches ... CASCADE` reaches the inventory tables too — inventory_items,
+// stock_movements and stock_balances all reference it — so this list deliberately
+// does NOT name them. Adding them here would be redundant, and the comment exists so
+// the next reader does not "fix" what is not broken.
 func resetTables(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
 	const q = `TRUNCATE TABLE order_lines, orders, idempotency_keys, sync_outbox_items, branches
@@ -371,9 +430,22 @@ func TestIngestOrder_PersistsToPostgresAndDeduplicatesOnRetry(t *testing.T) {
 	rates := postgres.NewBranchRate(pool)
 	idem := postgres.NewIdempotencyStore(pool)
 	outbox := postgres.NewOutboxLedger(pool)
+	// The REAL inventory store, wired exactly as cmd/api/main.go wires it.
+	//
+	// This suite is about ORDERS, so it has no inventory_items row and the deduction
+	// legitimately finds nothing to deduct — which is the correct outcome and is why
+	// the assertions below are unaffected. What matters is that the port is a real
+	// one: this is the end-to-end proof that a full ingest against live Postgres
+	// still works with the deduction in the pipeline.
+	stockStore := inventorypostgres.NewStockStore(pool)
 
 	ingest := orderuc.NewIngestOrder(orderuc.IngestOrderDeps{
 		Orders: orders, Rates: rates, Idem: idem, Outbox: outbox,
+		Stock: orderinventory.NewStockLedger(inventoryuc.NewDeductSale(inventoryuc.DeductSaleDeps{
+			Items: stockStore,
+			Store: stockStore,
+			Now:   func() time.Time { return now },
+		})),
 		Now: func() time.Time { return now },
 	})
 

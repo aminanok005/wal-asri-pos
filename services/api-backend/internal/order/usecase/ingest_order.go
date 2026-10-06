@@ -22,6 +22,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	identity "wal-asri-pos/services/api-backend/internal/identity/domain"
@@ -76,6 +77,103 @@ type OutboxLedger interface {
 	// TransitionTo moves an item's state. A duplicate submission does NOT call
 	// this: it returns the stored response instead.
 	TransitionTo(ctx context.Context, id identity.UUIDv7, to sync.OutboxState, at time.Time) error
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The stock port
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Declared HERE, in the order module's own vocabulary, rather than imported from
+// `internal/inventory/usecase` — which this package may not do.
+// internal/architecture/layers_test.go forbids one module's application layer from
+// depending on another's, and the rule is what lets both modules be tested without
+// the other.
+//
+// The types below therefore speak only `identity` and `money` — the two shared
+// kernels — and know nothing about inventory items, movements or balances.
+// `internal/order/adapter/inventory` implements this port over the real inventory
+// interactor; tests implement it over a fake.
+
+// StockLedger consumes stock for an accepted sale.
+//
+// ── WHY THIS IS A PORT AND NOT A DIRECT CALL ──────────────────────────────────
+//
+// Two reasons, and the second is the one that matters.
+//
+//  1. Inversion. This package's tests must run without a database, and a use case
+//     that reached for a Postgres driver would need one.
+//
+//  2. THE ACKNOWLEDGEMENT IS A PROMISE. Once a terminal receives a 200 it clears
+//     its outbox row, and the sale is never sent again. So an acknowledgement means
+//     "this sale is fully recorded" — and if stock were deducted somewhere the
+//     acknowledgement does not cover, the server would be making a promise it
+//     cannot keep. Keeping the deduction behind a port the interactor MUST call is
+//     what makes "an ACK implies a committed deduction" a property of this code
+//     rather than a convention someone can route around.
+type StockLedger interface {
+	// DeductForSale consumes stock for every tracked line of an accepted order and
+	// returns a warning per article that went below zero.
+	//
+	// It NEVER refuses a sale for insufficient stock. An offline terminal can sell
+	// the last of an article before anybody knew there was none; by the time the
+	// batch syncs the shortage has already happened, the customer has paid and the
+	// receipt is printed. The deduction COMMITS the negative balance and reports it,
+	// which is the ratified policy — see the inventory domain's package header and
+	// ARCHITECTURE-DEMO.md §9.
+	//
+	// An ERROR means the stock could not be recorded at all, which is different and
+	// must not be confused with a shortage: the caller fails the submission so the
+	// terminal retries, rather than acknowledging a sale whose stock was never
+	// written.
+	DeductForSale(ctx context.Context, sale SaleStock) ([]StockWarning, error)
+}
+
+// SaleStock is one accepted order's worth of stock to consume, in this module's
+// vocabulary.
+type SaleStock struct {
+	BranchID identity.UUIDv7
+
+	// OrderID is carried for error messages and for the reader's benefit; the
+	// deduction identifies itself per LINE, via OrderLineID. Nothing is keyed on
+	// the order, because nothing in the ledger is.
+	OrderID identity.UUIDv7
+
+	Lines []SaleStockLine
+}
+
+// SaleStockLine is one sold line.
+//
+// Quantity is `money.Quantity` — the exact milli-unit count the terminal priced
+// with, which is also the quantity that gets deducted. See the seam adapter's
+// package note for why nothing converts it on the way across.
+type SaleStockLine struct {
+	// OrderLineID is what makes the deduction idempotent: it becomes the stock
+	// movement's primary key, so a terminal retrying the batch that carried this
+	// line collides with itself and deducts nothing a second time.
+	OrderLineID      identity.UUIDv7
+	ProductVariantID identity.UUIDv7
+	Quantity         money.Quantity
+}
+
+// StockWarning is one article that went below zero.
+//
+// REPORTED, NOT ENFORCED — that is the whole of the policy. OnHandMilli is SIGNED
+// and negative for the article that was oversold.
+type StockWarning struct {
+	InventoryItemID identity.UUIDv7
+	// NameTH and Unit are carried so a warning is actionable rather than an id. An
+	// operator reading "-750" cannot reorder flour; one reading "-0.750 kg of
+	// แป้ง" can.
+	NameTH string
+	Unit   string
+	// OnHandMilli is the committed balance in milli-units, NEGATIVE when oversold.
+	//
+	// Named `...Milli` and typed as a raw int64 because this reaches the wire inside
+	// the acknowledgement. A `money.Quantity` would marshal as the decimal string
+	// "-0.750" under a field called `on_hand`, which is a different wire shape from
+	// the one the contract defines for StockBalance — and the acknowledgement is not
+	// the place to introduce a second spelling of the same value.
+	OnHandMilli int64
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -140,10 +238,13 @@ type IngestRequest struct {
 
 // IngestOrder accepts an offline order and makes it authoritative.
 type IngestOrder struct {
-	orders  OrderRepository
-	rates   BranchRateSource
-	idem    IdempotencyStore
-	outbox  OutboxLedger
+	orders OrderRepository
+	rates  BranchRateSource
+	idem   IdempotencyStore
+	outbox OutboxLedger
+	// stock consumes stock for the sale. REQUIRED, not optional — see the note at
+	// StockLedger on why a nil port here would be worse than a compile error.
+	stock   StockLedger
 	now     func() time.Time
 	idemTTL time.Duration
 }
@@ -151,10 +252,22 @@ type IngestOrder struct {
 // IngestOrderDeps is the constructor's argument bundle, so adding a port does not
 // change every call site's arity.
 type IngestOrderDeps struct {
-	Orders  OrderRepository
-	Rates   BranchRateSource
-	Idem    IdempotencyStore
-	Outbox  OutboxLedger
+	Orders OrderRepository
+	Rates  BranchRateSource
+	Idem   IdempotencyStore
+	Outbox OutboxLedger
+	// Stock consumes stock for the sale.
+	//
+	// NOT OPTIONAL. An interactor built without one would acknowledge orders whose
+	// stock was never deducted, and nothing downstream would notice — the sale
+	// would look perfectly recorded while the shelves silently drifted. The failure
+	// this module exists to prevent is a sale that is real but incomplete, and an
+	// optional port is precisely how that happens.
+	//
+	// A deployment that genuinely cannot deduct stock wires a REFUSING ledger (see
+	// cmd/api/main.go's unwiredStockLedger), which fails the ingest loudly and
+	// leaves the terminal retrying. That is the safe failure; a silent skip is not.
+	Stock   StockLedger
 	Now     func() time.Time
 	IdemTTL time.Duration
 }
@@ -174,6 +287,7 @@ func NewIngestOrder(d IngestOrderDeps) *IngestOrder {
 		rates:   d.Rates,
 		idem:    d.Idem,
 		outbox:  d.Outbox,
+		stock:   d.Stock,
 		now:     nowFn,
 		idemTTL: ttl,
 	}
@@ -188,6 +302,15 @@ type Result struct {
 	// Totals are the SERVER's figures, which may differ from the terminal's and are
 	// the ones that count.
 	Totals order.Totals
+	// StockWarnings names every article whose committed balance went below zero.
+	//
+	// The sale is NOT refused for any of them — see StockLedger. These travel in the
+	// acknowledgement so a terminal can show "we are short" without the operator
+	// having to open a database.
+	//
+	// Nil in the overwhelmingly common case, and the acknowledgement omits the field
+	// entirely when it is empty rather than emitting `"stock_alerts":[]`.
+	StockWarnings []StockWarning
 	// Response is the answer to serialise, and the value stored for a replay.
 	Response string
 }
@@ -210,13 +333,26 @@ type Result struct {
 //     a receipt that disagrees with the ledger, which is worse than a rejected
 //     order the cashier can re-ring.
 //
-//  4. COMMIT AND RECORD. Append the order, move the outbox item to ACKNOWLEDGED,
-//     and store the idempotency record with the response.
+//  4. COMMIT AND RECORD. Append the order, DEDUCT ITS STOCK, move the outbox item
+//     to ACKNOWLEDGED, and store the idempotency record with the response.
 //
-// Step 4's ordering matters: the idempotency record is written LAST, so a crash
-// between the append and the save leaves a duplicate to be re-applied rather than
-// one to be silently lost. At-least-once on the write is safe because the append
-// itself is idempotent on the client-generated primary key.
+// Step 4's ordering is the design, and both halves of it matter:
+//
+//   - the STOCK DEDUCTION happens BEFORE the idempotency record is written, so an
+//     acknowledgement — the only thing that makes a terminal drop its outbox row —
+//     can only exist once the stock has actually moved. An ACK is a promise that the
+//     sale is fully recorded, and a promise about stock that was not kept is the
+//     exact failure this service refuses everywhere else.
+//
+//   - the idempotency record is written LAST, so a crash anywhere earlier leaves a
+//     duplicate to be RE-APPLIED rather than a result to be silently lost.
+//     At-least-once on the write is safe because the append is idempotent on the
+//     client-generated primary key, and the stock movement's id is the order line's
+//     id — so re-applying deducts nothing twice.
+//
+// A sale that goes below zero on some article is NOT a failure at this layer: the
+// deduction commits the negative balance and returns a warning, because the sale
+// really happened. See StockLedger.
 func (i *IngestOrder) Execute(ctx context.Context, req IngestRequest) (Result, error) {
 	now := i.now().UTC()
 	branchID := req.Order.BranchID
@@ -302,9 +438,23 @@ func (i *IngestOrder) Execute(ctx context.Context, req IngestRequest) (Result, e
 		return held, nil
 	}
 
-	// ── Step 4: commit, then record ───────────────────────────────────────────
+	// ── Step 4: commit, deduct, then record ──────────────────────────────────
 	if err := i.orders.Append(ctx, priced); err != nil {
 		return Result{}, fmt.Errorf("order %s: appending: %w", priced.ID, err)
+	}
+
+	// The stock deduction, and it happens HERE — after the order is durable and
+	// before anything tells the terminal the sale is settled.
+	//
+	// A failure is NOT swallowed and NOT converted into a warning. The order is
+	// already committed, so the honest response is to fail the submission: the
+	// terminal keeps its outbox row and retries, and the retry is a no-op for any
+	// deduction that already landed because a movement's id is its order line's id.
+	// Swallowing it would acknowledge a sale whose stock was never recorded, which
+	// is a shelf that silently drifts for as long as nobody notices.
+	warnings, err := i.deductStock(ctx, priced)
+	if err != nil {
+		return Result{}, err
 	}
 
 	item := sync.SyncOutboxItem{
@@ -329,11 +479,12 @@ func (i *IngestOrder) Execute(ctx context.Context, req IngestRequest) (Result, e
 	}
 
 	result := Result{
-		OrderID: priced.ID,
-		State:   sync.StateAcknowledged,
-		Totals:  authoritative,
+		OrderID:       priced.ID,
+		State:         sync.StateAcknowledged,
+		Totals:        authoritative,
+		StockWarnings: warnings,
 	}
-	result.Response = renderAcknowledged(priced, authoritative)
+	result.Response = renderAcknowledged(priced, authoritative, warnings)
 
 	rec, err := sync.NewIdempotencyRecord(key, priced.ID, sync.StateAcknowledged, result.Response, now)
 	if err != nil {
@@ -351,6 +502,62 @@ func (i *IngestOrder) Execute(ctx context.Context, req IngestRequest) (Result, e
 	return result, nil
 }
 
+// deductStock consumes stock for a committed order and returns any shortage.
+//
+// A METHOD rather than a few inline lines, because the line-to-line mapping is the
+// part worth naming once: the deduction is driven by the LINES THAT ACTUALLY
+// ARRIVED, not by the order header and not by a re-derivation. Those quantities are
+// already agreed — steps 2 and 3 re-priced the order and refused any mismatch — so
+// the server has no better figure than the terminal does, and inventing one would
+// mean two answers to "how much flour did this latte use" with no way to adjudicate.
+//
+// The order carries no `BranchID`-scoped stock context of its own beyond the branch,
+// so the branch is passed explicitly rather than read off a line.
+func (i *IngestOrder) deductStock(ctx context.Context, o order.Order) ([]StockWarning, error) {
+	// AN UNWIRED LEDGER IS A CONFIGURATION ERROR, and it is checked here rather than
+	// left to a nil-pointer panic three frames deeper.
+	//
+	// The panic would be loud too, so this is not about noise — it is about WHERE
+	// the failure points. A segfault at ingest_order.go:526 during a shift says
+	// "something is wrong in the ingest path"; this error says "Stock was not wired
+	// into the composition root", which is a one-line fix.
+	//
+	// It is checked per call rather than in the constructor because the constructor
+	// cannot distinguish a nil port from an interface holding a nil pointer, and
+	// because failing at the point of use keeps the requirement attached to the one
+	// place that cannot work without it.
+	if i.stock == nil {
+		return nil, fmt.Errorf(
+			"order %s: the order is committed but no stock ledger is wired into the ingest pipeline. "+
+				"StockLedger is required: without it the server would acknowledge sales whose stock it "+
+				"never recorded. Wire one in cmd/api/main.go — the real Postgres store when "+
+				"%s is set, or a refusing placeholder when it is not", o.ID, "DATABASE_URL")
+	}
+
+	lines := make([]SaleStockLine, 0, len(o.Lines))
+	for _, l := range o.Lines {
+		lines = append(lines, SaleStockLine{
+			OrderLineID:      l.ID,
+			ProductVariantID: l.ProductVariantID,
+			Quantity:         l.Quantity,
+		})
+	}
+
+	warnings, err := i.stock.DeductForSale(ctx, SaleStock{
+		BranchID: o.BranchID,
+		OrderID:  o.ID,
+		Lines:    lines,
+	})
+	if err != nil {
+		return nil, fmt.Errorf(
+			"order %s: the order is committed but its stock could not be deducted (%v). The "+
+				"submission fails so the terminal retries; the retry is a no-op for any deduction "+
+				"that already landed, because a stock movement's id is its order line's id",
+			o.ID, err)
+	}
+	return warnings, nil
+}
+
 // holdForConflict stores an order whose terminal-side figures disagree with the
 // server's, and moves it to CONFLICT_HELD.
 //
@@ -358,6 +565,25 @@ func (i *IngestOrder) Execute(ctx context.Context, req IngestRequest) (Result, e
 // different outcomes for a sale that genuinely happened on a device. The order is
 // stored — the money is real and the customer has paid — but it is not applied to
 // the authoritative ledger until someone decides.
+//
+// ── WHY NO STOCK IS DEDUCTED HERE, EXPLICITLY ─────────────────────────────────
+//
+// This is the one path through Execute that does NOT call deductStock, and it is a
+// decision rather than an oversight.
+//
+// `CONFLICT_HELD` means the order is stored and INSPECTABLE but deliberately NOT
+// APPLIED — the ledger row itself says so, and the terminal is told to stop retrying.
+// The stock movement ledger records facts that were APPLIED; appending a movement
+// for an order nobody has applied would make `stock_movements` a record of
+// submissions rather than of things that happened, and the balance would then
+// disagree with the orders that were actually settled.
+//
+// THE OPEN OBLIGATION, STATED SO IT IS NOT FORGOTTEN: resolving a held order —
+// approving it, or voiding it — must deduct or credit stock at that point. That
+// resolution path does not exist yet; `OrderStatus.Transition` moves the status but
+// nothing consumes stock. Until it does, a held order's ingredients stay on the
+// shelf, which UNDER-deducts rather than over-deducts: the safe direction to be
+// wrong in, and visible to whoever reconciles the conflict.
 func (i *IngestOrder) holdForConflict(
 	ctx context.Context,
 	priced order.Order,
@@ -397,6 +623,8 @@ func (i *IngestOrder) holdForConflict(
 	}
 
 	result := Result{OrderID: priced.ID, State: sync.StateConflictHeld, Totals: authoritative}
+	// No stock_warnings: a held order is not applied, so it consumes nothing. See
+	// this method's note on why that is a decision rather than an omission.
 	result.Response = reason
 
 	rec, err := sync.NewIdempotencyRecord(key, priced.ID, sync.StateConflictHeld, result.Response, now)
@@ -425,10 +653,86 @@ func (i *IngestOrder) holdForConflict(
 // integer here would make the stored response — the bytes a retry gets back, and
 // the only record of what the server decided — disagree with the wire contract
 // that every other response on this endpoint follows.
-func renderAcknowledged(o order.Order, totals order.Totals) string {
-	return fmt.Sprintf(
-		`{"order_id":"%s","branch_id":"%s","status":"%s","total_satang":"%s","taxable_satang":"%s","tax_satang":"%s","vat_rate_bp":%d}`,
+//
+// ── WHY `stock_alerts` IS OMITTED RATHER THAN EMITTED EMPTY ───────────────────
+//
+// The overwhelmingly common case is a sale that consumed stock normally, and then
+// the field would be `"stock_alerts":[]` on every single acknowledgement — noise
+// every client has to parse and every reader has to look past to find the field
+// that matters. Omitting it entirely means "nothing went below zero" is the
+// ABSENCE of a key, which is unambiguous and costs nothing to detect.
+//
+// This also keeps the pre-existing acknowledgement BYTE-IDENTICAL for every sale
+// that did not oversell. That response is stored for 24 hours and replayed
+// verbatim on a retry, so its shape is a compatibility promise rather than an
+// implementation detail — and the tests at ingest_order_test.go assert on it.
+func renderAcknowledged(o order.Order, totals order.Totals, warnings []StockWarning) string {
+	base := fmt.Sprintf(
+		`{"order_id":"%s","branch_id":"%s","status":"%s","total_satang":"%s","taxable_satang":"%s","tax_satang":"%s","vat_rate_bp":%d`,
 		o.ID, o.BranchID, o.Status,
 		totals.TotalSatang.String(), totals.NetSatang().String(), totals.TaxSatang().String(),
 		totals.TaxSplit.RateBp)
+
+	if len(warnings) == 0 {
+		return base + "}"
+	}
+
+	var b strings.Builder
+	b.WriteString(base)
+	b.WriteString(`,"stock_alerts":[`)
+	for i, w := range warnings {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		// `on_hand_milli` is a plain integer, NOT a quoted decimal string and not a
+		// `*_satang` field: it is a milli-unit count, and the contract carries
+		// quantities as decimal STRINGS only for the `Quantity` schema on the wire's
+		// own endpoints. This acknowledgement is not that schema, and inventing a
+		// second spelling of a quantity here would be the exact drift the money
+		// guards exist to prevent.
+		fmt.Fprintf(&b,
+			`{"inventory_item_id":"%s","name_th":%s,"unit":%s,"on_hand_milli":%d}`,
+			w.InventoryItemID, jsonString(w.NameTH), jsonString(w.Unit), w.OnHandMilli)
+	}
+	b.WriteString("]}")
+	return b.String()
+}
+
+// jsonString renders a Go string as a JSON string literal.
+//
+// Hand-rolled rather than pulled from `encoding/json` because the only values that
+// reach it are an article's Thai name and its unit — neither of which may contain a
+// quote or a backslash in practice, but "in practice" is not a guarantee, and an
+// unescaped quote in a name would produce a stored response that no client can
+// parse. Ten lines is cheaper than a permanently-latent malformed ACK.
+//
+// Control characters are escaped rather than passed through, because a raw newline
+// inside a JSON string literal is invalid JSON even though it is a perfectly legal
+// character in a Thai product name pasted from a supplier's spreadsheet.
+func jsonString(s string) string {
+	var b strings.Builder
+	b.Grow(len(s) + 2)
+	b.WriteByte('"')
+	for _, r := range s {
+		switch r {
+		case '"':
+			b.WriteString(`\"`)
+		case '\\':
+			b.WriteString(`\\`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\r':
+			b.WriteString(`\r`)
+		case '\t':
+			b.WriteString(`\t`)
+		default:
+			if r < 0x20 {
+				fmt.Fprintf(&b, `\u%04x`, r)
+				continue
+			}
+			b.WriteRune(r)
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
 }

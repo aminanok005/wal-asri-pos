@@ -2,6 +2,7 @@ package usecase
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -103,6 +104,34 @@ func (f *fakeOutbox) TransitionTo(_ context.Context, _ identity.UUIDv7, to sync.
 	return nil
 }
 
+// fakeStock records what the deduction was asked to consume.
+//
+// It exists because StockLedger is a REQUIRED port, and a required port makes every
+// existing test a test of a pipeline with a nil hole in it. That is the trade the
+// port makes deliberately: a nil ledger panics at the call site instead of
+// silently skipping stock, and the panic is a louder failure than a shelf that
+// quietly drifts.
+//
+// By default it records the sale and returns NO warnings, which is the normal case
+// and keeps every pre-existing test's expectations untouched.
+type fakeStock struct {
+	sales    []SaleStock
+	calls    int
+	warnings []StockWarning
+	err      error
+}
+
+func (f *fakeStock) DeductForSale(_ context.Context, sale SaleStock) ([]StockWarning, error) {
+	f.calls++
+	f.sales = append(f.sales, sale)
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.warnings, nil
+}
+
+var _ StockLedger = (*fakeStock)(nil)
+
 // ── fixtures ─────────────────────────────────────────────────────────────────
 
 // terminalOrder builds a ฿45.50 takeaway exactly as a terminal would send it,
@@ -128,8 +157,17 @@ func terminalOrder(rateBp money.BasisPoints, n int) order.Order {
 }
 
 func newIngest(repo *fakeOrders, rates *fakeRates, idem *fakeIdem, out *fakeOutbox) *IngestOrder {
+	return newIngestWithStock(repo, rates, idem, out, &fakeStock{})
+}
+
+// newIngestWithStock is the constructor for tests that need to inspect or fail the
+// stock deduction. Every other test goes through newIngest so the default fake is
+// the one under test, not an accident of each call site.
+func newIngestWithStock(
+	repo *fakeOrders, rates *fakeRates, idem *fakeIdem, out *fakeOutbox, stock StockLedger,
+) *IngestOrder {
 	return NewIngestOrder(IngestOrderDeps{
-		Orders: repo, Rates: rates, Idem: idem, Outbox: out,
+		Orders: repo, Rates: rates, Idem: idem, Outbox: out, Stock: stock,
 		Now: func() time.Time { return now },
 	})
 }
@@ -406,5 +444,337 @@ func TestIngestOrder_AFailedIdempotencySaveReportsThatTheOrderIsCommitted(t *tes
 	msg := err.Error()
 	if !strings.Contains(msg, "committed") || !strings.Contains(msg, "duplicate primary key") {
 		t.Errorf("the error must state that the order committed and what happens on retry, got %q", msg)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The stock deduction on the acknowledgement path
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// These pin the four properties that make the deduction trustworthy rather than
+// merely present: it happens, it happens at the right moment, it happens for the
+// lines that actually arrived, and it does NOT happen for an order that was held.
+
+// TestIngestOrder_DeductsTheLinesThatActuallyArrived is the mapping assertion.
+//
+// The deduction is driven by the order's OWN lines — the quantities the terminal
+// priced with and the server already re-validated — rather than by a header field
+// or a re-derivation. Getting the line id or the variant id wrong here would deduct
+// the right quantity from the wrong shelf, which no test of the inventory module
+// alone could catch.
+func TestIngestOrder_DeductsTheLinesThatActuallyArrived(t *testing.T) {
+	repo, rates, idem, out := &fakeOrders{}, &fakeRates{bp: 700}, newFakeIdem(), &fakeOutbox{}
+	stock := &fakeStock{}
+	i := newIngestWithStock(repo, rates, idem, out, stock)
+
+	sent := terminalOrder(700, 100)
+	res, err := i.Execute(context.Background(), IngestRequest{
+		IdempotencyKey: "order-key-1",
+		TerminalID:     uid(9),
+		Order:          sent,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if stock.calls != 1 {
+		t.Fatalf("the stock ledger was called %d times, want 1", stock.calls)
+	}
+	sale := stock.sales[0]
+	if len(sale.Lines) != 1 {
+		t.Fatalf("deducted %d lines, want 1", len(sale.Lines))
+	}
+
+	line := sale.Lines[0]
+	if line.OrderLineID.Compare(sent.Lines[0].ID) != 0 {
+		t.Errorf("deducted order line %s, want %s", line.OrderLineID, sent.Lines[0].ID)
+	}
+	if line.ProductVariantID.Compare(sent.Lines[0].ProductVariantID) != 0 {
+		t.Errorf("deducted variant %s, want %s", line.ProductVariantID, sent.Lines[0].ProductVariantID)
+	}
+	if line.Quantity.Milli() != sent.Lines[0].Quantity.Milli() {
+		t.Errorf("deducted quantity %d milli-units, want %d",
+			line.Quantity.Milli(), sent.Lines[0].Quantity.Milli())
+	}
+	if sale.BranchID.Compare(sent.BranchID) != 0 {
+		t.Errorf("deducted against branch %s, want %s", sale.BranchID, sent.BranchID)
+	}
+	if sale.OrderID.Compare(res.OrderID) != 0 {
+		t.Errorf("the deduction names order %s, want %s", sale.OrderID, res.OrderID)
+	}
+}
+
+// TestIngestOrder_DeductsAfterTheOrderIsCommittedAndBeforeTheAcknowledgement is
+// the ordering claim, and it is the load-bearing one.
+//
+// The order must be durable before stock moves, and the acknowledgement must be
+// the LAST thing written. A terminal that receives a 200 clears its outbox row and
+// never sends that sale again — so an ACK is a promise that the sale is fully
+// recorded, and this test exists because that promise is only true if the
+// deduction precedes the idempotency record that produces the replayed response.
+func TestIngestOrder_DeductsAfterTheOrderIsCommittedAndBeforeTheAcknowledgement(t *testing.T) {
+	repo, rates, idem, out := &fakeOrders{}, &fakeRates{bp: 700}, newFakeIdem(), &fakeOutbox{}
+	stock := &fakeStock{}
+
+	// Record the order count at the moment the deduction runs, so the assertion is
+	// about ORDER not of sequence of calls.
+	ordersAtDeduction := -1
+	recordsAtDeduction := -1
+	inner := &orderingStock{inner: stock}
+	inner.onDeduct = func() {
+		ordersAtDeduction = len(repo.appended)
+		recordsAtDeduction = len(idem.records)
+	}
+	i := newIngestWithStock(repo, rates, idem, out, inner)
+
+	if _, err := i.Execute(context.Background(), IngestRequest{
+		IdempotencyKey: "order-key-1",
+		TerminalID:     uid(9),
+		Order:          terminalOrder(700, 100),
+	}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if ordersAtDeduction != 1 {
+		t.Errorf("the order had been appended %d times when stock was deducted, want 1; stock must "+
+			"never move for an order that is not yet durable", ordersAtDeduction)
+	}
+	if recordsAtDeduction != 0 {
+		t.Errorf("%d idempotency records existed when stock was deducted, want 0; the record is what "+
+			"makes the acknowledgement replayable, so it must be written AFTER the deduction "+
+			"commits — otherwise a crash here acknowledges a sale whose stock never moved",
+			recordsAtDeduction)
+	}
+}
+
+// orderingStock is a fakeStock that reports what was true at deduction time.
+type orderingStock struct {
+	inner    *fakeStock
+	onDeduct func()
+}
+
+func (s *orderingStock) DeductForSale(ctx context.Context, sale SaleStock) ([]StockWarning, error) {
+	if s.onDeduct != nil {
+		s.onDeduct()
+	}
+	return s.inner.DeductForSale(ctx, sale)
+}
+
+// TestIngestOrder_AFailedDeductionFailsTheSubmission is the promise this whole
+// arrangement protects.
+//
+// The order is already committed by the time stock is deducted, so the only honest
+// outcome is to fail: the terminal keeps its outbox row and retries. Acknowledging
+// anyway would leave a sale the server has promised is fully recorded, with its
+// stock nowhere — and the shelf would drift by exactly the amount the shop sold.
+func TestIngestOrder_AFailedDeductionFailsTheSubmission(t *testing.T) {
+	repo, rates, idem, out := &fakeOrders{}, &fakeRates{bp: 700}, newFakeIdem(), &fakeOutbox{}
+	stock := &fakeStock{err: fmt.Errorf("dial tcp 127.0.0.1:5433: connection refused")}
+	i := newIngestWithStock(repo, rates, idem, out, stock)
+
+	_, err := i.Execute(context.Background(), IngestRequest{
+		IdempotencyKey: "order-key-1",
+		TerminalID:     uid(9),
+		Order:          terminalOrder(700, 100),
+	})
+	if err == nil {
+		t.Fatal("a failed stock deduction returned success; the terminal would clear its outbox row " +
+			"and the stock would never be recorded")
+	}
+
+	msg := err.Error()
+	if !strings.Contains(msg, "committed") {
+		t.Errorf("the error must state that the order committed, so an operator knows what state the "+
+			"world is in; got %q", msg)
+	}
+	if !strings.Contains(msg, "retry") {
+		t.Errorf("the error must say what happens on retry; got %q", msg)
+	}
+	// And no idempotency record, because no acknowledgement may exist for it.
+	if len(idem.records) != 0 {
+		t.Errorf("stored %d idempotency records after a failed deduction, want 0", len(idem.records))
+	}
+}
+
+// TestIngestOrder_AHeldOrderDoesNotDeductStock is the explicit `if` in
+// holdForConflict, asserted so it cannot be deleted as an oversight.
+//
+// CONFLICT_HELD means stored and INSPECTABLE but deliberately NOT APPLIED. The
+// movement ledger records facts that were applied; appending a movement for an
+// order nobody has applied would make stock_movements a record of submissions
+// rather than of things that happened.
+//
+// The consequence is that a held order's ingredients stay on the shelf — an
+// UNDER-deduction, which is the safe direction to be wrong in, and visible to
+// whoever reconciles the conflict.
+func TestIngestOrder_AHeldOrderDoesNotDeductStock(t *testing.T) {
+	repo := &fakeOrders{}
+	// The branch is now at 10% while the terminal still prices at 7% — the stale
+	// terminal case, which is the realistic way an order reaches holdForConflict.
+	rates := &fakeRates{bp: 1000}
+	idem, out, stock := newFakeIdem(), &fakeOutbox{}, &fakeStock{}
+	i := newIngestWithStock(repo, rates, idem, out, stock)
+
+	res, err := i.Execute(context.Background(), IngestRequest{
+		IdempotencyKey: "order-key-stale",
+		TerminalID:     uid(9),
+		Order:          terminalOrder(700, 200),
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.State != sync.StateConflictHeld {
+		t.Fatalf("state = %s, want CONFLICT_HELD for this fixture", res.State)
+	}
+
+	if stock.calls != 0 {
+		t.Errorf("a held order called the stock ledger %d times, want 0; a held order is NOT applied, "+
+			"so it consumes nothing", stock.calls)
+	}
+	if len(res.StockWarnings) != 0 {
+		t.Errorf("a held order reported stock warnings %v, want none", res.StockWarnings)
+	}
+	if strings.Contains(res.Response, "stock_alerts") {
+		t.Errorf("the held response carries stock_alerts; a held order deducts nothing: %s", res.Response)
+	}
+}
+
+// TestIngestOrder_StockAlertsAreOmittedWhenNothingIsOversold pins the byte
+// compatibility of the acknowledgement.
+//
+// That response is stored for 24 hours and replayed verbatim on a retry, so its
+// shape is a compatibility promise rather than an implementation detail. Emitting
+// `"stock_alerts":[]` on the overwhelmingly common sale would change the bytes
+// every existing terminal has already parsed.
+func TestIngestOrder_StockAlertsAreOmittedWhenNothingIsOversold(t *testing.T) {
+	repo, rates, idem, out := &fakeOrders{}, &fakeRates{bp: 700}, newFakeIdem(), &fakeOutbox{}
+	i := newIngestWithStock(repo, rates, idem, out, &fakeStock{})
+
+	res, err := i.Execute(context.Background(), IngestRequest{
+		IdempotencyKey: "order-key-1",
+		TerminalID:     uid(9),
+		Order:          terminalOrder(700, 100),
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if strings.Contains(res.Response, "stock_alerts") {
+		t.Errorf("the response carries stock_alerts despite nothing being oversold; the field must be "+
+			"omitted so the common acknowledgement stays byte-identical: %s", res.Response)
+	}
+	if strings.Contains(res.Response, "[]") {
+		t.Errorf("the response contains an empty array; got: %s", res.Response)
+	}
+}
+
+// TestIngestOrder_AWarningIsReportedNotRefused is the ratified policy at the layer
+// that decides what an acknowledgement means.
+//
+// A sale that takes an article below zero COMMITS and is ACKNOWLEDGED, with the
+// shortage reported. Refusing it would not prevent the oversell — it happened on an
+// offline terminal, the customer paid and the receipt is printed — it would only
+// hide the one fact an operator needs.
+func TestIngestOrder_AWarningIsReportedNotRefused(t *testing.T) {
+	repo, rates, idem, out := &fakeOrders{}, &fakeRates{bp: 700}, newFakeIdem(), &fakeOutbox{}
+	stock := &fakeStock{warnings: []StockWarning{{
+		InventoryItemID: uid(50), NameTH: "แป้ง", Unit: "kg", OnHandMilli: -750,
+	}}}
+	i := newIngestWithStock(repo, rates, idem, out, stock)
+
+	res, err := i.Execute(context.Background(), IngestRequest{
+		IdempotencyKey: "order-key-1",
+		TerminalID:     uid(9),
+		Order:          terminalOrder(700, 100),
+	})
+	if err != nil {
+		t.Fatalf("an oversold sale FAILED: %v. The shortage already happened; refusing it hides it", err)
+	}
+	if res.State != sync.StateAcknowledged {
+		t.Errorf("state = %s, want ACKNOWLEDGED; a shortage is reported, not refused", res.State)
+	}
+	if len(res.StockWarnings) != 1 {
+		t.Fatalf("got %d stock warnings, want 1", len(res.StockWarnings))
+	}
+	if res.StockWarnings[0].OnHandMilli != -750 {
+		t.Errorf("the warning reports %d milli-units, want -750", res.StockWarnings[0].OnHandMilli)
+	}
+
+	// And it must reach the terminal, or an operator never learns about it.
+	for _, want := range []string{
+		`"stock_alerts"`, `"inventory_item_id":"` + uid(50).String() + `"`,
+		`"on_hand_milli":-750`, `"unit":"kg"`,
+	} {
+		if !strings.Contains(res.Response, want) {
+			t.Errorf("the acknowledgement is missing %s; got: %s", want, res.Response)
+		}
+	}
+}
+
+// TestIngestOrder_StockAlertsAreValidJSON guards the hand-rolled renderer.
+//
+// `renderAcknowledged` builds JSON by hand rather than through encoding/json, so a
+// Thai product name containing a quote would otherwise produce a stored response
+// that no client can parse — and that response is replayed verbatim for 24 hours.
+func TestIngestOrder_StockAlertsAreValidJSON(t *testing.T) {
+	for _, name := range []string{
+		`plain`, `has "quotes"`, `back\slash`, "tab\there", "new\nline", `แป้ง`,
+	} {
+		repo, rates, idem, out := &fakeOrders{}, &fakeRates{bp: 700}, newFakeIdem(), &fakeOutbox{}
+		stock := &fakeStock{warnings: []StockWarning{{
+			InventoryItemID: uid(50), NameTH: name, Unit: "kg", OnHandMilli: -1,
+		}}}
+		i := newIngestWithStock(repo, rates, idem, out, stock)
+
+		res, err := i.Execute(context.Background(), IngestRequest{
+			IdempotencyKey: "order-key-1",
+			TerminalID:     uid(9),
+			Order:          terminalOrder(700, 100),
+		})
+		if err != nil {
+			t.Fatalf("name %q: unexpected error: %v", name, err)
+		}
+		if !json.Valid([]byte(res.Response)) {
+			t.Errorf("name %q produced invalid JSON: %s", name, res.Response)
+		}
+	}
+}
+
+// TestIngestOrder_AnUnwiredStockLedgerIsAConfigurationErrorNotAPanic.
+//
+// StockLedger is a required port, and a nil one used to surface as a segfault deep
+// inside deductStock. That is loud, but it points at the wrong thing: a crash at a
+// line number during a shift says "the ingest path is broken", whereas the whole
+// fault is one missing line in cmd/api/main.go.
+//
+// So the nil case is a named error that says what to do. This test exists because a
+// panic-based failure is invisible to a test — the suite dies rather than reporting.
+func TestIngestOrder_AnUnwiredStockLedgerIsAConfigurationErrorNotAPanic(t *testing.T) {
+	repo, rates, idem, out := &fakeOrders{}, &fakeRates{bp: 700}, newFakeIdem(), &fakeOutbox{}
+
+	// Built deliberately WITHOUT Stock, which is the mistake this guards.
+	i := NewIngestOrder(IngestOrderDeps{
+		Orders: repo, Rates: rates, Idem: idem, Outbox: out,
+		Now: func() time.Time { return now },
+	})
+
+	_, err := i.Execute(context.Background(), IngestRequest{
+		IdempotencyKey: "order-key-1",
+		TerminalID:     uid(9),
+		Order:          terminalOrder(700, 100),
+	})
+	if err == nil {
+		t.Fatal("an unwired stock ledger was accepted; the order would be acknowledged with no deduction")
+	}
+
+	msg := err.Error()
+	for _, want := range []string{"no stock ledger is wired", "DATABASE_URL"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("the error must mention %q so the reader knows what to fix; got %q", want, msg)
+		}
+	}
+	// No acknowledgement may exist for it.
+	if len(idem.records) != 0 {
+		t.Errorf("stored %d idempotency records after an unwired ledger, want 0", len(idem.records))
 	}
 }
