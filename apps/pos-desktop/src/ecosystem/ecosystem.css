@@ -1,0 +1,110 @@
+/* ecosystem.css — Smart Restaurant POS Ecosystem design system (scoped `.eco`).
+ * Green-white palette per ux-ui spec. Scoped so existing sales terminal CSS is untouched.
+ * Dark mode: `.eco--dark` class on the wrapper (internal state, not <html>). */
+.eco { --e-primary:#16a34a; --e-primary-d:#15803d; --e-primary-light:#dcfce7; --e-lime:#a3e635;
+  --e-bg:#f1f5f9; --e-card:#ffffff; --e-border:#e2e8f0; --e-ink:#0f172a; --e-mut:#64748b;
+  --e-orange:#f97316; --e-blue:#3b82f6; --e-purple:#8b5cf6; --e-red:#ef4444;
+  --e-radius:1rem; font-family:'Plus Jakarta Sans','Inter',system-ui,sans-serif;
+  background:var(--e-bg); color:var(--e-ink); border-radius:12px; overflow:hidden; }
+.eco--dark { --e-bg:#0f172a; --e-card:#1e293b; --e-border:#334155; --e-ink:#f1f5f9; --e-mut:#94a3b8; --e-primary-light:#14532d; }
+.eco * { box-sizing:border-box; }
+.eco-persona { display:flex; gap:6px; align-items:center; background:var(--e-card); border-bottom:1px solid var(--e-border); padding:10px 12px; position:sticky; top:0; z-index:5; flex-wrap:wrap; }
+.eco-persona button { border:1px solid var(--e-border); background:transparent; color:var(--e-mut); border-radius:9999px; padding:8px 14px; font:inherit; font-weight:600; font-size:13px; cursor:pointer; }
+.eco-persona button.on { background:var(--e-primary); border-color:var(--e-primary); color:#fff; }
+.eco-persona .sp { flex:1; }
+.eco-iconbtn { border:1px solid var(--e-border); background:var(--e-card); border-radius:10px; width:38px; height:38px; font-size:17px; cursor:pointer; }
+.eco-body { padding:14px; }
+.eco-card { background:var(--e-card); border:1px solid var(--e-border); border-radius:var(--e-radius); padding:12px; }
+.eco-badge { border-radius:9999px; padding:3px 10px; font-size:11px; font-weight:700; white-space:nowrap; }
+.eco-badge--new { background:rgba(139,92,246,.15); color:var(--e-purple); }
+.eco-badge--cooking { background:rgba(249,115,22,.15); color:var(--e-orange); }
+.eco-badge--ready { background:rgba(59,130,246,.15); color:var(--e-blue); }
+.eco-badge--completed { background:rgba(22,163,74,.15); color:var(--e-primary); }
+.eco-badge--cancelled { background:rgba(239,68,68,.15); color:var(--e-red); }
+.eco-pill { border:1px solid var(--e-border); background:var(--e-card); color:var(--e-mut); border-radius:9999px; padding:7px 13px; font:inherit; font-size:12px; font-weight:600; cursor:pointer; display:inline-flex; gap:6px; align-items:center; }
+.eco-pill.on { background:var(--e-primary); border-color:var(--e-primary); color:#fff; }
+.eco-count { background:var(--e-lime); color:#1a2e05; border-radius:9999px; padding:1px 8px; font-size:11px; font-weight:800; }
+.eco-pill.on .eco-count { background:rgba(255,255,255,.3); color:#fff; }
+.eco-orderline-tabs { display:flex; gap:8px; margin-bottom:10px; flex-wrap:wrap; }
+.eco-orderline-row { display:flex; gap:6px; align-items:stretch; }
+.eco-nav-arrow { border:1px solid var(--e-border); background:var(--e-card); border-radius:12px; width:32px; font-size:20px; color:var(--e-mut); cursor:pointer; flex:none; }
+.eco-orderline-scroll { display:flex; gap:10px; overflow-x:auto; scroll-snap-type:x mandatory; scrollbar-width:none; padding:2px; flex:1; }
+.eco-orderline-scroll::-webkit-scrollbar { display:none; }
+.eco-ocard { scroll-snap-align:start; flex:0 0 220px; background:var(--e-card); border:1px solid var(--e-border); border-radius:var(--e-radius); padding:10px 12px; font-size:12px; }
+.eco-ocard-top { display:flex; justify-content:space-between; align-items:baseline; gap:6px; }
+.eco-ocard-top b { font-family:'JetBrains Mono',monospace; font-size:14px; }
+.eco-omode { color:var(--e-mut); font-size:11px; }
+.eco-ocard-mid { display:flex; justify-content:space-between; margin:8px 0; align-items:center; }
+.eco-qty { background:var(--e-lime); color:#1a2e05; font-weight:800; border-radius:9999px; padding:2px 10px; font-size:11px; }
+.eco-time { color:var(--e-mut); font-size:11px; }
+.eco-ocard-bot { display:flex; justify-content:space-between; align-items:center; gap:6px; }
+.eco-mini-btn { border:0; background:var(--e-primary-light); color:var(--e-primary-d); border-radius:9px; padding:6px 12px; font-weight:700; font-size:12px; cursor:pointer; }
+.eco--dark .eco-mini-btn { color:#bbf7d0; }
+.eco-layout-pos { display:grid; grid-template-columns:56px 1fr 330px; gap:12px; margin-top:12px; }
+.eco-side { background:var(--e-card); border:1px solid var(--e-border); border-radius:var(--e-radius); display:flex; flex-direction:column; gap:6px; padding:10px 8px; align-items:center; }
+.eco-sidebtn { width:40px; height:40px; border-radius:12px; border:0; background:transparent; font-size:18px; cursor:pointer; }
+.eco-sidebtn.on { background:var(--e-primary); color:#fff; }
+.eco-search { display:flex; align-items:center; gap:8px; background:var(--e-card); border:1px solid var(--e-border); border-radius:14px; padding:0 12px; height:44px; margin:10px 0; }
+.eco-search input { flex:1; border:0; background:none; outline:0; font:inherit; color:inherit; }
+.eco-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(150px,1fr)); gap:12px; }
+.eco-dish { background:var(--e-card); border:1px solid var(--e-border); border-radius:var(--e-radius); overflow:hidden; }
+.eco-dish.incart { border-color:var(--e-primary); box-shadow:0 0 0 2px var(--e-primary-light); }
+.eco-dishart { height:96px; display:grid; place-items:center; font-size:52px; }
+.eco-dishbody { padding:8px 10px; font-size:13px; }
+.eco-dishbody .pr { font-family:'JetBrains Mono',monospace; font-weight:700; color:var(--e-primary-d); }
+.eco--dark .eco-dishbody .pr { color:#4ade80; }
+.eco-veg { font-size:10px; font-weight:700; border-radius:6px; padding:1px 6px; }
+.eco-veg.v { background:rgba(22,163,74,.15); color:var(--e-primary); }
+.eco-veg.n { background:rgba(239,68,68,.15); color:var(--e-red); }
+.eco-addbtn { width:100%; margin-top:8px; border:0; background:var(--e-primary); color:#fff; border-radius:10px; padding:8px; font-weight:700; cursor:pointer; }
+.eco-stepper { display:flex; align-items:center; justify-content:space-between; margin-top:8px; background:var(--e-primary-light); border-radius:10px; padding:4px; font-weight:800; }
+.eco-stepper button { width:30px; height:30px; border-radius:8px; border:0; background:var(--e-primary); color:#fff; font-size:16px; cursor:pointer; }
+.eco-cartline { display:flex; gap:8px; align-items:center; padding:8px 0; border-bottom:1px solid var(--e-border); font-size:13px; }
+.eco-thumb { width:40px; height:40px; border-radius:10px; display:grid; place-items:center; font-size:22px; flex:none; }
+.eco-totals { font-size:13px; color:var(--e-mut); display:grid; gap:4px; margin:10px 0; }
+.eco-totals div { display:flex; justify-content:space-between; }
+.eco-totals .gt { color:var(--e-ink); font-weight:800; font-size:17px; border-top:1px dashed var(--e-border); padding-top:6px; }
+.eco-payrow { display:flex; gap:8px; margin:8px 0; }
+.eco-payrow button { flex:1; border:1px solid var(--e-border); background:var(--e-card); border-radius:10px; padding:9px 4px; font-size:12px; font-weight:700; color:var(--e-mut); cursor:pointer; }
+.eco-payrow button.on { border-color:var(--e-primary); color:var(--e-primary-d); background:var(--e-primary-light); }
+.eco-go { width:100%; border:0; background:var(--e-primary); color:#fff; font-weight:800; font-size:15px; border-radius:14px; padding:13px; cursor:pointer; }
+.eco-go:disabled { opacity:.45; }
+.eco-modalwrap { position:fixed; inset:0; background:rgba(0,0,0,.5); display:grid; place-items:center; z-index:60; padding:16px; }
+.eco-modal { background:var(--e-card); color:var(--e-ink); border-radius:20px; padding:26px; text-align:center; max-width:340px; }
+.eco-kpi-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; margin:12px 0; }
+.eco-kpi-val { font-family:'JetBrains Mono',monospace; font-size:22px; font-weight:800; margin:6px 0 2px; }
+.eco-kpi-title { color:var(--e-mut); font-size:12px; }
+.eco-kpi-top { display:flex; justify-content:space-between; align-items:center; }
+.eco-delta { font-size:11px; font-weight:800; border-radius:9999px; padding:2px 8px; }
+.eco-delta.up { background:rgba(22,163,74,.15); color:var(--e-primary); }
+.eco-delta.down { background:rgba(239,68,68,.15); color:var(--e-red); }
+.eco-phone { max-width:430px; margin:12px auto 0; }
+.eco-clockin { text-align:center; padding:26px 18px; }
+.eco-avatar { width:72px; height:72px; border-radius:50%; margin:0 auto 10px; display:grid; place-items:center; font-size:36px; background:linear-gradient(135deg,#16a34a,#a3e635); }
+.eco-clocktime { font-family:'JetBrains Mono',monospace; font-size:34px; font-weight:800; }
+.eco-dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:6px; }
+.eco-task { border:2px solid var(--e-primary); }
+.eco-timeline { display:grid; gap:0; margin-top:10px; }
+.eco-slot { display:flex; gap:10px; }
+.eco-slot .tm { width:52px; flex:none; font-family:'JetBrains Mono',monospace; font-size:11px; color:var(--e-mut); padding-top:8px; }
+.eco-slot .ln { width:2px; background:var(--e-border); position:relative; }
+.eco-slot .pillblock { margin:4px 0 4px 10px; border-radius:10px; padding:7px 12px; font-size:12px; font-weight:600; flex:1; }
+.eco-bar { height:8px; background:var(--e-border); border-radius:99px; overflow:hidden; }
+.eco-bar i { display:block; height:100%; background:var(--e-primary); border-radius:99px; }
+.eco-toast { position:sticky; bottom:10px; background:#0f172a; color:#fff; border-radius:12px; padding:10px 14px; font-size:13px; margin-top:10px; }
+.eco-mgr { display:grid; grid-template-columns:56px 1fr; gap:12px; margin-top:12px; }
+.eco-mgrtabs { display:flex; gap:8px; overflow-x:auto; margin-bottom:10px; }
+.eco-ogrid { display:grid; grid-template-columns:repeat(auto-fill,minmax(220px,1fr)); gap:12px; }
+.eco-split { display:grid; grid-template-columns:1fr 340px; gap:12px; }
+.eco-chart { display:flex; align-items:flex-end; gap:5px; height:150px; padding:10px 4px 0; }
+.eco-chart .col { flex:1; display:flex; flex-direction:column; gap:3px; align-items:stretch; justify-content:flex-end; height:100%; }
+.eco-chart .rv { background:var(--e-primary); border-radius:5px 5px 0 0; }
+.eco-chart .ex { background:var(--e-border); border-radius:5px 5px 0 0; }
+.eco-chartlbl { display:flex; gap:5px; }
+.eco-chartlbl span { flex:1; text-align:center; font-size:9px; color:var(--e-mut); }
+.eco-alert { border-left:4px solid; margin-bottom:8px; }
+.eco-alert.red { border-color:var(--e-red); } .eco-alert.green { border-color:var(--e-primary); } .eco-alert.orange { border-color:var(--e-orange); }
+.eco-feed { display:grid; gap:8px; font-size:13px; }
+.eco-feed time { font-family:'JetBrains Mono',monospace; color:var(--e-mut); font-size:11px; margin-right:8px; }
+.eco-empty { color:var(--e-mut); padding:16px; font-size:13px; }
+@media(max-width:900px){ .eco-layout-pos{grid-template-columns:1fr;} .eco-side{flex-direction:row;} .eco-split{grid-template-columns:1fr;} .eco-mgr{grid-template-columns:1fr;} }

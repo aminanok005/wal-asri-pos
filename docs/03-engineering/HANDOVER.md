@@ -2,18 +2,25 @@
 
 > **For whoever picks this up next.** Written 2026-10-02 at the end of the
 > offline-native foundation; **updated 2026-10-04** after Phase 2A and Phase 2B
-> (ESC/POS byte compiler, CP874 encoding, LAN transport, cash rounding). Read
-> this before reading the code: it records what is *decided*, what is *proven*,
-> and — more usefully — what is **not finished**.
+> (ESC/POS byte compiler, CP874 encoding, LAN transport, cash rounding);
+> **updated again 2026-10-06** after the UI pass that brought the sales screen
+> up to the `GreenTable POS V4.html` reference and added interaction feedback.
+> Read this before reading the code: it records what is *decided*, what is
+> *proven*, and — more usefully — what is **not finished**.
 >
 > Verify the state yourself before trusting it:
 > ```bash
-> bun run verify   # expect 390 pass / 0 fail, then the Rust suite below
-> cd apps/pos-desktop/src-tauri && cargo test --locked   # expect 87 pass / 0 fail
+> bun run verify   # expect 604 pass / 0 fail, then the Rust suite below
+> cd apps/pos-desktop/src-tauri && cargo test --locked   # expect 160 pass / 0 fail
 > ```
 > `bun run verify` now chains the Rust suite (via `test:rust`), so the first
 > command covers both sides. The `cargo` invocation is still worth running on its
 > own when you want the per-test names.
+>
+> **The UI has its own guide:** [`UI-GUIDE.md`](./UI-GUIDE.md) — design tokens,
+> the CSP traps that silently break a build, the sound catalogue, and which
+> interaction rules are already enforced app-wide so nobody adds a second
+> opinion.
 
 ---
 
@@ -25,10 +32,14 @@ Three surfaces, all green as of the commit that introduced this file.
 |---|---|---|
 | Domain (`Money`, `cart`, `tax`, `lineId`, `catalog`) | Complete | `bun test` |
 | Domain (`cashRounding`) | Complete — cash rounding, signed adjustment | `cashRounding.test.ts` |
-| Storage (`0001` + `0002`) | Complete, enforced | `migrations.test.ts` |
+| Domain (`inventory/quantity`) | Complete — signed milli-unit quantities | `quantity.test.ts` |
+| Storage (`0001` + `0002` + `0003`) | Complete, enforced | `migrations.test.ts` |
 | Native crate (SQLCipher, offline checkout) | Complete | `cargo test` |
 | Native crate (CP874, ESC/POS compiler, TCP transport) | Complete, **no hardware tested** | `cargo test` |
+| Native crate (`stock_balances`) | Complete, **no hardware tested** | `cargo test` |
 | UI (`CartView`, `SalesTerminalView`, `AppShell`) | Connected to the database | component tests |
+| UI chrome (`CatalogBrowser`, `RecentOrdersStrip`) | Complete — tabs, search, cards, recent orders | component tests |
+| UI feedback (press, sound, reduced motion) | Complete — see [`UI-GUIDE.md`](./UI-GUIDE.md) | `tickSound.test.ts` |
 | ESC/POS printing | Byte compiler + TCP adapter done; **never run against a real printer** | `cargo test` |
 | Go backend + sync | **Blocked** | — |
 
@@ -186,6 +197,10 @@ caught; this section exists so nobody re-derives them.
 | **`Money.fromSatang` rejects numbers** | Passing a `number` where `bigint` was expected. | Runtime throw — satang never pass through a JS number. |
 | **`Bun.Glob.scan` needs a string `cwd`** | Passing a `URL` throws `invalid cwd, not a string`. | `fileURLToPath()` in `layers.test.ts`. |
 | **Only Rust's own tests prove the Rust** | `migrations.test.ts` proves the CHECKs are right; nothing proved the code satisfying them was right. | CI `rust` job with `--locked`. |
+| **Inline `style=` builds fine and renders nothing** | The prototype assigns each tile its gradient with `style="background:linear-gradient(...)"`. `csp: "default-src 'self'"` is enforced by the webview at runtime, so an inline style has no `'self'` source — the build succeeds, the bundle ships, and every card is colourless. | Gradients are tokens in `tokens.css` selected by a class. `CatalogGrid.test.tsx` asserts no tile carries a `style` attribute. |
+| **`transition` on a base rule silently kills the shared press feedback** | `catalog-grid.css` declared `transition: border-color …`. A `transition` on a more specific rule REPLACES the app-wide list in `index.css` rather than extending it, so the tap-scale stopped animating — and nothing failed, because the button still worked. | Comments at both declaration sites naming the interaction; the shared list lives only in `index.css`. |
+| **An `act()` warning cannot be fixed in `afterEach`** | Adding an async read to `SalesTerminalView` produced 25 act() warnings. Flushing in `afterEach` changed nothing: the warning is emitted when the read settles during the *test body*, which runs before `afterEach`. Confirmed with a throwaway probe test. | `flush()` inside the test body, at every point a screen mounts. `AppShell.test.tsx` is the pattern; 0 warnings is the gate. |
+| **A partial audio stub makes sound tests pass while sound is broken** | The Web Audio stub was missing `start`/`stop`, so `playTick`'s try/catch swallowed the TypeError. Oscillators were "recorded" but never started, and the failures pointed at the module rather than the stub. | `tickSound.test.ts` asserts on frequency, envelope and timing — a tone that never plays fails every one of them. |
 
 ---
 

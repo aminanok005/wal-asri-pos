@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 import { Money } from '../../payments/domain/money';
-import { buildCatalog, entriesInCategory, findEntry, unitPriceOf } from './catalog';
+import { buildCatalog, entriesInCategory, filterEntries, findEntry, unitPriceOf } from './catalog';
 import type {
   CatalogIndex,
   CatalogResponse,
@@ -602,6 +602,126 @@ describe('queries', () => {
     );
 
     expect(index.entries[0]?.categoryId).toBeNull();
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// filterEntries — the tab + search pair the menu screen asks the domain for
+//
+// A menu with a tab bar and a search box has to answer "which of these are
+// sellable right now" on every keystroke. If that answer lived in a component, it
+// would be a SECOND answer next to `buildCatalog`'s, and the two could disagree
+// while both rendering a plausible-looking grid. These tests pin the contract
+// that makes them one answer instead.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('filterEntries', () => {
+  /** A two-category, three-item menu: two drinks and one food. */
+  function menuIndex(): CatalogIndex {
+    const latte = variant(201, 'BEV-LATTE-12', PRODUCT_DRINKS);
+    const mocha = variant(202, 'BEV-MOCHA-12', PRODUCT_DRINKS);
+    const khao = variant(203, 'FOOD-KHAO-THAI', PRODUCT_FOOD);
+    return buildCatalog(
+      snapshot({
+        products: [product(PRODUCT_DRINKS, COFFEE), product(PRODUCT_FOOD, FOOD)],
+        variants: [khao, latte, mocha],
+        price_list_entries: [khao, latte, mocha].map((v, i) =>
+          price({ id: 401 + i, listId: LIST_STANDARD, variantId: v.id, satang: 4550 }),
+        ),
+      }),
+    );
+  }
+
+  it('returns every entry when no filter is given at all', () => {
+    // The default is the whole menu. A tab bar that opened on an empty grid
+    // because its initial state was `null` — the UNCATEGORISED bucket — is
+    // exactly the confusion this three-state contract exists to prevent.
+    const index = menuIndex();
+    expect(filterEntries(index)).toHaveLength(3);
+    expect(filterEntries(index, {})).toHaveLength(3);
+  });
+
+  it('keeps the three-state category contract identical to entriesInCategory', () => {
+    // The two functions must not drift: `undefined` is no filter, `null` is the
+    // uncategorised bucket. A `filterEntries` that collapsed `null` into
+    // `undefined` would make "ทั้งหมด" and "uncategorised" the same tab.
+    const index = menuIndex();
+
+    expect(filterEntries(index, { categoryId: undefined })).toHaveLength(3);
+    expect(filterEntries(index, { categoryId: COFFEE }).map((e) => e.variant.sku)).toEqual([
+      'BEV-LATTE-12',
+      'BEV-MOCHA-12',
+    ]);
+    // Every product here is categorised, so the bucket is legitimately empty —
+    // and empty is NOT the same answer as unfiltered.
+    expect(filterEntries(index, { categoryId: null })).toHaveLength(0);
+    expect(filterEntries(index, { categoryId: null })).not.toHaveLength(3);
+  });
+
+  it('matches the query against the Thai name, case-insensitively', () => {
+    const index = menuIndex();
+    // Thai has no letter case, so this proves the lowercase-then-match path does
+    // not accidentally break a name that is already lowercase.
+    expect(filterEntries(index, { query: 'BEV' }).map((e) => e.variant.sku)).toEqual([
+      'BEV-LATTE-12',
+      'BEV-MOCHA-12',
+    ]);
+    expect(filterEntries(index, { query: 'bev' }).map((e) => e.variant.sku)).toEqual([
+      'BEV-LATTE-12',
+      'BEV-MOCHA-12',
+    ]);
+  });
+
+  it('also matches the SKU, because a barcode scan speaks SKU not name', () => {
+    // A cashier holding a scanner and a customer saying a name is the common
+    // case; a search box that only understood names would answer half of it.
+    const index = menuIndex();
+    expect(filterEntries(index, { query: 'khao' }).map((e) => e.variant.sku)).toEqual([
+      'FOOD-KHAO-THAI',
+    ]);
+    expect(filterEntries(index, { query: 'LATTE' }).map((e) => e.variant.sku)).toEqual([
+      'BEV-LATTE-12',
+    ]);
+  });
+
+  it('treats an empty or whitespace-only query as no filter, not as no results', () => {
+    // The most likely mistake on a touchscreen: a trailing space from a thumb
+    // would otherwise blank the menu a cashier is halfway through searching.
+    const index = menuIndex();
+    expect(filterEntries(index, { query: '' })).toHaveLength(3);
+    expect(filterEntries(index, { query: '   ' })).toHaveLength(3);
+  });
+
+  it('intersects the two filters rather than one overriding the other', () => {
+    // The tab and the box are BOTH live at once, so "BEV-LATTE-12 while on the
+    // food tab" has to be empty — not "show the latte anyway" and not "show all
+    // the food".
+    const index = menuIndex();
+    expect(filterEntries(index, { categoryId: COFFEE, query: 'LATTE' })).toHaveLength(1);
+    expect(filterEntries(index, { categoryId: FOOD, query: 'LATTE' })).toHaveLength(0);
+  });
+
+  it('never re-orders: the result follows index.entries exactly', () => {
+    // `buildCatalog` states "Nothing here sorts". A filter that sorted would make
+    // tiles jump under the cashier's hand as they type, on a menu they had
+    // already learned the order of.
+    const index = menuIndex();
+    const byQuery = filterEntries(index, { query: 'BEV' }).map((e) => e.variant.sku);
+    expect(byQuery).toEqual(
+      index.entries.map((e) => e.variant.sku).filter((sku) => sku.startsWith('BEV')),
+    );
+  });
+
+  it('returns a frozen array, like every other query here', () => {
+    const index = menuIndex();
+    expect(Object.isFrozen(filterEntries(index, { categoryId: COFFEE }))).toBe(true);
+  });
+
+  it('does not mutate the index it was given', () => {
+    const index = menuIndex();
+    const before = JSON.stringify(index.entries.map((e) => e.variant.sku));
+    filterEntries(index, { categoryId: COFFEE, query: 'LATTE' });
+    expect(JSON.stringify(index.entries.map((e) => e.variant.sku))).toBe(before);
   });
 });
 

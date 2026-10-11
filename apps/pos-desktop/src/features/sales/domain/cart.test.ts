@@ -12,6 +12,7 @@ import {
   findItem,
   isEmpty,
   lineCount,
+  quantitiesByVariant,
   removeItem,
   totalUnits,
   updateQuantity,
@@ -332,6 +333,69 @@ describe('purity', () => {
     const a = addItem(createCart(), LATTE, 2n, Money.fromSatang(4550n), ID_1);
     const b = addItem(createCart(), LATTE, 2n, Money.fromSatang(4550n), ID_1);
     expect(calculateSubtotal(a).equals(calculateSubtotal(b))).toBe(true);
+  });
+});
+
+describe('quantitiesByVariant', () => {
+  const MOCHA = variant('018f3c2a-0000-7000-8000-00000000000b', 'BEV-MOCHA', 'มอคค่า');
+  const LATTE_PRICE = Money.fromSatang(4550n);
+  const MOCHA_PRICE = Money.fromSatang(6000n);
+
+  it('is empty for an empty cart — not a map full of zeroes', () => {
+    // The grid treats an ABSENT entry as "none in the basket" and a zero as a
+    // value it has to suppress. A map pre-filled with every known variant at 0
+    // would make those two cases indistinguishable at the call site.
+    expect(quantitiesByVariant(createCart()).size).toBe(0);
+  });
+
+  it('keys by VARIANT id, which is what a grid tile knows', () => {
+    const cart = addItem(createCart(), LATTE, 2n, LATTE_PRICE, ID_1);
+    const quantities = quantitiesByVariant(cart);
+
+    // Keyed by `item.variant.id`, NOT by the line id — a tile has never heard of
+    // a cart line id, so a map keyed by it would answer nothing useful.
+    expect(quantities.get(LATTE.id)).toBe(2n);
+    expect(quantities.get(ID_1)).toBeUndefined();
+  });
+
+  it('merges repeat additions of one variant into the single quantity', () => {
+    // `addItem` merges on repeat, so there is one LINE — and this asserts the
+    // map still reports the summed quantity rather than the last one written.
+    let cart = addItem(createCart(), LATTE, 2n, LATTE_PRICE, ID_1);
+    cart = addItem(cart, LATTE, 3n, LATTE_PRICE, ID_2);
+
+    expect(cart.items).toHaveLength(1);
+    expect(quantitiesByVariant(cart).get(LATTE.id)).toBe(5n);
+  });
+
+  it('holds one entry per variant, with two variants side by side', () => {
+    let cart = addItem(createCart(), LATTE, 1n, LATTE_PRICE, ID_1);
+    cart = addItem(cart, MOCHA, 4n, MOCHA_PRICE, ID_2);
+
+    const quantities = quantitiesByVariant(cart);
+    expect(quantities.size).toBe(2);
+    expect(quantities.get(LATTE.id)).toBe(1n);
+    expect(quantities.get(MOCHA.id)).toBe(4n);
+  });
+
+  it('agrees with totalUnits, summed over its own entries', () => {
+    // The map and the count are two answers to "how much is in the basket". If
+    // they could disagree, a tile badged ×2 beside a header saying 1 รายการ
+    // would be on screen with no way to tell which was wrong.
+    let cart = addItem(createCart(), LATTE, 3n, LATTE_PRICE, ID_1);
+    cart = addItem(cart, MOCHA, 4n, MOCHA_PRICE, ID_2);
+
+    const summed = [...quantitiesByVariant(cart).values()].reduce((a, b) => a + b, 0n);
+    expect(summed).toBe(totalUnits(cart));
+  });
+
+  it('returns a frozen map, so a caller cannot add a phantom line', () => {
+    // `readonly` is erased at runtime; the freeze is what actually prevents a
+    // view from writing a quantity for a variant the cart does not hold.
+    const quantities = quantitiesByVariant(
+      addItem(createCart(), LATTE, 1n, LATTE_PRICE, ID_1),
+    );
+    expect(Object.isFrozen(quantities)).toBe(true);
   });
 });
 

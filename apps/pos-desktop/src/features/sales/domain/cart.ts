@@ -195,6 +195,36 @@ export function findItem(cart: Cart, itemId: UuidV7): CartItem | undefined {
   return cart.items.find((item) => item.id === itemId);
 }
 
+/**
+ * How many units of each VARIANT the cart holds.
+ *
+ * WHY BY VARIANT AND NOT BY LINE ID: the grid needs to badge a tile with "how many
+ * of this item is already in the basket", and the grid knows a variant — it has
+ * never heard of a line id. `addItem` merges on repeat (`cart.ts` guarantees one
+ * line per variant), so a variant id is a TOTAL key here: there is never a second
+ * line for the same variant whose quantity would be lost to a `Map.set`.
+ *
+ * WHY IT LIVES HERE AND NOT IN THE VIEW: this is the same question
+ * `totalUnits` answers — how much of what is in the basket — asked per variant
+ * instead of summed, and it is answered from the one basket rather than from
+ * whatever the component happened to be counting. A view that built this map from
+ * `cart.items` itself would be a second implementation of the merge rule, which
+ * is the class of bug the layer guard exists to prevent.
+ *
+ * Frozen: `readonly` is erased at runtime, so the freeze is what actually stops
+ * a caller adding a line to a map describing a cart that does not contain it.
+ */
+export function quantitiesByVariant(cart: Cart): ReadonlyMap<UuidV7, bigint> {
+  const quantities = new Map<UuidV7, bigint>();
+  for (const item of cart.items) {
+    // `?? 0n` rather than a read-modify-write: a map already holding this
+    // variant means `addItem` merged, so summing is correct and a missing
+    // entry means first sight of it. Both fall out of `?? 0n`.
+    quantities.set(item.variant.id, (quantities.get(item.variant.id) ?? 0n) + item.quantity);
+  }
+  return Object.freeze(quantities);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Line totals
 // ─────────────────────────────────────────────────────────────────────────────

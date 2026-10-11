@@ -414,6 +414,43 @@ function satangToWire(value: bigint): string {
 }
 
 /**
+ * Terminal identity from the native command.
+ *
+ * `get_terminal_identity` reads `WAL_ASRI_TERMINAL_ID` and `WAL_ASRI_BRANCH_ID`
+ * from the process environment. Both must be set and be valid UUIDv7s, or the
+ * command fails with `kind: "invalidPayload"`. There is NO fallback — an unset
+ * or malformed variable is an error that surfaces to the UI.
+ *
+ * @throws OfflineOrdersError with the command's message when the terminal is not configured.
+ */
+export interface TerminalIdentityWire {
+  readonly terminalId: string;
+  readonly branchId: string;
+}
+
+export async function getTerminalIdentity(): Promise<TerminalIdentityWire> {
+  const raw: unknown = await invoke('get_terminal_identity');
+
+  if (raw === null || typeof raw !== 'object') {
+    throw new OfflineOrdersError(
+      `get_terminal_identity must return an object, received ${JSON.stringify(raw)}`,
+    );
+  }
+
+  const wire = raw as Record<string, unknown>;
+
+  if ('kind' in wire && wire.kind === 'invalidPayload') {
+    const message = typeof wire.message === 'string' ? wire.message : 'terminal not configured';
+    throw new OfflineOrdersError(message);
+  }
+
+  return Object.freeze({
+    terminalId: requiredString('terminalId', wire.terminalId),
+    branchId: requiredString('branchId', wire.branchId),
+  });
+}
+
+/**
  * Build a wire payload from domain checkout figures.
  *
  * Separated from `saveOfflineOrder` so the mapping is testable WITHOUT a Tauri

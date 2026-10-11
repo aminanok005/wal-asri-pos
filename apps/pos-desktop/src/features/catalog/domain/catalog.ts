@@ -502,3 +502,69 @@ export function entriesInCategory(
 ): readonly CatalogEntry[] {
   return Object.freeze(index.entries.filter((entry) => entry.categoryId === categoryId));
 }
+
+/**
+ * Two narrowing questions asked together: which category, and which text.
+ *
+ * WHY THIS IS DOMAIN AND NOT A COMPONENT: both are decisions about WHICH rows a
+ * cashier may sell, made against the same resolved index `buildCatalog` produced.
+ * A view that filtered `index.entries` itself would be a second place that could
+ * disagree with the other about what is sellable — and the disagreement would be
+ * invisible, because both filters would still render a plausible-looking grid.
+ *
+ * THE TWO FILTERS ARE INDEPENDENT, AND BOTH ARE OPTIONAL
+ *
+ * `categoryId` keeps `entriesInCategory`'s exact three-state contract so the two
+ * functions cannot drift: `undefined` means NO category filter, and `null` means
+ * the uncategorised bucket — a real bucket, not "no filter". Collapsing `null` into
+ * `undefined` here would be a silent behaviour change for the one caller that asks
+ * for it.
+ *
+ * `query` matches `name_th` AND `sku`, case-insensitively. The SKU is included
+ * because a barcode scan and a shelf label both speak SKU while a customer speaks
+ * name, and a search box that only understood Thai names would answer half the
+ * question the person typing it is asking.
+ *
+ * NO SORTING, for the reason `buildCatalog` gives: `index.entries` is the order
+ * the server chose, and re-ordering the grid as a cashier types would make tiles
+ * jump around under their own hands.
+ */
+export function filterEntries(
+  index: CatalogIndex,
+  filters: {
+    /**
+     * `undefined` = no category filter. `null` = the uncategorised bucket.
+     *
+     * SPELLED `| undefined` EXPLICITLY, not left to the implicit optional. The
+     * repo compiles with `exactOptionalPropertyTypes`, where an omitted `?:
+     * T` forbids assigning `undefined` — so a caller whose filter state is
+     * genuinely "no category chosen" (a tab, a state variable) could not pass it
+     * at all, and would have to branch into two call shapes. Here `undefined` is
+     * a REAL third state rather than an absence, so the type has to admit it.
+     */
+    readonly categoryId?: UuidV7 | null | undefined;
+    /** Case-insensitive substring. Absent, empty or whitespace-only = no text filter. */
+    readonly query?: string;
+  } = {},
+): readonly CatalogEntry[] {
+  const { categoryId, query } = filters;
+
+  // Trimmed ONCE, and the trimmed form is what `includes` tests: a cashier who
+  // types a space by accident should see the unfiltered menu, not nothing.
+  const needle = (query ?? '').trim().toLowerCase();
+
+  return Object.freeze(
+    index.entries.filter((entry) => {
+      if (categoryId !== undefined && entry.categoryId !== categoryId) {
+        return false;
+      }
+      if (needle.length === 0) {
+        return true;
+      }
+      return (
+        entry.variant.name_th.toLowerCase().includes(needle) ||
+        entry.variant.sku.toLowerCase().includes(needle)
+      );
+    }),
+  );
+}

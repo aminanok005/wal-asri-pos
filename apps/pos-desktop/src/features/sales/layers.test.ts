@@ -57,8 +57,13 @@ describe('sales feature layer boundary', () => {
     // The UI must not keep a parallel item list in component state.
     expect(source).not.toMatch(/useState<[^>]*\[\]/);
     expect(source).not.toMatch(/setItems/);
-    // The subtotal on screen must come from the domain function.
-    expect(source).toMatch(/calculateSubtotal/);
+    // Every money figure the panel DOES show must come from the domain. The
+    // basket lists lines and their totals; the ORDER total was moved out to the
+    // checkout breakdown, so `calculateSubtotal` is no longer called here — and
+    // `calculateLineTotal` is what stands behind each row instead. A UI that
+    // started multiplying quantities by prices itself would fail here.
+    expect(source).toMatch(/calculateLineTotal/);
+    expect(source).not.toMatch(/calculateSubtotal/);
   });
 
   // ── tax.ts ────────────────────────────────────────────────────────────────
