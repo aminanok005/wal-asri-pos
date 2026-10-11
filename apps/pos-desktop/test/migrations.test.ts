@@ -65,6 +65,7 @@ const MIGRATION_SQL: string = [
   '0001_init.sql',
   '0002_signed_rounding.sql',
   '0003_stock_balances.sql',
+  '0004_local_recipes.sql',
 ]
   .map((file) => readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
   .join('\n');
@@ -293,7 +294,7 @@ describe('0001_init.sql — schema objects', () => {
     // This must stay in step with `LATEST_VERSION` in `src/migrate.rs` — if it
     // drifts, `src/migrate.rs`'s refusal to open a database from a NEWER
     // terminal starts firing on this build's own database.
-    expect(row?.user_version).toBe(3);
+    expect(row?.user_version).toBe(4);
   });
 
   it('agrees with LATEST_VERSION in the Rust migration runner', () => {
@@ -1723,8 +1724,8 @@ describe('0003_stock_balances.sql — the local stock cache', () => {
     expect(row.synced_at).toBe(NOW);
   });
 
-  it('bumps user_version to 3, so an upgraded terminal is recorded as upgraded', () => {
+  it('bumps user_version to 4, so an upgraded terminal is recorded as upgraded', () => {
     const version = db.prepare('PRAGMA user_version').get() as { user_version: number };
-    expect(version.user_version).toBe(3);
+    expect(version.user_version).toBe(4);
   });
 });

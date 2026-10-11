@@ -136,9 +136,11 @@ fn start_sync_drain(app: &tauri::AppHandle) {
 
     // 3. Create sink with VALIDATED identity
     let terminal_id = identity.terminal_id.clone();
+    let branch_id = identity.branch_id.clone();
     let sink = std::sync::Arc::new(sync_http::HttpBatchSink::new(sync_http::SyncConfig::new(
         base_url.trim(),
         terminal_id.clone(), // guaranteed UUIDv7
+        branch_id.clone(), // guaranteed UUIDv7
     )));
 
     log::info!(target: "sync_outbox", "offline outbox drain starting (terminal={})", terminal_id);

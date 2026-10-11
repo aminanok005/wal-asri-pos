@@ -65,6 +65,10 @@ pub struct SyncConfig {
   pub base_url: String,
   /// Client-asserted; the contract notes it is UNVERIFIED in this revision.
   pub terminal_id: String,
+  /// The branch this terminal serves. Carried in the `X-Branch-Id` header so
+  /// the server can scope the push to one branch's outbox without trusting
+  /// the client to put it in the body.
+  pub branch_id: String,
   /// Ceiling on one whole request, not per byte. A café uplink that has died
   /// silently is indistinguishable from a slow one, and a drain that blocks
   /// forever holds the connection mutex that every checkout command needs.
@@ -74,8 +78,8 @@ pub struct SyncConfig {
 impl SyncConfig {
   /// A config with a 10-second ceiling — long enough for a congested café
   /// uplink, short enough that a dead one is noticed well inside a shift.
-  pub fn new(base_url: impl Into<String>, terminal_id: impl Into<String>) -> Self {
-    Self { base_url: base_url.into(), terminal_id: terminal_id.into(), timeout: Duration::from_secs(10) }
+  pub fn new(base_url: impl Into<String>, terminal_id: impl Into<String>, branch_id: impl Into<String>) -> Self {
+    Self { base_url: base_url.into(), terminal_id: terminal_id.into(), branch_id: branch_id.into(), timeout: Duration::from_secs(10) }
   }
 
   fn push_url(&self) -> String {
@@ -226,6 +230,8 @@ impl HttpBatchSink {
       .post(&self.config.push_url())
       .header("Content-Type", "application/json")
       .header(IDEMPOTENCY_KEY_HEADER, &key)
+      .header("X-Terminal-Id", &self.config.terminal_id)
+      .header("X-Branch-Id", &self.config.branch_id)
       .send_json(&request)
     {
       Ok(response) => response,
@@ -303,6 +309,8 @@ mod tests {
     path: String,
     idempotency_key: Option<String>,
     content_type: Option<String>,
+    terminal_id_header: Option<String>,
+    branch_id_header: Option<String>,
     body: String,
   }
 
@@ -378,6 +386,8 @@ mod tests {
       match name.to_ascii_lowercase().as_str() {
         "content-length" => content_length = value.trim().parse().unwrap_or(0),
         "idempotency-key" => captured.idempotency_key = Some(value.trim().to_string()),
+        "x-terminal-id" => captured.terminal_id_header = Some(value.trim().to_string()),
+        "x-branch-id" => captured.branch_id_header = Some(value.trim().to_string()),
         "content-type" => captured.content_type = Some(value.trim().to_string()),
         _ => {}
       }
@@ -445,7 +455,7 @@ mod tests {
                      {"id":"b","outcome":"duplicate","error_message":null}],
           "applied":1,"duplicates":1,"rejected":0,"pushed_at":"2026-10-05T12:00:00Z"}"#,
     );
-    let sink = HttpBatchSink::new(SyncConfig::new(server.url(), "terminal-1"));
+    let sink = HttpBatchSink::new(SyncConfig::new(server.url(), "terminal-1", "branch-1"));
 
     let outcome = sink.push(&[event(1, "a", "ka"), event(2, "b", "kb")]);
 
@@ -468,7 +478,7 @@ mod tests {
       r#"{"results":[{"id":"a","outcome":"rejected","error_message":"payload is not an order"}],
           "applied":0,"duplicates":0,"rejected":1,"pushed_at":"2026-10-05T12:00:00Z"}"#,
     );
-    let sink = HttpBatchSink::new(SyncConfig::new(server.url(), "terminal-1"));
+    let sink = HttpBatchSink::new(SyncConfig::new(server.url(), "terminal-1", "branch-1"));
 
     match sink.push(&[event(1, "a", "ka")]) {
       BatchOutcome::Processed(results) => {
@@ -490,7 +500,7 @@ mod tests {
       r#"{"results":[{"id":"a","outcome":"quantum_superposition","error_message":null}],
           "applied":0,"duplicates":0,"rejected":0,"pushed_at":"2026-10-05T12:00:00Z"}"#,
     );
-    let sink = HttpBatchSink::new(SyncConfig::new(server.url(), "terminal-1"));
+    let sink = HttpBatchSink::new(SyncConfig::new(server.url(), "terminal-1", "branch-1"));
 
     match sink.push(&[event(1, "a", "ka")]) {
       // An EMPTY result list, not one fabricated entry.
@@ -503,7 +513,7 @@ mod tests {
   #[test]
   fn a_500_is_retryable_and_carries_the_servers_stable_code() {
     let server = FakeServer::once(500, r#"{"code":"internal_error","message":"upstream down"}"#);
-    let sink = HttpBatchSink::new(SyncConfig::new(server.url(), "terminal-1"));
+    let sink = HttpBatchSink::new(SyncConfig::new(server.url(), "terminal-1", "branch-1"));
 
     match sink.push(&[event(1, "a", "ka")]) {
       BatchOutcome::Retryable { reason } => {
@@ -518,7 +528,7 @@ mod tests {
   #[test]
   fn a_400_is_a_refusal_not_a_retryable_failure() {
     let server = FakeServer::once(400, r#"{"code":"idempotency_key_required","message":"missing"}"#);
-    let sink = HttpBatchSink::new(SyncConfig::new(server.url(), "terminal-1"));
+    let sink = HttpBatchSink::new(SyncConfig::new(server.url(), "terminal-1", "branch-1"));
 
     match sink.push(&[event(1, "a", "ka")]) {
       BatchOutcome::Refused { reason } => assert!(reason.contains("idempotency_key_required"), "got {reason}"),
@@ -536,7 +546,7 @@ mod tests {
       let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
       listener.local_addr().expect("addr").port()
     };
-    let sink = HttpBatchSink::new(SyncConfig::new(format!("http://127.0.0.1:{port}"), "terminal-1"));
+    let sink = HttpBatchSink::new(SyncConfig::new(format!("http://127.0.0.1:{port}"), "terminal-1", "branch-1"));
 
     match sink.push(&[event(1, "a", "ka")]) {
       BatchOutcome::Retryable { reason } => assert!(!reason.is_empty()),
@@ -548,7 +558,7 @@ mod tests {
   #[test]
   fn a_200_with_an_unreadable_body_is_retried_not_trusted() {
     let server = FakeServer::once(200, "{not json at all");
-    let sink = HttpBatchSink::new(SyncConfig::new(server.url(), "terminal-1"));
+    let sink = HttpBatchSink::new(SyncConfig::new(server.url(), "terminal-1", "branch-1"));
 
     match sink.push(&[event(1, "a", "ka")]) {
       BatchOutcome::Retryable { .. } => {}
@@ -565,7 +575,7 @@ mod tests {
   #[test]
   fn the_request_matches_the_contract_exactly() {
     let server = FakeServer::once(200, r#"{"results":[],"applied":0,"duplicates":0,"rejected":0,"pushed_at":"2026-10-05T12:00:00Z"}"#);
-    let sink = HttpBatchSink::new(SyncConfig::new(server.url(), "terminal-7"));
+    let sink = HttpBatchSink::new(SyncConfig::new(server.url(), "terminal-7", "branch-1"));
 
     sink.push(&[event(1, "a", "ka")]);
     let captured = server.finish();
@@ -577,6 +587,8 @@ mod tests {
       Some(batch_key("terminal-7", &[event(1, "a", "ka")]).as_str()),
       "the batch key must be in the header"
     );
+    assert_eq!(captured.terminal_id_header.as_deref(), Some("terminal-7"));
+    assert_eq!(captured.branch_id_header.as_deref(), Some("branch-1"));
     assert!(captured.content_type.unwrap_or_default().contains("application/json"));
 
     let body: serde_json::Value = serde_json::from_str(&captured.body).expect("body is JSON");
@@ -600,7 +612,7 @@ mod tests {
   #[test]
   fn commands_are_sent_in_outbox_sequence_order() {
     let server = FakeServer::once(200, r#"{"results":[],"applied":0,"duplicates":0,"rejected":0,"pushed_at":"2026-10-05T12:00:00Z"}"#);
-    let sink = HttpBatchSink::new(SyncConfig::new(server.url(), "terminal-1"));
+    let sink = HttpBatchSink::new(SyncConfig::new(server.url(), "terminal-1", "branch-1"));
 
     sink.push(&[event(1, "a", "ka"), event(2, "b", "kb"), event(3, "c", "kc")]);
     let captured = server.finish();
@@ -619,7 +631,7 @@ mod tests {
   /// An empty batch must not open a socket at all.
   #[test]
   fn an_empty_batch_is_a_no_op() {
-    let sink = HttpBatchSink::new(SyncConfig::new("http://127.0.0.1:1", "terminal-1"));
+    let sink = HttpBatchSink::new(SyncConfig::new("http://127.0.0.1:1", "terminal-1", "branch-1"));
     assert_eq!(sink.push(&[]), BatchOutcome::Processed(Vec::new()));
   }
 
@@ -697,7 +709,7 @@ mod tests {
       r#"{"results":[{"id":"a","outcome":"applied"},{"id":"b","outcome":"applied"}],
           "applied":2,"duplicates":0,"rejected":0,"pushed_at":"2026-10-05T12:00:00Z"}"#,
     );
-    let sink = HttpBatchSink::new(SyncConfig::new(server.url(), "terminal-1"));
+    let sink = HttpBatchSink::new(SyncConfig::new(server.url(), "terminal-1", "branch-1"));
     let mut conn = db();
 
     let a = enqueue(&conn, "a", "ka");
@@ -723,7 +735,7 @@ mod tests {
                      {"id":"bad","outcome":"rejected","error_message":"payload is not an order"}],
           "applied":1,"duplicates":0,"rejected":1,"pushed_at":"2026-10-05T12:00:00Z"}"#,
     );
-    let sink = HttpBatchSink::new(SyncConfig::new(server.url(), "terminal-1"));
+    let sink = HttpBatchSink::new(SyncConfig::new(server.url(), "terminal-1", "branch-1"));
     let mut conn = db();
 
     let ok = enqueue(&conn, "ok", "k-ok");
@@ -749,7 +761,7 @@ mod tests {
   #[test]
   fn a_500_returns_every_row_to_pending_and_leaves_none_in_flight() {
     let server = FakeServer::once(500, r#"{"code":"internal_error","message":"upstream down"}"#);
-    let sink = HttpBatchSink::new(SyncConfig::new(server.url(), "terminal-1"));
+    let sink = HttpBatchSink::new(SyncConfig::new(server.url(), "terminal-1", "branch-1"));
     let mut conn = db();
 
     let a = enqueue(&conn, "a", "ka");
@@ -778,7 +790,7 @@ mod tests {
       let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
       listener.local_addr().expect("addr").port()
     };
-    let sink = HttpBatchSink::new(SyncConfig::new(format!("http://127.0.0.1:{port}"), "terminal-1"));
+    let sink = HttpBatchSink::new(SyncConfig::new(format!("http://127.0.0.1:{port}"), "terminal-1", "branch-1"));
     let mut conn = db();
 
     let a = enqueue(&conn, "a", "ka");
@@ -797,7 +809,7 @@ mod tests {
       let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
       listener.local_addr().expect("addr").port()
     };
-    let failing = HttpBatchSink::new(SyncConfig::new(format!("http://127.0.0.1:{dead}"), "terminal-1"));
+    let failing = HttpBatchSink::new(SyncConfig::new(format!("http://127.0.0.1:{dead}"), "terminal-1", "branch-1"));
     let mut conn = db();
 
     let a = enqueue(&conn, "a", "idem-a");
@@ -811,7 +823,7 @@ mod tests {
       r#"{"results":[{"id":"a","outcome":"duplicate"}],
           "applied":0,"duplicates":1,"rejected":0,"pushed_at":"2026-10-05T12:05:00Z"}"#,
     );
-    let working = HttpBatchSink::new(SyncConfig::new(server.url(), "terminal-1"));
+    let working = HttpBatchSink::new(SyncConfig::new(server.url(), "terminal-1", "branch-1"));
 
     // The row only becomes due again once `next_attempt_at` has passed, which is
     // what proves attempt 1 actually rescheduled it rather than dropping it.
