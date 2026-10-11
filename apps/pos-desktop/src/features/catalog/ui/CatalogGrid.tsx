@@ -31,6 +31,7 @@ import type { JSX } from 'react';
 
 import { entriesInCategory } from '../domain/catalog';
 import type { CatalogEntry, CatalogIndex, UuidV7 } from '../domain/catalog';
+import type { Product } from '../domain/catalog';
 import { Money } from '../../payments/domain/money';
 // A VALUE import: the media span renders the glyph this returns. Presentation,
 // like everything else in this component — see `emoji.ts` for why the mapping
@@ -114,6 +115,15 @@ export interface CatalogGridProps {
    * worse failure than a documented precedence.
    */
   readonly entries?: readonly CatalogEntry[];
+  /**
+   * Product lookup by product id, for rendering recipe badges.
+   *
+   * KEYED BY PRODUCT ID — the `Product.id` from the catalog snapshot. When
+   * provided, tiles whose variant's product has a `recipe_id` will show a
+   * recipe component preview badge. Optional: when omitted or when a variant's
+   * product is not in the map, no recipe badge is rendered.
+   */
+  readonly products?: ReadonlyMap<UuidV7, Product>;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -180,6 +190,7 @@ export function CatalogGrid(props: CatalogGridProps): JSX.Element {
     onSelect,
     categoryId,
     quantities,
+    products,
     entries: entriesOverride,
     hideWithheldWarning = false,
   } = props;
@@ -229,6 +240,11 @@ export function CatalogGrid(props: CatalogGridProps): JSX.Element {
             // badge, so "none" never has to be distinguished from "zero".
             const inBasket = quantities?.get(entry.variant.id) ?? 0n;
 
+            // Look up the product for this variant to check for recipe_id.
+            // The variant carries `product_id`; the products map is keyed by product id.
+            const product = products?.get(entry.variant.product_id);
+            const hasRecipe = product?.recipe_id !== null && product?.recipe_id !== undefined;
+
             return (
               <li key={entry.variant.id} className="catalog-grid__tile">
                 {/* The accessible name is the item's name and nothing else. A screen
@@ -274,6 +290,20 @@ export function CatalogGrid(props: CatalogGridProps): JSX.Element {
                   {inBasket > 0n && (
                     <span className="catalog-grid__tile-badge" aria-hidden="true">
                       {`×${inBasket.toString()}`}
+                    </span>
+                  )}
+
+                  {/* Recipe component preview badge — shows when the product has a
+                      recipe_id, indicating ingredient/allergen info is available.
+                      Uses the warning token (brown-orange) to avoid clashing with
+                      the accent-coloured quantity badge and the pay button flow. */}
+                  {hasRecipe && (
+                    <span
+                      className="catalog-grid__tile-recipe-badge"
+                      aria-label="มีข้อมูลสูตรผสมและสารก่อภูมิแพ้"
+                      aria-hidden="false"
+                    >
+                      📋
                     </span>
                   )}
 

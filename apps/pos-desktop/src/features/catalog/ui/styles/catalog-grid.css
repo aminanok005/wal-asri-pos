@@ -224,6 +224,36 @@
   z-index: 1;
 }
 
+/*
+ * Recipe component preview badge — top-left of the colour panel.
+ *
+ * Shows when the product has a `recipe_id`, indicating ingredient/allergen
+ * info is available. Uses the warning token (brown-orange `--warn`) to avoid
+ * clashing with the accent-coloured quantity badge and the pay button flow.
+ * The emoji glyph is the content; the badge itself is a coloured circle.
+ * Minimum 48px touch target is not required as this is not interactive,
+ * but the glyph is sized for visibility.
+ */
+.catalog-grid__tile-recipe-badge {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: var(--warn);
+  color: var(--on-acc);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  line-height: 1;
+  box-shadow: var(--shadow-1);
+  /* Card-coloured ring for separation from the gradient panel. */
+  border: 2px solid var(--card);
+  z-index: 1;
+}
+
 /* The text block under the panel. Name on top, price beside the SKU's weight,
    SKU last and quietest — the order a cashier reads them in. */
 .catalog-grid__tile-body {
