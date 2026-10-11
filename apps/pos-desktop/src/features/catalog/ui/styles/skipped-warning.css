@@ -1,0 +1,103 @@
+/*
+ * SkippedWarning — the chip, and the popover it opens.
+ *
+ * COLOUR: existing tokens only, deliberately. `--warn` on `--warns` measures
+ * 4.31:1 in the light theme, which is short of AA for 13px text, so:
+ *
+ *   · the LABEL wears `--danger` — 4.68:1 light, 5.21:1 dark, both clear AA;
+ *   · `--warn` is left for the border and the ⚠, where the 3:1 non-text rule
+ *     applies and it measures 4.31:1 on `--warns` and 4.80:1 on `--card`.
+ *
+ * No new token was added for this, and none was needed: the warning already had
+ * a colour, it just had none that passed at text size.
+ */
+
+.skipped-warning {
+  position: relative;
+  /* Never grows: the search field holds `flex: 1`, and this chip sits after it
+     claiming only the width its label needs. */
+  flex: none;
+}
+
+.skipped-warning__chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: var(--tap);
+  padding: 0 14px;
+  border: 1px solid var(--warn);
+  border-radius: 999px;
+  background: var(--warns);
+  color: var(--danger);
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: box-shadow 0.15s ease, border-color 0.15s ease;
+}
+
+.skipped-warning__chip:focus-visible {
+  outline: 2px solid var(--warn);
+  outline-offset: 2px;
+}
+
+/* The ring grows rather than the button, so opening the popover cannot nudge the
+   search field sideways — a layout that moved under the tap would be worse than
+   the warning it reports. */
+.skipped-warning__chip[aria-expanded='true'] {
+  border-color: var(--danger);
+  box-shadow: 0 0 0 3px var(--warns);
+}
+
+.skipped-warning__chip-icon {
+  font-size: 14px;
+  line-height: 1;
+}
+
+.skipped-warning__chip-label {
+  font-variant-numeric: tabular-nums;
+}
+
+/* ALWAYS IN THE DOM, in both states.
+ *
+ * OPEN: a popover hanging under the chip, over the tabs and the first row of
+ * tiles. `position: absolute` so opening it never reflows the menu beneath it —
+ * a grid that jumps the moment someone reads a warning is a grid people stop
+ * trusting.
+ */
+.skipped-warning__detail {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 20;
+  box-sizing: border-box;
+  margin: 0;
+  padding: 10px 12px;
+  width: max-content;
+  max-width: 340px;
+  border: 1px solid var(--warn);
+  border-radius: 12px;
+  background: var(--card);
+  color: var(--ink);
+  font-size: 13px;
+  line-height: 1.5;
+  box-shadow: var(--shadow-2);
+}
+
+/* CLOSED: clipped to nothing, NOT removed.
+ *
+ * This is the whole reason the paragraph is still mounted. A screen reader keeps
+ * announcing the sentence whether or not anyone has tapped the chip, and
+ * `role="status"` keeps matching while collapsed — which `hidden` or a detached
+ * node would silently undo.
+ */
+.skipped-warning[data-open='false'] .skipped-warning__detail {
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}

@@ -107,6 +107,7 @@ async function flush(): Promise<void> {
 async function renderView(props: {
   readonly repository: OfflineOrdersRepository;
   readonly limit?: number;
+  readonly onGoToSales?: () => void;
 }): Promise<void> {
   render(<OfflineOrdersView {...props} />);
   await flush();
@@ -615,20 +616,47 @@ describe('OfflineOrdersView — money on the row', () => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe('OfflineOrdersView — a read-only screen', () => {
-  it('renders no interactive control, and a tap on a row changes nothing', async () => {
+  it('makes no ROW interactive, and a tap on a row changes nothing', async () => {
     await renderView({ repository: createInMemoryOfflineOrdersRepository(SHIFT) });
 
     // Every action on an offline order is an outbox write (SKILL.md §2.2) and
     // this screen has no way to perform one. A row that had quietly become a
     // button would be an affordance the port cannot honour — and a mis-tap here
     // is the one thing that must never be able to void a sale.
-    expect(within(view()).queryAllByRole('button')).toHaveLength(0);
+    //
+    // THE CLAIM IS NOW ABOUT ROWS, NOT THE WHOLE SCREEN. The sync chips are real
+    // buttons — they filter what is already loaded — and "no button anywhere"
+    // would have become false the moment the screen became usable. What must
+    // stay true is that none of the buttons belongs to a row.
     expect(within(view()).queryAllByRole('link')).toHaveLength(0);
+    expect(within(view()).queryAllByRole('button', { name: /R-1001/ })).toHaveLength(0);
+    expect(within(view()).queryAllByRole('button', { name: /R-1002/ })).toHaveLength(0);
+
+    for (const row of rows()) {
+      expect(within(row).queryAllByRole('button')).toHaveLength(0);
+    }
 
     const before = rowText('R-1001');
     fireEvent.click(rowFor('R-1001'));
     expect(rowText('R-1001')).toBe(before);
     expect(rows()).toHaveLength(3);
+  });
+
+  it('offers ONLY the four sync filters as controls — no sync button, no clock', async () => {
+    await renderView({ repository: createInMemoryOfflineOrdersRepository(SHIFT) });
+
+    // Exactly four buttons, one per rung of `SyncState` — which is what makes
+    // "a fifth control appeared" a failing assertion rather than something to
+    // notice by eye.
+    const buttons = within(view()).getAllByRole('button');
+    expect(buttons).toHaveLength(ALL_SYNC_STATES.length);
+
+    // Deliberately ABSENT, and asserted by name so a future author has to delete
+    // this line to add them: both need a backend that does not exist yet. When
+    // a push last succeeded, and whether one is running, are questions only the
+    // server can answer — a button that cannot reach it is worse than none.
+    expect(view().textContent).not.toContain('ซิงก์ตอนนี้');
+    expect(view().textContent).not.toContain('ซิงก์ล่าสุด');
   });
 
   it('names itself and heads itself in Thai, matching the nav label', async () => {
@@ -684,5 +712,191 @@ describe('OfflineOrdersView — a late response never reaches a dead tree', () =
     });
 
     expect(screen.queryByTestId('offline-orders')).toBeNull();
+  });
+});
+// ─────────────────────────────────────────────────────────────────────────────
+// 9. The chips filter, and the empty state works
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** The chip for one sync rung, found the way a person would: by its Thai label. */
+function chip(syncState: SyncState): HTMLElement {
+  return within(view()).getByRole('button', { name: new RegExp(THAI_SYNC_LABELS[syncState]) });
+}
+
+/** Every receipt number currently on screen, in order. */
+function receiptNumbers(): string[] {
+  return rows().map((row) => row.querySelector('.offline-orders__row-receipt')?.textContent ?? '');
+}
+
+describe('OfflineOrdersView — the sync chips filter the list', () => {
+  it('starts with nothing pressed, showing the whole page', async () => {
+    await renderView({ repository: createInMemoryOfflineOrdersRepository(SHIFT) });
+
+    for (const syncState of ALL_SYNC_STATES) {
+      expect(chip(syncState).getAttribute('aria-pressed')).toBe('false');
+    }
+    expect(rows()).toHaveLength(3);
+  });
+
+  it('narrows the list to the pressed rung and marks the chip pressed', async () => {
+    await renderView({ repository: createInMemoryOfflineOrdersRepository(SHIFT) });
+
+    fireEvent.click(chip('pending'));
+
+    expect(chip('pending').getAttribute('aria-pressed')).toBe('true');
+    expect(chip('synced').getAttribute('aria-pressed')).toBe('false');
+    expect(receiptNumbers()).toEqual(['R-1002']);
+  });
+
+  it('combines rungs, because a shift lead wants conflicts AND rejections', async () => {
+    await renderView({ repository: createInMemoryOfflineOrdersRepository(SHIFT) });
+
+    fireEvent.click(chip('synced'));
+    expect(receiptNumbers()).toEqual(['R-1001']);
+
+    // Additive, not a swap: a single-select control would make this second press
+    // TRADE one rung for the other and the cashier would never see both.
+    fireEvent.click(chip('rejected'));
+    // Sorted before comparing: the port returns newest-first, and filtering must
+    // PRESERVE the port's order rather than impose one. What is being asserted
+    // is which rows survive, not where they sit.
+    expect([...receiptNumbers()].sort()).toEqual(['R-1001', 'R-1003']);
+  });
+
+  it('pressing a chip again releases it', async () => {
+    await renderView({ repository: createInMemoryOfflineOrdersRepository(SHIFT) });
+
+    fireEvent.click(chip('pending'));
+    expect(rows()).toHaveLength(1);
+
+    fireEvent.click(chip('pending'));
+
+    expect(chip('pending').getAttribute('aria-pressed')).toBe('false');
+    expect(rows()).toHaveLength(3);
+  });
+
+  it('the chip counts describe the PAGE, so they do not move as you filter', async () => {
+    await renderView({ repository: createInMemoryOfflineOrdersRepository(SHIFT) });
+
+    const countOf = (s: SyncState): string =>
+      chip(s).querySelector('.offline-orders__sync-count')?.textContent ?? '';
+
+    expect(countOf('pending')).toBe('1');
+    expect(countOf('synced')).toBe('1');
+    expect(countOf('conflict')).toBe('0');
+
+    fireEvent.click(chip('pending'));
+
+    // Still 1. A chip that re-counted what it was showing would slide towards 0
+    // as it filtered, and the bar would stop being a summary of the terminal.
+    expect(countOf('pending')).toBe('1');
+    expect(countOf('synced')).toBe('1');
+    expect(countOf('conflict')).toBe('0');
+  });
+
+  it('says so when a filter matches nothing, and does NOT offer to leave', async () => {
+    await renderView({ repository: createInMemoryOfflineOrdersRepository(SHIFT) });
+
+    fireEvent.click(chip('conflict'));
+
+    expect(rows()).toHaveLength(0);
+    expect(screen.queryByTestId('offline-orders-empty')).toBeNull();
+
+    // The terminal HAS three orders; a chip is hiding them. Sending the cashier
+    // back to sales here would hide a screen that is working perfectly.
+    expect(
+      screen.queryByRole('button', { name: 'กลับไปหน้าขาย' }),
+    ).toBeNull();
+    expect(within(view()).getByText(/ไม่มีออเดอร์ในสถานะที่เลือก/)).toBeDefined();
+  });
+
+  it('never asks the port again — the filter runs on the page it already has', async () => {
+    let calls = 0;
+    const inner = createInMemoryOfflineOrdersRepository(SHIFT);
+    const counting: OfflineOrdersRepository = {
+      ...inner,
+      listRecent: (limit) => {
+        calls += 1;
+        return inner.listRecent(limit);
+      },
+    };
+
+    await renderView({ repository: counting });
+    expect(calls).toBe(1);
+
+    fireEvent.click(chip('pending'));
+    fireEvent.click(chip('rejected'));
+
+    // Three presses, still one read. A filter that re-queried would be a new
+    // request per chip press against a terminal that may be offline at all.
+    expect(calls).toBe(1);
+  });
+});
+
+describe('OfflineOrdersView — the empty state is usable', () => {
+  it('offers an icon, the sentence, a hint, and a way back', async () => {
+    await renderView({
+      repository: createInMemoryOfflineOrdersRepository([]),
+      onGoToSales: () => {},
+    });
+
+    const empty = screen.getByTestId('offline-orders-empty');
+    expect(within(empty).getByText('ยังไม่มีออเดอร์ที่บันทึกไว้ในเครื่องนี้')).toBeDefined();
+    expect(within(empty).getByText(/ออเดอร์ที่ขายขณะออฟไลน์จะแสดงที่นี่/)).toBeDefined();
+
+    // Decorative: the sentence already says everything the shape was saying, so
+    // announcing it too would read the same fact twice.
+    const icon = empty.querySelector('svg');
+    expect(icon).not.toBeNull();
+    expect(icon?.getAttribute('aria-hidden')).toBe('true');
+
+    expect(screen.getByRole('button', { name: 'กลับไปหน้าขาย' })).toBeDefined();
+  });
+
+  it('the way back actually goes back', async () => {
+    let went = 0;
+    await renderView({
+      repository: createInMemoryOfflineOrdersRepository([]),
+      onGoToSales: () => {
+        went += 1;
+      },
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'กลับไปหน้าขาย' }));
+
+    expect(went).toBe(1);
+  });
+
+  it('offers no dead button when the screen has nowhere to go', async () => {
+    // Rendered on its own — no shell, so no route to return to. A permanent
+    // button that does nothing is the one control here that could lie.
+    await renderView({ repository: createInMemoryOfflineOrdersRepository([]) });
+
+    expect(screen.getByTestId('offline-orders-empty')).not.toBeNull();
+    expect(screen.queryByRole('button', { name: 'กลับไปหน้าขาย' })).toBeNull();
+  });
+
+  it('keeps the loaded count for screen readers while hiding it from the eye', async () => {
+    await renderView({ repository: createInMemoryOfflineOrdersRepository(SHIFT) });
+
+    const summary = within(view()).getByRole('status');
+    expect(summary.textContent).toBe('โหลดออเดอร์ 3 รายการ');
+
+    // STILL A LIVE REGION AND STILL IN THE DOCUMENT. Clipped rather than removed
+    // is the whole point — `display: none` would have taken this out of the
+    // accessibility tree and silenced the one number a screen reader needs.
+    expect(summary.getAttribute('role')).toBe('status');
+    expect(summary.hasAttribute('hidden')).toBe(false);
+    expect(summary.getAttribute('style')).toBeNull();
+
+    // The clipping itself lives in a stylesheet, and `happy-dom` does not load
+    // the app's CSS — so the recipe is asserted where it is written rather than
+    // through a computed style that would be empty here regardless.
+    const css = await Bun.file(
+      new URL('../features/sales/ui/styles/offline-orders.css', import.meta.url),
+    ).text();
+    const rule = css.slice(css.indexOf('.offline-orders__summary {'));
+    expect(rule).toContain('clip-path: inset(50%)');
+    expect(rule).not.toContain('display: none');
   });
 });

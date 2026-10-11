@@ -12,21 +12,14 @@
  * A border in --acc rather than a solid fill: this warns the shift lead that the
  * menu is short, and must not compete with the pay button for attention.
  */
-.catalog-grid__warning {
-  margin: 0 0 14px;
-  padding: 10px 12px;
-  border: 1px solid var(--acc);
-  border-radius: 12px;
-  background: var(--card);
-  color: var(--ink);
-  font-size: 13px;
-  line-height: 1.5;
-}
+/* The withheld-items chip lives in `skipped-warning.css`, beside the search box
+   rather than across the top of this grid. `.catalog-grid__warning` is gone with
+   it — nothing here draws a warning any more. */
 
 .catalog-grid__tiles {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
-  gap: 12px;
+  grid-template-columns: repeat(auto-fill, minmax(165px, 1fr));
+  gap: 14px;
   margin: 0;
   padding: 0;
   list-style: none;
@@ -36,29 +29,210 @@
   display: flex;
 }
 
+/*
+ * The card. `position: relative` is what anchors the badge to the card rather than
+ * to the page, and `overflow: hidden` clips the gradient panel's corners to the
+ * card's own radius — without it the panel's top corners square off against a
+ * rounded card and the grid reads as a row of mismatched shapes.
+ */
 .catalog-grid__tile-button {
+  position: relative;
   display: flex;
   flex-direction: column;
-  align-items: flex-start;
-  gap: 4px;
+  align-items: stretch;
+  gap: 0;
   /* `flex: 1` + `width: 100%` makes every tile in a row the same height whatever
      its Thai name's length. */
   flex: 1;
   width: 100%;
   min-height: var(--tap);
-  padding: 12px;
+  /* No padding on the button: the gradient panel bleeds to the card edge, which is
+     the whole point of a panel. The BODY below carries its own padding. */
+  padding: 0;
   border: 1px solid var(--line);
-  border-radius: 14px;
+  border-radius: 18px;
   background: var(--card);
   color: var(--ink);
   font: inherit;
   text-align: start;
   cursor: pointer;
-  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  /* Resting elevation: a card, not a sticker. `--shadow-1` is the token's
+     lowest rung, so the grid reads as objects ON the page rather than holes
+     cut into it. */
+  box-shadow: var(--shadow-1);
+  /*
+   * `transform` IS listed here — a deliberate reversal of the note this rule
+   * used to carry. The app-wide press feedback in `index.css` transitions
+   * `transform` on `:active`, and a component transition REPLACES that list;
+   * the old rule therefore named only border/colour to keep the shared press
+   * alive, which also meant a hover lift could not be animated. Naming the
+   * FULL set below — including `transform` — keeps the press scale working
+   * (`button:active` in `index.css` only shortens the duration, it does not
+   * re-declare the properties) AND lets hover raise the card. Layout
+   * properties are still never named: `transform` is composited, `top`/`margin`
+   * would re-run layout on every hover of a 40-tile grid.
+   */
+  transition:
+    transform 0.15s ease,
+    border-color 0.15s ease,
+    box-shadow 0.15s ease,
+    background-color 0.15s ease,
+    color 0.15s ease;
 }
 
+/*
+ * Hover: lift a pixel and a half into the accent ring. On a touch till this
+ * rarely fires, which is exactly why the press feedback below stays — but on
+ * the desktop window a shift lead reviews the menu on, it is the card saying
+ * "I am sellable".
+ */
 .catalog-grid__tile-button:hover {
   border-color: var(--acc);
+  box-shadow: var(--shadow-2);
+  transform: translateY(-2px);
+}
+
+/*
+ * The shared press scale, RE-CLAIMED at this specificity. `button:active` in
+ * `index.css` sets `transform: scale(0.97)` for every control in the app, but
+ * the hover rule above is the more specific selector — without this line a
+ * hovered tile would keep LIFTING while pressed instead of pressing, and the
+ * "did that register?" cue the app-wide rule exists for would silently vanish
+ * on exactly the control a cashier presses most.
+ */
+.catalog-grid__tile-button:active {
+  transform: scale(0.97);
+}
+
+/*
+ * A tile the basket already holds, ringed in the accent — the reference
+ * design's selected-card treatment. Keyed off `:has(.catalog-grid__tile-badge)`
+ * rather than a new prop: the badge IS the DOM's truth about "this variant is
+ * in the basket" (it renders exactly when the quantity is positive), so the
+ * ring can never disagree with it — the same `:has` argument
+ * `sales-terminal.css` makes for the fulfilment chips. The `×N` badge alone
+ * tells a cashier WHAT is in the cart; the ring tells them WHERE, across a
+ * grid of forty tiles at a glance.
+ */
+.catalog-grid__tile:has(.catalog-grid__tile-badge) .catalog-grid__tile-button {
+  border-color: var(--acc);
+  box-shadow: 0 0 0 1px var(--acc), var(--shadow-1);
+}
+
+/*
+ * The colour panel, now a FLEX BOX centring the tile's decorative emoji
+ * (rendered as text inside it from `CatalogGrid.tsx`). Height is FIXED rather
+ * than intrinsic so a one-word drink and a three-word combo produce cards whose
+ * text starts on the same line — otherwise a grid of mixed name lengths is a
+ * grid of staggered price rows.
+ *
+ * `position: relative` anchors the sheen pseudo-element below; the emoji sits
+ * at 34px so it reads as the card's "photo" at a glance without crowding a
+ * 165px tile.
+ */
+.catalog-grid__tile-media {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 84px;
+  border-radius: 17px 17px 0 0;
+  font-size: 34px;
+  line-height: 1;
+}
+
+/*
+ * The glass sheen, painted OVER the emoji (a ::after stacks above the element's
+ * own text): a radial highlight from the top-left corner turns the flat
+ * gradient into a lit surface. Pure decoration, and a token because it carries
+ * colour — `tokens.css` is the only file allowed to name one, and it holds the
+ * dark edition too, so the sheen dims with the theme.
+ */
+.catalog-grid__tile-media::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: var(--tile-sheen);
+  pointer-events: none;
+}
+
+/*
+ * ONE CLASS PER GRADIENT PAIR, and the stops come from `tokens.css`.
+ *
+ * The prototype assigns each gradient inline. That is blocked here: the webview
+ * runs under `csp: "default-src 'self'"`, and an inline `style` attribute has no
+ * 'self' source — so copying it would build successfully and render every card
+ * colourless. The colour stops are tokens (with dark-mode overrides) and only the
+ * SELECTION is a class here.
+ *
+ * Which class a tile gets is decided in `CatalogGrid.tsx` from a hash of the
+ * variant id, so a given drink is the same colour on every terminal.
+ */
+.catalog-grid__tile-media--1 {
+  background: linear-gradient(135deg, var(--tile-grad-1-from), var(--tile-grad-1-to));
+}
+
+.catalog-grid__tile-media--2 {
+  background: linear-gradient(135deg, var(--tile-grad-2-from), var(--tile-grad-2-to));
+}
+
+.catalog-grid__tile-media--3 {
+  background: linear-gradient(135deg, var(--tile-grad-3-from), var(--tile-grad-3-to));
+}
+
+.catalog-grid__tile-media--4 {
+  background: linear-gradient(135deg, var(--tile-grad-4-from), var(--tile-grad-4-to));
+}
+
+.catalog-grid__tile-media--5 {
+  background: linear-gradient(135deg, var(--tile-grad-5-from), var(--tile-grad-5-to));
+}
+
+.catalog-grid__tile-media--6 {
+  background: linear-gradient(135deg, var(--tile-grad-6-from), var(--tile-grad-6-to));
+}
+
+/*
+ * "Already N in the basket", top-right of the colour panel.
+ *
+ * `position: absolute` against the button's `position: relative` above. A
+ * non-zero `top`/`right` rather than `0`: the badge is accent-coloured on a
+ * warm gradient, and flush against the card edge it would touch the rounded
+ * corner and read as a clipped edge rather than a deliberate inset chip.
+ */
+.catalog-grid__tile-badge {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  padding: 2px 9px;
+  border-radius: 999px;
+  background: var(--acc);
+  color: var(--on-acc);
+  /* A card-coloured ring around the badge so it floats OFF the gradient panel
+     rather than biting into it — the same separation trick the reference
+     design uses for its floating labels. */
+  border: 2px solid var(--card);
+  font-size: 12px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.5;
+  box-shadow: var(--shadow-1);
+  /* Lifted above the sheen: the badge overlaps the panel's ::after, and a
+     stacking context without an explicit z-index lets that pseudo-element
+     paint over the badge on some engines. */
+  z-index: 1;
+}
+
+/* The text block under the panel. Name on top, price beside the SKU's weight,
+   SKU last and quietest — the order a cashier reads them in. */
+.catalog-grid__tile-body {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 7px;
+  flex: 1;
+  padding: 11px 13px 13px;
 }
 
 .catalog-grid__tile-name {
@@ -69,10 +243,21 @@
   line-height: 1.5;
 }
 
+/*
+ * The price as an accent-soft pill rather than bare accent text: on the
+ * reference design the price is a contained object on the card, and the pill
+ * keeps ฿45.50 legible against a card whose top half is a vivid gradient —
+ * accent TEXT at 17px on white was already loud, accent text on a tinted panel
+ * next to it would be noise. Colour stays `--acc`, the number stays
+ * `Money.toString()` rendered by the component: no change to WHO owns it.
+ */
 .catalog-grid__tile-price {
+  padding: 3px 11px;
+  border-radius: 999px;
+  background: var(--accs);
   color: var(--acc);
-  font-size: 17px;
-  font-weight: 700;
+  font-size: 15px;
+  font-weight: 800;
   font-variant-numeric: tabular-nums;
 }
 

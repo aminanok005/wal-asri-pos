@@ -2,10 +2,22 @@
  * tokens.css — the design system. Every colour, font and tap size in the
  * terminal resolves to a property here; component files declare no hex codes.
  *
- * Palette copied verbatim from the V4 prototype at the repo root
- * (`GreenTable POS V4.html` lines 7-9). Prototype variant B is not carried
- * across: it lives behind a UI toggle, which is a different decision from
- * following the OS preference.
+ * Base palette copied from the V4 prototype at the repo root
+ * (`GreenTable POS V4.html` lines 7-9), then extended (shadows, gradients,
+ * elevation) for the redesign. THREE THEMING STATES, all driven from here:
+ *
+ *   `index.html` ships `<html data-theme="dark">` — the terminal opens dark
+ *   because the reference design this UI is graded against is dark, and a till
+ *   in a dim dining room reads better dark. Setting the attribute to `light`
+ *   flips it; REMOVING it returns to following `prefers-color-scheme`, the
+ *   behaviour this file had before the redesign. Nothing but this file reads
+ *   the attribute, and it is a content attribute — never an inline style —
+ *   so `csp: default-src 'self'` is untouched.
+ *
+ * `color-scheme` is set alongside the colours so NATIVE pieces (radio dots,
+ * scrollbars, form controls) match the palette a cashier can actually see;
+ * the `light dark` double value on the base keeps OS-driven mode honest when
+ * no attribute is present.
  */
 
 :root {
@@ -13,9 +25,72 @@
   --card: #fff;
   --ink: #1f2420;
   --mut: #7b827c;
+  /*
+   * `--mut-strong` — the SECONDARY TEXT rung that clears WCAG AA.
+   *
+   * `--mut` above is decorative-grey and measures 3.30:1 on `--bg-2`, 3.74:1 on
+   * `--card-2` and 3.94:1 on `--card` in this theme: it is legal for a hairline
+   * and an icon, and FAILS the 4.5:1 that body-size text owes a cashier reading
+   * it across a counter. This is the darker step on the same hue, measured at
+   * 4.66:1 on `--bg-2`, 4.80:1 on `--card-2` and 4.83:1 on `--card`.
+   *
+   * A token rather than a literal because `tokens.css` is the only file allowed
+   * to name a colour, and because the dark editions below have to stay in step
+   * with this one — which is the whole reason the pair exists.
+   */
+  --mut-strong: #636a64;
   --line: #e8e4dc;
   --acc: #ff5a1f;
   --accs: #fff0e8;
+
+  /* The colour ON a solid accent surface (pay button, active pills, badge).
+     A token rather than a literal because `tokens.css` is the only place a
+     colour may be named, and #fff is a colour. */
+  --on-acc: #fff;
+
+  /* The one font stack, so a till cannot render two typefaces on one screen.
+     'Noto Sans Thai' first when the system has it; 'Leelawadee UI' is the
+     common Windows Thai face — a till is often a Windows tablet — and Tahoma
+     behind that covers older installs. Nothing is fetched: under
+     `csp: default-src 'self'` a webfont would have to be vendored, and a
+     system stack costs no download on a shop's flaky line. */
+  --font: 'Noto Sans Thai', 'Leelawadee UI', 'Tahoma', system-ui, sans-serif;
+
+  /* Surfaces. `--bg-2` is a RECESSED well (summary strips, search chrome) and
+     `--card-2` a raised inner panel (totals row, tab chips) — the two extra
+     rungs that let a layout read as layered instead of as one flat sheet. */
+  --bg-2: #ecebe5;
+  --card-2: #faf9f5;
+
+  /* Accent gradient for the controls that must win the screen: the pay
+     button, the active nav/category pill, the + stepper. A gradient, not a
+     flat fill, because on both themes it reads as a lit surface rather than a
+     sticker — the reference design's orange does the same. */
+  --acc-grad: linear-gradient(135deg, #ff8a4d, #ff5a1f);
+  /* The accent's own shadow: warm, so the glow reads as light from the
+     button itself. Never on anything that is not accent-coloured. */
+  --glow-acc: 0 6px 18px rgba(255, 90, 31, 0.3);
+
+  /* Elevation. Two rungs only: `1` lifts a resting card off the page, `2`
+     answers a hover. A third would be a level nothing on a till needs, and
+     shadows that differ by a pixel are shadows nobody can see. */
+  --shadow-1: 0 1px 2px rgba(31, 36, 32, 0.06), 0 3px 10px rgba(31, 36, 32, 0.06);
+  --shadow-2: 0 4px 14px rgba(31, 36, 32, 0.08), 0 18px 44px rgba(31, 36, 32, 0.1);
+
+  /* The glass sheen painted over a menu tile's gradient panel, so the panel
+     reads as a lit object rather than a flat colour block. A token because it
+     is a colour-bearing value and this file is the only place allowed one. */
+  --tile-sheen: radial-gradient(
+    130% 90% at 28% 0%,
+    rgba(255, 255, 255, 0.38),
+    rgba(255, 255, 255, 0) 62%
+  );
+
+  /* Double value: the UA picks dark native controls on a dark OS and light
+     ones on a light OS, so radio dots and scrollbars match whatever palette
+     the OS and this file are currently agreeing on. The attribute blocks below
+     pin it when a theme is chosen explicitly. */
+  color-scheme: light dark;
 
   /* Not in the prototype — invented here. Needs design sign-off before commit. */
   --danger: #c8372a;
@@ -32,6 +107,52 @@
   --tap-sm: 44px;
   --tap-pay: 56px;
 
+  /*
+   * The shell header's own height, MEASURED: the 48px nav pill (`--tap`) plus
+   * 12px padding top and bottom plus the 1px border beneath it. Not decoration —
+   * anything that pins below the header (the order rail, in
+   * `sales-terminal.css`) offsets its `top` and trims its `max-height` by
+   * exactly this band, and a mismatch would slide pinned content UNDER the
+   * opaque header that paints over it. One number, one truth: if the header's
+   * padding ever changes, this changes with it.
+   */
+  --shell-h: 73px;
+
+  /*
+   * ── Menu-tile gradients ────────────────────────────────────────────────────
+   * Six warm pairs, in the prototype's own order (`GreenTable POS V4.html:118-121`,
+   * one per menu item, with `-22`° interpolated stops).
+   *
+   * WHY TOKENS AND NOT A CLASS PER COLOUR, AND WHY NOT INLINE STYLES
+   *
+   * The prototype writes each tile's gradient as an inline `style=` attribute.
+   * That is blocked here: `tauri.conf.json` sets `csp: "default-src 'self'"`, and
+   * `index.html` documents that an inline style has no 'self' source. Copying it
+   * would produce a build that succeeds and a till that renders colourless cards.
+   *
+   * So the colours live here as tokens and `catalog-grid.css` selects between
+   * them with a class. Which class a tile gets is decided in TypeScript from the
+   * variant's id — a stable hash, not render order — so the same drink is the
+   * same colour on every terminal and after every re-render.
+   *
+   * These are a PRESENTATION choice, not data: nothing in the contract describes
+   * a product's colour, so no badge or price anywhere may claim one. Dark-mode
+   * pairs are below, in the dark blocks, for the same reason every other token
+   * is overridden there.
+   */
+  --tile-grad-1-from: #f6c177;
+  --tile-grad-1-to: #e8883a;
+  --tile-grad-2-from: #f2b66d;
+  --tile-grad-2-to: #c8602b;
+  --tile-grad-3-from: #b9e08a;
+  --tile-grad-3-to: #5aa845;
+  --tile-grad-4-from: #f3d9a4;
+  --tile-grad-4-to: #d49a4e;
+  --tile-grad-5-from: #ffb08a;
+  --tile-grad-5-to: #d6452b;
+  --tile-grad-6-from: #ffd0a0;
+  --tile-grad-6-to: #ff7a45;
+
   padding-top: env(safe-area-inset-top, 0px);
   padding-bottom: env(safe-area-inset-bottom, 0px);
 }
@@ -47,6 +168,10 @@
     --card: #1d1d1d;
     --ink: #f2f2ee;
     --mut: #9a9a94;
+    /* Already 5.35:1 on the worst dark surface, so the dark edition of
+       `--mut-strong` is the same grey `--mut` names here: in dark the muted
+       end of the range is the LIGHT end, and this value is that. */
+    --mut-strong: #9a9a94;
     --line: #2f2f2f;
     --acc: #ff7a45;
     --accs: #35231a;
@@ -55,6 +180,43 @@
     --oks: #14291d;
     --warn: #f0a04b;
     --warns: #3a2410;
+    /* The two extra surface rungs, dark editions: `--bg-2` sinks a full step
+       below the card (recessed wells stay recessed at night too) and
+       `--card-2` sits between card and line — an inner panel on a dark card
+       must be LIGHTER than its host, the opposite of the light theme. */
+    --bg-2: #0e0e0e;
+    --card-2: #262626;
+    /* Gradient and glow run warmer and wider in the dark: an orange button on
+       a #1d1d1d card is the brightest object on screen and its glow should
+       say so. */
+    --acc-grad: linear-gradient(135deg, #ff9159, #ff6a2a);
+    --glow-acc: 0 6px 22px rgba(255, 122, 69, 0.35);
+    /* Dark-mode elevation leans on real black rather than tinted grey: on a
+       near-black page the drop itself is the only depth cue left. */
+    --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.45), 0 3px 12px rgba(0, 0, 0, 0.3);
+    --shadow-2: 0 6px 18px rgba(0, 0, 0, 0.45), 0 20px 48px rgba(0, 0, 0, 0.4);
+    --tile-sheen: radial-gradient(
+      130% 90% at 28% 0%,
+      rgba(255, 255, 255, 0.28),
+      rgba(255, 255, 255, 0) 60%
+    );
+    /* Menu-tile gradients, VIVID in the dark — the same six pairs the
+       prototype itself paints on its dark cards (`GreenTable POS V4.html:118-
+       121`). The earlier muted-brown dark pairs were an invention that read as
+       dirty smudges beside a food emoji; the reference proves vivid gradients
+       are exactly what a dark card wants. */
+    --tile-grad-1-from: #f6c177;
+    --tile-grad-1-to: #e8883a;
+    --tile-grad-2-from: #f2b66d;
+    --tile-grad-2-to: #c8602b;
+    --tile-grad-3-from: #b9e08a;
+    --tile-grad-3-to: #5aa845;
+    --tile-grad-4-from: #f3d9a4;
+    --tile-grad-4-to: #d49a4e;
+    --tile-grad-5-from: #ffb08a;
+    --tile-grad-5-to: #d6452b;
+    --tile-grad-6-from: #ffd0a0;
+    --tile-grad-6-to: #ff7a45;
   }
 }
 
@@ -63,6 +225,8 @@
   --card: #1d1d1d;
   --ink: #f2f2ee;
   --mut: #9a9a94;
+  /* Same value as the `prefers-color-scheme` block above — see it. */
+  --mut-strong: #9a9a94;
   --line: #2f2f2f;
   --acc: #ff7a45;
   --accs: #35231a;
@@ -71,6 +235,47 @@
   --oks: #14291d;
   --warn: #f0a04b;
   --warns: #3a2410;
+  /* The dark editions of the extra rungs — see the media block above for the
+     reasoning; the two blocks stay in step because a till pinned dark by
+     `index.html` must look identical to one that followed the OS into dark. */
+  --bg-2: #0e0e0e;
+  --card-2: #262626;
+  --acc-grad: linear-gradient(135deg, #ff9159, #ff6a2a);
+  --glow-acc: 0 6px 22px rgba(255, 122, 69, 0.35);
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.45), 0 3px 12px rgba(0, 0, 0, 0.3);
+  --shadow-2: 0 6px 18px rgba(0, 0, 0, 0.45), 0 20px 48px rgba(0, 0, 0, 0.4);
+  --tile-sheen: radial-gradient(
+    130% 90% at 28% 0%,
+    rgba(255, 255, 255, 0.28),
+    rgba(255, 255, 255, 0) 60%
+  );
+  /* Vivid tile pairs, matching the prototype's own dark cards. */
+  --tile-grad-1-from: #f6c177;
+  --tile-grad-1-to: #e8883a;
+  --tile-grad-2-from: #f2b66d;
+  --tile-grad-2-to: #c8602b;
+  --tile-grad-3-from: #b9e08a;
+  --tile-grad-3-to: #5aa845;
+  --tile-grad-4-from: #f3d9a4;
+  --tile-grad-4-to: #d49a4e;
+  --tile-grad-5-from: #ffb08a;
+  --tile-grad-5-to: #d6452b;
+  --tile-grad-6-from: #ffd0a0;
+  --tile-grad-6-to: #ff7a45;
+  /* Native controls pinned dark to match, whatever the OS prefers. */
+  color-scheme: dark;
+}
+
+/*
+ * An explicit LIGHT choice pins the NATIVE scheme too: the base `light dark`
+ * value would otherwise hand a dark-OS till dark radio dots on a light card —
+ * the colours this file paints say light, and the OS-chosen controls must say
+ * light as well. No colour overrides live here: the light palette IS the base
+ * block above, which is why removing `data-theme` from `index.html` falls back
+ * to light-on-light rather than to nothing.
+ */
+:root[data-theme='light'] {
+  color-scheme: light;
 }
 
 /*

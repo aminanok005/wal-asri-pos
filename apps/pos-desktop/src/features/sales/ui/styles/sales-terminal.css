@@ -1,10 +1,13 @@
 /*
- * sales-terminal.css — the cashier's screen: header, checkout, and the two-column
- * split that puts the catalog grid beside the cart panel.
+ * sales-terminal.css — the cashier's screen: a compact header, the two-column
+ * split, and the ORDER RAIL — the right-hand panel that holds the basket, the
+ * fulfilment tabs, the VAT breakdown, the payment chips and the pay button
+ * together, the way the reference design's panel does.
  *
  * The tiles and cart rows themselves are styled in their own components'
- * stylesheets. This file owns ARRANGEMENT — how the two sit relative to each
- * other, and the chrome that belongs to this screen alone.
+ * stylesheets. This file owns ARRANGEMENT — how the columns sit relative to
+ * each other, what pins while the menu scrolls, and the chrome that belongs to
+ * this screen alone (fulfilment, checkout, pay).
  *
  * @see tokens.css — every colour and tap size used below
  */
@@ -13,96 +16,114 @@
   padding: 20px;
   background: var(--bg);
   color: var(--ink);
-  font-family: 'Noto Sans Thai', system-ui, sans-serif;
+  font-family: var(--font);
   font-size: 15px;
 }
 
 /* ── Header ─────────────────────────────────────────────────────────────── */
 
+/*
+ * Title left, the two read-only context labels right, on ONE line. The header
+ * shrank when the fulfilment tabs and the basket totals moved into the order
+ * rail below, so it can afford to be a compact flex row. `flex-wrap` still
+ * earns its place: a longer Thai customer string wraps rather than pushing the
+ * table chip off the right edge — "ประวัติ..." nearly twice the length of a
+ * short name must not break this row.
+ */
 .sales-terminal__header {
-  margin-bottom: 16px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 6px 16px;
+  margin-bottom: 14px;
 }
 
-.sales-terminal__header h1 {
-  margin: 0 0 12px;
-  font-size: 24px;
-  line-height: 1.2;
+/*
+ * 22px, and explicitly sized: without a rule this renders at the UA's default
+ * `h2`, which varies by engine — and the shell's own title (20px in
+ * `app-shell.css`) must stay the SMALLER of the two. `line-height: 1.3` for
+ * Thai: a tone mark above a consonant needs the taller glyph box.
+ */
+.sales-terminal__header h2 {
+  margin: 0;
+  font-size: 22px;
+  line-height: 1.3;
 }
 
 .sales-terminal__context {
   display: flex;
   flex-wrap: wrap;
-  gap: 10px;
+  gap: 8px;
   align-items: center;
-  margin-bottom: 12px;
   color: var(--mut);
   font-size: 14px;
 }
 
-.sales-terminal__fulfilment {
-  display: flex;
-  gap: 6px;
-}
-
 /*
- * Styled as a neutral pair, NOT as a selected/unselected toggle. These two
- * buttons have no handler and no state: rendering one at full accent weight
- * would tell a cashier their choice is recorded when nothing records it.
+ * The two read-only labels as chips, not bare grey text. They are still
+ * "labels and nothing else" — no order entity backs them, and none is invented
+ * here — but a bordered pill says "context attached to THIS order" where
+ * floating text said nothing, and it keeps the 999px silhouette every other
+ * piece of chrome on the till now wears.
  */
-.sales-terminal__fulfilment-button {
-  min-height: var(--tap-sm);
-  padding: 6px 14px;
+.sales-terminal__customer,
+.sales-terminal__table {
+  padding: 5px 12px;
   border: 1px solid var(--line);
   border-radius: 999px;
   background: var(--card);
-  color: var(--ink);
-  font: inherit;
-  font-size: 13px;
-  cursor: default;
-}
-
-/* Unreferenced. Reserved for the day the pair becomes a real toggle. */
-.sales-terminal__fulfilment-button.is-selected {
-  background: var(--acc);
-  border-color: var(--acc);
-  color: #fff;
-}
-
-/*
- * `tabular-nums` on every money figure in the app: it makes each digit the same
- * width, so a subtotal changing from ฿45.50 to ฿140.50 does not shift the layout
- * under a thumb reaching for the pay button. This is a FONT rule — it changes how
- * a glyph is drawn, never the value. The number was produced upstream by
- * `Money.toString()` in integer satang; no CSS here recomputes or reformats it.
- */
-.sales-terminal__totals {
-  display: flex;
-  justify-content: space-between;
-  align-items: baseline;
-  gap: 12px;
-  margin: 0 0 16px;
-  padding: 12px 14px;
-  border-radius: 14px;
-  background: var(--bg);
   color: var(--mut);
   font-size: 13px;
 }
 
-.sales-terminal__totals [data-testid='sales-subtotal'] {
-  font-size: 20px;
-  font-weight: 800;
-  color: var(--ink);
-  font-variant-numeric: tabular-nums;
+/*
+ * The fulfilment pair, as ARRANGEMENT only.
+ *
+ * Everything about how it looks lives in `segmented-control.css` — the well, the
+ * sliding thumb, the 48px options, the focus ring. What is left here is what this
+ * screen decides: that the pair is the first control in the order rail, and that
+ * it does not shrink when the rail runs out of height.
+ *
+ * The `<fieldset>` and its `<legend>` are still rendered by `SegmentedControl`
+ * itself. That is not decoration to be moved into a stylesheet: they are what
+ * give the group its accessible name and what tell a screen reader that these two
+ * radios are ONE exclusive choice rather than two independent settings.
+ */
+.sales-terminal__fulfilment {
+  flex: none;
 }
+
+/*
+ * `tabular-nums` on every money figure in the app: it makes each digit the same
+ * width, so a total changing from ฿45.50 to ฿140.50 does not shift the layout
+ * under a thumb reaching for the pay button. This is a FONT rule — it changes how
+ * a glyph is drawn, never the value. The number was produced upstream by
+ * `Money.toString()` in integer satang; no CSS here recomputes or reformats it.
+ */
 
 /* ── Checkout ───────────────────────────────────────────────────────────── */
 
+/*
+ * The summary and payment block — the order rail's LAST section, and the one
+ * that never scrolls out of reach: the rail's flex layout shrinks the basket's
+ * line list first, so the VAT rows, the payment chips and the pay button hold
+ * the bottom of the column the way the reference design's checkout block does.
+ *
+ * A SECTION OF THE PANEL NOW, NOT A CARD OF ITS OWN. It used to carry the same
+ * 18px radius, 1px border and `--shadow-1` as the basket above it, which drew a
+ * second edge 16px inside the rail's — a card inside a card, with a gutter of
+ * page background showing between them. Both live on one surface now and are
+ * divided by a hairline instead; `padding` is all this block still needs.
+ *
+ * `margin: auto 0 0` is unchanged and still pins this to the rail's floor: in a
+ * flex column an `auto` top margin eats the free space, so with a short basket
+ * the whitespace opens ABOVE this block rather than below the lines it sums.
+ */
 .sales-terminal__checkout {
-  margin-bottom: 16px;
-  padding: 14px;
-  border: 1px solid var(--line);
-  border-radius: 16px;
-  background: var(--card);
+  flex: none;
+  margin: auto 0 0;
+  padding: 16px;
 }
 
 .sales-terminal__tax-breakdown {
@@ -124,7 +145,9 @@
 }
 
 .sales-terminal__tax-breakdown dt {
-  color: var(--mut);
+  /* `--mut-strong`, not `--mut`: this is 13px body text a customer reads off the
+     screen, and `--mut` measures 3.94:1 on `--card` in the light theme. */
+  color: var(--mut-strong);
   font-size: 13px;
 }
 
@@ -134,28 +157,66 @@
   font-variant-numeric: tabular-nums;
 }
 
-/* The gross — what the customer is actually asked for. */
-.sales-terminal__tax-breakdown [data-testid='checkout-subtotal'] {
-  font-size: 20px;
+/*
+ * The gross — what the customer is actually asked for, and the answer the two
+ * rows above it add up to.
+ *
+ * THE ONLY ROW WITH A RULE ABOVE IT, so the total is separable from the
+ * arithmetic that produced it without a second border or a well to hold it. The
+ * largest type in the panel, because this is the number the pay button below
+ * quotes and the cashier has to be able to match the two.
+ */
+.sales-terminal__tax-breakdown-total {
+  margin-top: 4px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+
+.sales-terminal__tax-breakdown-total dt {
+  color: var(--ink);
+  font-size: 15px;
   font-weight: 800;
 }
 
+.sales-terminal__tax-breakdown-total dd {
+  font-size: 24px;
+}
+
 /*
- * The one control that takes money gets the accent and the full 48px+ height.
- * 56px is the prototype's own `.go` height.
+ * THE one control that takes money: accent GRADIENT, the 56px the prototype's
+ * `.go` height fixed, a 999px capsule to match every other primary shape on
+ * the till, and `--glow-acc` under it so it is literally the brightest object
+ * on the screen — the reference design's สั่งเครื่อง button, and the same
+ * reasoning: when a queue is five deep, "where do I take the money" must be
+ * answerable from across the counter without reading a word.
+ *
+ * 18px/800 label: the PAYABLE total rides inside this text (`ชำระเงิน ฿68.20`),
+ * so the figure needs to hold at arm's length while the button itself stays
+ * one obvious target.
  */
 .sales-terminal__pay {
   width: 100%;
   min-height: var(--tap-pay);
   border: 0;
-  border-radius: 16px;
-  background: var(--acc);
-  color: #fff;
+  border-radius: 999px;
+  background: var(--acc-grad);
+  color: var(--on-acc);
   font: inherit;
-  font-size: 17px;
-  font-weight: 700;
+  font-size: 18px;
+  font-weight: 800;
   font-variant-numeric: tabular-nums;
   cursor: pointer;
+  box-shadow: var(--glow-acc);
+  /*
+   * Opacity only, and never `transform` — a deliberate exception to the hover
+   * lift `.catalog-grid__tile-button` animates. The pay button is the one
+   * control where a press scale is arguably TOO much: it is the button that
+   * takes money, and a control that visibly shrinks under the thumb reads as
+   * "it might have cancelled". It keeps the colour response, and a `transition`
+   * on the base rule REPLACES the app-wide list from `index.css` — so naming
+   * only `opacity` here is what leaves the shared press feedback off this one
+   * button on purpose.
+   */
   transition: opacity 0.15s ease;
 }
 
@@ -184,50 +245,18 @@
 
 /* ── Payment method ──────────────────────────────────────────────────────── */
 
-.sales-terminal__payment {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin: 0 0 14px;
-  padding: 0;
-  border: 0;
-}
-
-.sales-terminal__payment legend {
-  padding: 0;
-  color: var(--mut);
-  font-size: 13px;
-}
-
 /*
- * The radio is kept visible and clickable rather than hidden behind the label:
- * a till is used by someone who is not looking at the screen, and an invisible
- * control has no affordance to aim at. The label wraps both, so the whole chip is
- * the hit target and the native radio still carries the checked state.
+ * The payment channels, as ARRANGEMENT only — the same
+ * `SegmentedControl` the fulfilment pair above uses, with three options.
+ *
+ * The `margin-bottom` is the whole reason this rule exists. It is the spacing
+ * between this group and the pay button below it, inside `.sales-terminal__checkout`
+ * which supplies no gap of its own to its children. Removing it would close the
+ * gap between "how the customer is paying" and "take the money" — which is the
+ * gap that lets a cashier read the two together without thinking about it.
  */
-.sales-terminal__payment-option {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  min-height: var(--tap-sm);
-  padding: 6px 12px;
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  background: var(--card);
-  font-size: 13px;
-  cursor: pointer;
-}
-
-.sales-terminal__payment-option:has(input:checked) {
-  border-color: var(--acc);
-  background: var(--accs);
-  color: var(--acc);
-  font-weight: 600;
-}
-
-.sales-terminal__payment-option:has(input:disabled) {
-  opacity: 0.5;
-  cursor: not-allowed;
+.sales-terminal__payment {
+  margin: 0 0 14px;
 }
 
 /* ── Cash rounding ───────────────────────────────────────────────────────── */
@@ -253,7 +282,210 @@
   font-variant-numeric: tabular-nums;
 }
 
+/* ── Status banners (terminal identity, held orders) ─────────────────────────── */
+
+/*
+ * Base banner style shared by identity and held-orders banners.
+ * Fixed at the top of the body so the cashier sees it immediately.
+ */
+.sales-terminal__identity-banner,
+.sales-terminal__held-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 12px 16px;
+  border-radius: 12px;
+  margin-bottom: 12px;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+/* Loading state — subtle spinner, polite live region. */
+.sales-terminal__spinner {
+  flex: none;
+  width: 20px;
+  height: 20px;
+  margin-top: 2px;
+  color: var(--mut-strong);
+}
+
+/* Error state — persistent alert with details for admin. */
+.sales-terminal__identity-banner--error,
+.sales-terminal__held-banner--error {
+  border: 1px solid var(--danger);
+  background: var(--warns);
+  color: var(--danger);
+}
+
+.sales-terminal__alert-icon {
+  flex: none;
+  width: 20px;
+  height: 20px;
+  margin-top: 2px;
+  color: var(--danger);
+}
+
+/* Warning state for held orders — amber background, alert live region. */
+.sales-terminal__held-banner--warning {
+  border: 1px solid var(--warn);
+  background: var(--warns);
+  color: var(--warn);
+}
+
+.sales-terminal__warning-icon {
+  flex: none;
+  width: 20px;
+  height: 20px;
+  margin-top: 2px;
+  color: var(--warn);
+}
+
+.sales-terminal__identity-banner strong,
+.sales-terminal__held-banner strong {
+  display: block;
+  margin-bottom: 8px;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+/* Collapsible details for both banner types. */
+.sales-terminal__identity-details,
+.sales-terminal__held-details {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid currentColor;
+  opacity: 0.9;
+}
+
+.sales-terminal__identity-details summary,
+.sales-terminal__held-details summary {
+  cursor: pointer;
+  font-weight: 600;
+  margin-bottom: 8px;
+  color: var(--mut-strong);
+}
+
+.sales-terminal__identity-details pre,
+.sales-terminal__held-details pre {
+  margin: 0;
+  padding: 8px 12px;
+  background: rgba(0, 0, 0, 0.05);
+  border-radius: 8px;
+  font-size: 12px;
+  font-family: var(--font);
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* Held orders specific styles. */
+.sales-terminal__held-content {
+  flex: 1;
+  min-width: 0;
+}
+
+.sales-terminal__held-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.sales-terminal__held-item {
+  padding: 12px;
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+}
+
+.sales-terminal__held-receipt {
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  margin-bottom: 8px;
+}
+
+.sales-terminal__held-mismatch {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.sales-terminal__held-amount {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px 12px;
+  font-size: 13px;
+}
+
+.sales-terminal__held-label {
+  color: var(--mut-strong);
+  font-weight: 500;
+}
+
+.sales-terminal__held-value {
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  font-size: 14px;
+}
+
+.sales-terminal__held-value--claimed {
+  color: var(--acc);
+}
+
+.sales-terminal__held-value--authoritative {
+  color: var(--ok);
+}
+
+.sales-terminal__held-diff {
+  margin-top: 4px;
+  padding-top: 8px;
+  border-top: 1px dashed currentColor;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.sales-terminal__held-diff-value {
+  font-variant-numeric: tabular-nums;
+  color: var(--danger);
+}
+
+.sales-terminal__held-detected {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--mut);
+}
+
+.sales-terminal__held-action {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid currentColor;
+  font-size: 13px;
+  color: var(--mut-strong);
+  line-height: 1.6;
+}
+
+.sales-terminal__held-action code {
+  background: rgba(0, 0, 0, 0.1);
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-family: var(--font);
+}
+
 /* ── The two columns ────────────────────────────────────────────────────── */
+
+/*
+ * The menu column: the recent-orders strip above the catalogue, one stack.
+ * The strip's own `margin-bottom` (recent-orders-strip.css) already spaces the
+ * two, so no gap is declared here — `min-width: 0` is the only necessity. As a
+ * grid item this div otherwise carries the UA's automatic `min-width: auto`,
+ * and one long unbreakable string inside could then widen the 1fr track past
+ * its share; the same floor `minmax(0, 1fr)` puts on the track, applied where
+ * the content actually lives.
+ */
+.sales-terminal__menu {
+  min-width: 0;
+}
 
 .sales-terminal__body {
   display: grid;
@@ -262,18 +494,124 @@
    * is floored at its content's min-content width by default, so a long Thai
    * product name or SKU could push the track wider than the space available and
    * scroll the whole page sideways. The explicit 0 removes that floor.
+   *
+   * The right track widened 360 → 380px: it no longer holds only the basket —
+   * it is now the full ORDER RAIL (fulfilment tabs, basket, checkout, pay), and
+   * three equal payment chips plus the VAT rows need the extra twenty pixels
+   * before any label starts to wrap.
    */
-  grid-template-columns: minmax(0, 1fr) 360px;
+  grid-template-columns: minmax(0, 1fr) 380px;
   gap: 16px;
   align-items: start;
 }
 
 /*
- * Fold to one column at the prototype's own breakpoint. Below it the 360px cart
- * column plus a usable catalogue no longer both fit. The prototype hides its nav
- * rail instead, which is not available here — this app's nav is a horizontal
- * strip — so the columns stack: catalogue flows full width, cart panel follows
- * below it, in the order a cashier works in.
+ * ── The order rail ────────────────────────────────────────────────────────
+ *
+ * The right-hand column, and the one structural move of the redesign: the
+ * fulfilment pair, the basket itself and the whole summary-and-payment block
+ * live HERE, stacked, the way the reference design's order panel stacks them.
+ * The three reasons it works as ONE sticky box rather than three:
+ *
+ *   1. STICKY AS A WHOLE — the panel that takes money must not scroll away
+ *      while a forty-tile menu scrolls past it on the left. One sticky wrapper
+ *      pins all of it; independently-sticky children would pin and unpin at
+ *      different scroll positions and read as unrelated cards.
+ *   2. FLEX COLUMN with the basket's line list as the only flexible child —
+ *      `.cart-view__items` already has `flex: 1; min-height: 0; overflow-y:
+ *      auto`, so the list absorbs the scroll and the pay button stays parked
+ *      at the bottom no matter how many lines the order grows. That is the
+ *      whole point of putting checkout UNDER the basket: the total, the
+ *      payment method and the button are one glance from the lines they sum.
+ *   3. `max-height: calc(100vh - var(--shell-h))` + `overflow-y: auto` as the
+ *      honest floor — a window short enough that even the fixed chrome exceeds
+ *      it scrolls the RAIL rather than clipping the button that takes money.
+ *      Trimmed by `--shell-h` (tokens.css) because the shell header is itself
+ *      sticky: without the subtraction the rail's top row would pin behind an
+ *      opaque header and vanish.
+ *
+ * ── ONE SURFACE ───────────────────────────────────────────────────────────
+ *
+ * This rule is also the PANEL: it carries the only border, the only radius and
+ * the only shadow on the right-hand side of the screen, and the sections below
+ * it carry none of their own. It used to be a transparent sticky wrapper around
+ * THREE cards — a totals strip, the basket and the checkout — each with its own
+ * edge, so one order was drawn inside four nested boxes.
+ *
+ * The basket's own sticky/max-height (declared in `cart-view.css` for its
+ * standalone life) is cancelled below: two nested sticky boxes would fight over
+ * the same scrollport, and the rail — not the panel — is what must stay pinned.
+ */
+.sales-terminal__rail {
+  position: sticky;
+  top: var(--shell-h);
+  display: flex;
+  flex-direction: column;
+  /* `gap: 0` because separation is a hairline now, not a gutter — see the
+     `> * + *` rule below. A gap would show the panel's own background between
+     two of its sections and read as the join between two panels. */
+  gap: 0;
+  min-width: 0;
+  max-height: calc(100vh - var(--shell-h));
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: var(--card);
+  box-shadow: var(--shadow-1);
+}
+
+/*
+ * The hairline between two sections — ONE rule for all of them rather than a top
+ * border on each child, so a section added later is divided by default and
+ * cannot forget to divide itself.
+ *
+ * Full-bleed on purpose: it runs to the panel's own edges with no inset, which
+ * is what makes it read as a rule INSIDE one surface. An inset divider, or the
+ * 12px gap that used to sit here, would put the panel's background back on both
+ * sides of it and turn it back into a border between cards.
+ */
+.sales-terminal__rail > * + * {
+  border-top: 1px solid var(--line);
+}
+
+/*
+ * The fulfilment pair is the panel's FIRST section, so it supplies the panel's
+ * top padding itself. Padding the rail instead would inset the hairlines, which
+ * have to run edge to edge to read as rules rather than borders.
+ */
+.sales-terminal__rail > .sales-terminal__fulfilment {
+  padding: 14px 16px;
+}
+
+.sales-terminal__rail > .cart-view {
+  position: static;
+  max-height: none;
+  /* The ONE shrinkable child: `0 1 auto` lets the basket hand its height back
+     when the rail runs out — and inside it, `.cart-view__items` (already `flex:
+     1; min-height: 0; overflow-y: auto`) absorbs the squeeze and scrolls, while
+     the tabs and the checkout below stay full size. The basket grows with its
+     lines until the column is full; after that it scrolls itself, per point 2 of
+     the note above. */
+  flex: 0 1 auto;
+  min-height: 0;
+  /* The basket's standalone chrome, cancelled. `cart-view.css` gives the panel a
+     border, radius and shadow for the cases where it renders ALONE — its
+     component tests, and any future screen that embeds it by itself. Inside the
+     rail none of that applies: it is one section of the panel, and keeping its
+     edge would redraw the very border this consolidation removed, 16px inside
+     the rail's own. */
+  border: 0;
+  border-radius: 0;
+  background: none;
+  box-shadow: none;
+}
+
+/*
+ * Fold to one column at the prototype's own breakpoint. Below it the 380px rail
+ * plus a usable catalogue no longer both fit. The prototype hides its nav rail
+ * instead, which is not available here — this app's nav is a horizontal strip —
+ * so the columns stack: catalogue flows full width, order rail follows below
+ * it, in the order a cashier works in.
  */
 @media (max-width: 900px) {
   .sales-terminal__body {
@@ -281,10 +619,22 @@
   }
 
   /*
-   * The cart panel stops being a sticky sidebar. Stacked, `position: sticky` with
-   * `max-height: 100vh` would pin a full-height box over the content beneath it.
+   * The rail stops being a sticky sidebar. Stacked, `position: sticky` with
+   * `max-height: 100vh` would pin a full-height box over the content beneath
+   * it — and its `overflow-y: auto` would become a scroll region inside a page
+   * that is already scrolling as one.
+   *
+   * It KEEPS its border, radius and background: stacked, it is still one panel
+   * with three sections divided by hairlines, and only its stickiness and its
+   * scrollport are given up.
    */
-  .sales-terminal__body > .cart-view {
+  .sales-terminal__rail {
+    position: static;
+    max-height: none;
+    overflow: visible;
+  }
+
+  .sales-terminal__rail > .cart-view {
     position: static;
     max-height: none;
   }

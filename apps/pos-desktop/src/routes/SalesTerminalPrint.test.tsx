@@ -9,7 +9,7 @@
  */
 
 import { afterEach, describe, expect, it } from 'bun:test';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 
 import {
   SalesTerminalView,
@@ -17,12 +17,40 @@ import {
   roundingRowText,
 } from './SalesTerminalView';
 import type { CheckoutRepository } from './SalesTerminalView';
+import type { SalesTerminalViewProps } from './SalesTerminalView';
 import type { PrinterEndpoint, ReceiptPrinter } from '../features/sales/application/receiptPrinter';
 import { ReceiptPrintError } from '../features/sales/application/receiptPrinter';
 import type { ReceiptIr } from '../features/sales/domain/receiptLayout';
 import { applyCashRounding } from '../features/sales/domain/cashRounding';
 
-afterEach(cleanup);
+// A valid UUIDv7 for testing (version=7, variant=10xx)
+const TEST_TERMINAL_ID = '018f3c2a-0000-7000-8000-000000000001';
+const TEST_BRANCH_ID = '018f3c2b-0000-7000-8000-000000000002';
+
+/** Render SalesTerminalView with test terminal identity injected. */
+function renderTerminal(props: Omit<SalesTerminalViewProps, 'terminalIdentity'>): ReturnType<typeof render> {
+  return render(<SalesTerminalView {...props} terminalIdentity={{ terminalId: TEST_TERMINAL_ID, branchId: TEST_BRANCH_ID }} />);
+}
+
+// Unmount between tests, and let every read still in flight land FIRST.
+//
+// This file mounts TWO trees in one test (`:251-275`), so the first screen's
+// recent-orders read is still in flight when that tree is unmounted. Without the
+// flush its update lands afterwards and React reports an act() warning — and two
+// live carts and two live strips is exactly the state this suite exists to keep
+// impossible.
+afterEach(async () => {
+  await flush();
+  cleanup();
+});
+
+/** Drain the microtask queue inside `act`, twice — see the note above. */
+async function flush(): Promise<void> {
+  await act(async () => {
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+}
 
 const LATTE = /ลาเต้/;
 
@@ -76,7 +104,7 @@ describe('SalesTerminalView — one total, three places', () => {
   it('shows, commits and prints the SAME payable total', async () => {
     const { repo: r, saved } = repo();
     const { printer, printed } = recordingPrinter();
-    render(<SalesTerminalView repository={r} printer={printer} />);
+    renderTerminal({ repository: r, printer });
 
     // \u0e1f91.00 = 9100 satang for two lattes. Note 9100 % 25 === 0, so cash
     // rounding does NOT move it \u2014 which is exactly why this test earns its
@@ -109,7 +137,7 @@ describe('SalesTerminalView — one total, three places', () => {
   it('never rounds a digital payment, on screen or in the database', async () => {
     const { repo: r, saved } = repo();
     const { printer, printed } = recordingPrinter();
-    render(<SalesTerminalView repository={r} printer={printer} />);
+    renderTerminal({ repository: r, printer });
 
     addLatte(2); // ฿91.00, which cash would round to ฿91.00 anyway; see below
     fireEvent.click(screen.getByTestId('payment-qr'));
@@ -130,7 +158,7 @@ describe('SalesTerminalView — one total, three places', () => {
 describe('SalesTerminalView — the cash-rounding row', () => {
   it('is absent when the total needs no rounding', () => {
     const { repo: r } = repo();
-    render(<SalesTerminalView repository={r} />);
+    renderTerminal({ repository: r });
 
     addLatte(); // ฿45.50 = 4550, an exact multiple of 25
 
@@ -158,7 +186,7 @@ describe('SalesTerminalView — the cash-rounding row', () => {
 
   it('renders no row at all when the total is already payable', () => {
     const { repo: r } = repo();
-    render(<SalesTerminalView repository={r} />);
+    renderTerminal({ repository: r });
 
     addLatte(); // ฿45.50 = 4550, an exact multiple of 25
 
@@ -169,7 +197,7 @@ describe('SalesTerminalView — the cash-rounding row', () => {
 
   it('renders no row for a digital payment either', () => {
     const { repo: r } = repo();
-    render(<SalesTerminalView repository={r} />);
+    renderTerminal({ repository: r });
 
     addLatte();
     fireEvent.click(screen.getByTestId('payment-qr'));
@@ -210,16 +238,14 @@ describe('SalesTerminalView — commit happens BEFORE any print', () => {
     const saved: unknown[] = [];
     const { printer, printed } = recordingPrinter();
 
-    render(
-      <SalesTerminalView
-        repository={{
-          async save() {
-            throw new Error('database is locked');
-          },
-        }}
-        printer={printer}
-      />,
-    );
+    renderTerminal({
+      repository: {
+        async save() {
+          throw new Error('database is locked');
+        },
+      },
+      printer,
+    });
     void saved;
 
     addLatte();
@@ -236,7 +262,7 @@ describe('SalesTerminalView — commit happens BEFORE any print', () => {
   it('prints AFTER the save resolves, carrying the committed receipt number', async () => {
     const { printer, printed } = recordingPrinter();
     const { repo: r, saved } = repo();
-    render(<SalesTerminalView repository={r} printer={printer} />);
+    renderTerminal({ repository: r, printer });
 
     addLatte();
     fireEvent.click(screen.getByRole('button', { name: /ชำระเงิน/ }));
@@ -252,9 +278,7 @@ describe('SalesTerminalView — commit happens BEFORE any print', () => {
     // rendering into the same tree would leave the second screen's basket
     // contaminated by the first one's already-cleared one.
     const cashRun = recordingPrinter();
-    const cashView = render(
-      <SalesTerminalView repository={repo().repo} printer={cashRun.printer} />,
-    );
+    const cashView = renderTerminal({ repository: repo().repo, printer: cashRun.printer });
     addLatte();
     fireEvent.click(screen.getByTestId('payment-cash'));
     fireEvent.click(screen.getByRole('button', { name: /ชำระเงิน/ }));
@@ -264,7 +288,7 @@ describe('SalesTerminalView — commit happens BEFORE any print', () => {
     cashView.unmount();
 
     const qrRun = recordingPrinter();
-    render(<SalesTerminalView repository={repo().repo} printer={qrRun.printer} />);
+    renderTerminal({ repository: repo().repo, printer: qrRun.printer });
     addLatte();
     fireEvent.click(screen.getByTestId('payment-qr'));
     fireEvent.click(screen.getByRole('button', { name: /ชำระเงิน/ }));
@@ -277,13 +301,11 @@ describe('SalesTerminalView — commit happens BEFORE any print', () => {
   it('sends the receipt to the configured endpoint', async () => {
     const { repo: r } = repo();
     const { printer, printed } = recordingPrinter();
-    render(
-      <SalesTerminalView
-        repository={r}
-        printer={printer}
-        printerEndpoint={{ host: '192.168.1.50', port: 9100 }}
-      />,
-    );
+    renderTerminal({
+      repository: r,
+      printer,
+      printerEndpoint: { host: '192.168.1.50', port: 9100 },
+    });
 
     addLatte();
     fireEvent.click(screen.getByRole('button', { name: /ชำระเงิน/ }));
@@ -297,7 +319,7 @@ describe('SalesTerminalView — a print failure is NOT a failed sale', () => {
   it('keeps the basket cleared and still reports the sale as saved', async () => {
     const { repo: r, saved } = repo();
     const { printer } = recordingPrinter({ failWith: 'cannot reach printer at 192.168.1.50:9100' });
-    render(<SalesTerminalView repository={r} printer={printer} />);
+    renderTerminal({ repository: r, printer });
 
     addLatte();
     fireEvent.click(screen.getByRole('button', { name: /ชำระเงิน/ }));
@@ -307,7 +329,7 @@ describe('SalesTerminalView — a print failure is NOT a failed sale', () => {
     // The money was taken. The sale shows as SAVED...
     expect(screen.getByTestId('checkout-receipt')).toBeDefined();
     // ...the basket is empty, because re-ringing would double the sale...
-    expect(screen.getByTestId('sales-item-count').textContent).toBe('0 รายการ');
+    expect(screen.getByTestId('cart-item-count').textContent).toBe('0 รายการ');
     // ...the database has exactly one order...
     expect(saved).toHaveLength(1);
     // ...and the cashier is told the paper failed.
@@ -325,7 +347,7 @@ describe('the receipt IR that crosses the bridge', () => {
   it('uses snake_case for the IR and camelCase for the wrapper', async () => {
     const { repo: r } = repo();
     const { printer, printed } = recordingPrinter();
-    render(<SalesTerminalView repository={r} printer={printer} />);
+    renderTerminal({ repository: r, printer });
 
     addLatte();
     fireEvent.click(screen.getByRole('button', { name: /ชำระเงิน/ }));
@@ -345,7 +367,7 @@ describe('the receipt IR that crosses the bridge', () => {
   it('carries the Thai product name into the receipt body', async () => {
     const { repo: r } = repo();
     const { printer, printed } = recordingPrinter();
-    render(<SalesTerminalView repository={r} printer={printer} />);
+    renderTerminal({ repository: r, printer });
 
     addLatte();
     fireEvent.click(screen.getByRole('button', { name: /ชำระเงิน/ }));
@@ -359,7 +381,7 @@ describe('the receipt IR that crosses the bridge', () => {
   it('is frozen, so a printer cannot mutate the order that produced it', async () => {
     const { repo: r } = repo();
     let captured: ReceiptIr | null = null;
-    const printer: ReceiptPrinter = {
+    const mutatingPrinter: ReceiptPrinter = {
       async print(ir) {
         captured = ir;
         expect(Object.isFrozen(ir)).toBe(true);
@@ -367,7 +389,7 @@ describe('the receipt IR that crosses the bridge', () => {
       },
     };
 
-    render(<SalesTerminalView repository={r} printer={printer} />);
+    renderTerminal({ repository: r, printer: mutatingPrinter });
     addLatte();
     fireEvent.click(screen.getByRole('button', { name: /ชำระเงิน/ }));
 

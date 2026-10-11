@@ -18,7 +18,7 @@
  * @see ../features/sales/application/offlineOrders.ts — the port and the unions
  */
 
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import type { JSX } from 'react';
 
 // `import type` for both of these. `verbatimModuleSyntax` is on repo-wide, and
@@ -34,6 +34,7 @@ import type {
   SyncState,
 } from '../features/sales/application/offlineOrders';
 import type { Money } from '../features/payments/domain/money';
+import { THAI_STATUS_LABELS, THAI_SYNC_LABELS } from '../features/sales/ui/orderLabels';
 import { ALL_SYNC_STATES, summariseSyncStates } from './offlineOrdersSummary';
 import { formatAdjustment } from './moneyFormat';
 
@@ -55,55 +56,55 @@ export interface OfflineOrdersViewProps {
    * making the list slow to paint on the hardware these tills actually run on.
    */
   readonly limit?: number;
+  /**
+   * How the cashier gets back to the sales screen.
+   *
+   * OPTIONAL, and the empty state renders its "กลับไปหน้าขาย" button only when
+   * this is supplied — a screen shown on its own has nowhere to go, and a
+   * permanent button that does nothing is the one control on this screen that
+   * could lie. `AppShell` owns the route, so it passes the navigation down
+   * rather than this view reaching for a global that may not exist.
+   */
+  readonly onGoToSales?: () => void;
 }
 
 /** Rows requested when the caller names no page size. */
 const DEFAULT_LIMIT = 50;
 
+/**
+ * The empty page, shared.
+ *
+ * `state.orders` is already an array on every `loaded` page, so this only stands
+ * in for the two states that have no rows at all — and it is a frozen EMPTY
+ * constant rather than a fresh `[]` so the `useMemo` below does not see a new
+ * reference on every render of a screen that is loading or has failed.
+ */
+const NO_ORDERS: readonly OfflineOrderSummary[] = Object.freeze([]);
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Thai labels for the two ladders
 //
-// BOTH MAPS ARE EXHAUSTIVE BY TYPE, AND THAT IS THE POINT
+// RE-EXPORTED, NOT DECLARED HERE.
 //
-// `Record<OfflineOrderStatus, string>` makes a missing rung a COMPILE error on
-// the screen that is supposed to mention it. That matters because a missing rung
-// is not a blank cell: indexing an object with an absent key yields
-// `undefined`, and React renders `undefined` as nothing at all. A status nobody
-// labelled would show as an empty span in a row whose receipt number, total and
-// line count are all perfectly legible — the one field a cashier needs to be
-// missing, and missing silently, in the one screen opened during a bug report.
+// Both maps moved to `features/sales/ui/orderLabels.ts` when the sales screen's
+// recent-orders strip needed to render the same two badges. Importing them from
+// this route would have made a UI component depend on a route — inverting the
+// layering `layers.test.ts` exists to hold — and would have left two components
+// each holding their own copy of the same map.
 //
-// Exported so the test suite can iterate them and fail loudly when a new rung
-// lands without a label, rather than waiting for the row to render blank.
+// Both maps are EXHAUSTIVE BY TYPE, and that is the point: `Record<
+// OfflineOrderStatus, string>` makes a missing rung a COMPILE error on every
+// screen that might mention it. A missing rung is not a blank cell — indexing an
+// object with an absent key yields `undefined`, and React renders `undefined` as
+// nothing at all. A status nobody labelled would show as an empty chip in a row
+// whose receipt number, total and line count are all perfectly legible.
+//
+// Re-exported so the test suite can still iterate them from this path, and so
+// `OfflineOrdersView.test.tsx` keeps failing loudly when a new rung lands without
+// a label, rather than waiting for a row to render blank.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** Thai wording for each `OfflineOrderStatus`, for the person reading the till. */
-export const THAI_STATUS_LABELS: Readonly<Record<OfflineOrderStatus, string>> = {
-  draft: 'ร่าง',
-  submitted: 'ส่งออเดอร์แล้ว',
-  in_preparation: 'กำลังเตรียมสินค้า',
-  ready: 'พร้อมเสิร์ฟ',
-  served: 'เสิร์ฟแล้ว',
-  completed: 'ปิดรายการ',
-  void_requested: 'ขอยกเลิกออเดอร์',
-  voided: 'ยกเลิกออเดอร์แล้ว',
-};
-
-/**
- * Thai wording for each `SyncState`.
- *
- * Kept separate from the status map above because the two answer different
- * questions and a cashier reconciles them separately: "เสิร์ฟแล้ว รอซิงก์" is a
- * perfectly healthy order, while "เสิร์ฟแล้ว ข้อมูลขัดแย้ง" is the one the shift
- * lead has to phone the back office about. Collapsing them into one badge would
- * hide exactly that difference.
- */
-export const THAI_SYNC_LABELS: Readonly<Record<SyncState, string>> = {
-  pending: 'รอซิงก์',
-  synced: 'ซิงก์แล้ว',
-  conflict: 'ข้อมูลขัดแย้ง',
-  rejected: 'ถูกปฏิเสธ',
-};
+export { THAI_STATUS_LABELS, THAI_SYNC_LABELS };
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Formatting
@@ -176,7 +177,7 @@ type OrdersState =
 // ─────────────────────────────────────────────────────────────────────────────
 
 export function OfflineOrdersView(props: OfflineOrdersViewProps): JSX.Element {
-  const { repository, limit } = props;
+  const { repository, limit, onGoToSales } = props;
   const effectiveLimit = limit ?? DEFAULT_LIMIT;
 
   const [state, setState] = useState<OrdersState>({ kind: 'loading' });
@@ -222,6 +223,49 @@ export function OfflineOrdersView(props: OfflineOrdersViewProps): JSX.Element {
     [state],
   );
 
+  // ── The sync-state filter ─────────────────────────────────────────────────
+  //
+  // A SET rather than "which single rung is selected": the buckets are
+  // independent and additive. A shift lead chasing every conflict AND every
+  // rejected write wants both lit at once, and a single-select control would
+  // make the second press TRADE one filter for the other.
+  //
+  // EMPTY SET MEANS NO FILTER, not "nothing matches". The default state of this
+  // screen is the whole page — the answer to the question the cashier arrived
+  // with — and reaching for a "ทั้งหมด" chip to undo an accidental press would be
+  // one more thing to remember.
+  const [activeStates, setActiveStates] = useState<ReadonlySet<SyncState>>(
+    () => new Set<SyncState>(),
+  );
+
+  const toggleSyncState = useCallback((syncState: SyncState) => {
+    setActiveStates((previous) => {
+      // A fresh Set rather than mutating `previous`: React compares state by
+      // reference, and mutating in place would leave every chip looking unpressed.
+      const next = new Set(previous);
+      if (next.has(syncState)) {
+        next.delete(syncState);
+      } else {
+        next.add(syncState);
+      }
+      return next;
+    });
+  }, []);
+
+  const filtering = activeStates.size > 0;
+
+  // THE PAGE, NARROWED.
+  //
+  // Memoised for the same reason `syncCounts` is: this walks every order, and
+  // the screen re-renders on every chip press. Filtering the LOADED page rather
+  // than the port result — the port is asked once, for the whole page, and no
+  // press here can make it answer again.
+  const visibleOrders = useMemo(() => {
+    if (state.kind !== 'loaded') return NO_ORDERS;
+    if (!filtering) return state.orders;
+    return state.orders.filter((order) => activeStates.has(order.syncState));
+  }, [state, activeStates, filtering]);
+
   // ── Render ────────────────────────────────────────────────────────────────
   // The Thai heading matches the nav label in `app/routes.ts`, so the tab the
   // cashier pressed and the screen it opened say the same thing.
@@ -241,7 +285,7 @@ export function OfflineOrdersView(props: OfflineOrdersViewProps): JSX.Element {
           The trailing colon keeps each label a text node of its own — the row
           badges reuse these four strings, and a test matches one by exact text. */}
       {syncCounts !== null && (
-        <div className="offline-orders__sync-summary" role="status">
+        <div className="offline-orders__sync-summary">
           <ul className="offline-orders__sync-list">
             {ALL_SYNC_STATES.map((syncState) => (
               <li
@@ -249,10 +293,33 @@ export function OfflineOrdersView(props: OfflineOrdersViewProps): JSX.Element {
                 className="offline-orders__sync-item"
                 data-sync-state={syncState}
               >
-                <span className="offline-orders__sync-label">{`${THAI_SYNC_LABELS[syncState]}:`}</span>
-                <span className="offline-orders__sync-count">
-                  {syncCounts.bySyncState[syncState].toString()}
-                </span>
+                {/* `aria-pressed` AND NOT a radio group: the four buckets are
+                    additive filters, and a pressed/unpressed button is exactly
+                    what the attribute means. It also tells a screen reader the
+                    list below is currently narrowed, and by which rungs — which
+                    a plain count never could.
+
+                    `role="status"` IS GONE from this container, and deliberately:
+                    it now holds buttons, and a live region whose contents change
+                    announces the whole bar on every press. The one count still
+                    worth announcing is announced once, at the foot of the screen.
+
+                    The trailing colon on each label is unchanged, and still earns
+                    its place — it keeps the label a text node of its own, because
+                    the row badges reuse these same four strings. */}
+                <button
+                  type="button"
+                  className="offline-orders__sync-filter"
+                  aria-pressed={activeStates.has(syncState)}
+                  onClick={() => {
+                    toggleSyncState(syncState);
+                  }}
+                >
+                  <span className="offline-orders__sync-label">{`${THAI_SYNC_LABELS[syncState]}:`}</span>
+                  <span className="offline-orders__sync-count">
+                    {syncCounts.bySyncState[syncState].toString()}
+                  </span>
+                </button>
               </li>
             ))}
           </ul>
@@ -296,8 +363,59 @@ export function OfflineOrdersView(props: OfflineOrdersViewProps): JSX.Element {
           either strands the cashier waiting for a list that will never arrive,
           or sends the shift lead hunting a sync fault that does not exist. */}
       {state.kind === 'loaded' && state.orders.length === 0 && (
-        <p className="offline-orders__empty">ยังไม่มีออเดอร์ที่บันทึกไว้ในเครื่องนี้</p>
+        <div className="offline-orders__empty" data-testid="offline-orders-empty">
+          {/* A LINE drawing, not a filled glyph: an empty state is a quiet
+              statement of fact, and a solid icon would make it look like a
+              warning. `aria-hidden` because the sentence under it already says
+              everything the shape was saying. */}
+          <svg
+            className="offline-orders__empty-icon"
+            width="56"
+            height="56"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.5"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M6 3.5h12a1 1 0 0 1 1 1v16l-2.4-1.6-2.6 1.6-2.6-1.6L8 20.5 5 18.9v-14.4a1 1 0 0 1 1-1Z" />
+            <path d="M9 8.5h6M9 12.5h4" />
+          </svg>
+          <p className="offline-orders__empty-title">ยังไม่มีออเดอร์ที่บันทึกไว้ในเครื่องนี้</p>
+          {/* WHAT TO DO ABOUT IT. The old line named the condition and stopped,
+              which left the cashier's only move to be guessing. This says the
+              screen is watching the machine and will fill itself in. */}
+          <p className="offline-orders__empty-hint">
+            ออเดอร์ที่ขายขณะออฟไลน์จะแสดงที่นี่ทันทีที่บันทึกลงเครื่องนี้
+          </p>
+          {/* RENDERED ONLY WHEN THERE IS SOMEWHERE TO GO — see `onGoToSales`. */}
+          {onGoToSales !== undefined && (
+            <button
+              type="button"
+              className="offline-orders__empty-action"
+              onClick={onGoToSales}
+            >
+              กลับไปหน้าขาย
+            </button>
+          )}
+        </div>
       )}
+
+      {/* ── Filtered to nothing ───────────────────────────────────────────
+          A DIFFERENT SENTENCE FROM THE EMPTY STATE ABOVE, and the distinction is
+          the whole point: the till HAS orders and the filter is hiding them, so
+          offering "กลับไปหน้าขาย" here would send the cashier away from a screen
+          that is working correctly. Telling them to press a chip again is the
+          action that actually resolves it. */}
+      {state.kind === 'loaded' &&
+        state.orders.length > 0 &&
+        visibleOrders.length === 0 && (
+          <p className="offline-orders__empty-filtered">
+            ไม่มีออเดอร์ในสถานะที่เลือก — กดชิปสถานะอีกครั้งเพื่อแสดงทั้งหมด
+          </p>
+        )}
 
       {/* ── Loaded ───────────────────────────────────────────────────────
           One `li` per order, newest first — the order the port returned is the
@@ -306,9 +424,9 @@ export function OfflineOrdersView(props: OfflineOrdersViewProps): JSX.Element {
           mutate a sale. Every action on an offline order is an outbox write
           (SKILL.md §2.2) and this screen deliberately has no way to perform
           one. */}
-      {state.kind === 'loaded' && state.orders.length > 0 && (
+      {state.kind === 'loaded' && visibleOrders.length > 0 && (
         <ul className="offline-orders__list">
-          {state.orders.map((order) => (
+          {visibleOrders.map((order) => (
             <li key={order.id} className="offline-orders__row" data-testid="offline-order-row">
               <span className="offline-orders__row-receipt">{order.localReceiptNumber}</span>
               <span className="offline-orders__row-status">{THAI_STATUS_LABELS[order.status]}</span>
@@ -354,11 +472,25 @@ export function OfflineOrdersView(props: OfflineOrdersViewProps): JSX.Element {
       )}
 
       {/* ── Summary ──────────────────────────────────────────────────────
-          How many orders were actually loaded, announced politely when the rows
-          arrive. A count rather than a bare list, because a truncated page and a
-          complete one must be distinguishable at a glance: fifty rows means the
-          port honoured the page size, and any other number means the terminal is
-          showing only part of the day's history. */}
+          STILL A LIVE REGION, AND STILL THE COUNT THAT MATTERS — a truncated page
+          and a complete one must be distinguishable: fifty rows means the port
+          honoured the page size, and any other number means the terminal is
+          showing only part of the day's history.
+
+          BUT NO LONGER VISIBLE. It used to sit at the bottom-left corner as grey
+          13px text, and on an empty screen it read "โหลดออเดอร์ 0 รายการ" under a
+          heading that already said, in much larger type, that this terminal holds
+          no orders. A page whose only content is "nothing here", stated twice and
+          in the smallest type available, is a page that looks broken rather than
+          empty.
+
+          CLIPPED, NOT `display: none`, so it stays in the accessibility tree and
+          is still announced when the rows arrive — which is the job it was
+          written for. See `.offline-orders__summary` in `offline-orders.css`.
+
+          It counts `state.orders`, NOT `visibleOrders`: this reports what the port
+          returned, so the figure does not change as chips are pressed and two
+          numbers on one screen never mean two different things. */}
       {state.kind === 'loaded' && (
         <p className="offline-orders__summary" role="status">
           {`โหลดออเดอร์ ${state.orders.length} รายการ`}

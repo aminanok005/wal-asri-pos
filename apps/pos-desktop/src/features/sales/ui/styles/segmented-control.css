@@ -1,0 +1,370 @@
+/*
+ * segmented-control.css — the one exclusive choice on the till, drawn once.
+ *
+ * Used for BOTH the fulfilment pair and the payment channel group. They are the
+ * same control with different options, which is why they are the same control:
+ * a till with two answers to "pick one of these" has two sets of hit boxes to
+ * learn, and a cashier who has learned one should not have to learn the other.
+ *
+ * THE THUMB. One element carries the selection and slides between the options
+ * with `transform`. The alternative — each option painting its own selected
+ * background — makes the selection appear and disappear, and the cashier's eye
+ * is usually not on the control: it is on the customer or on the next tile they
+ * mean to press. A pill that visibly MOVES answers "which one is selected?" from
+ * peripheral vision alone.
+ *
+ * `transform` and never `left`/`margin`, per `UI-GUIDE.md` §4: animating a
+ * layout property re-runs layout every frame, and this control changes on every
+ * press. The 200ms is longer than the app-wide 0.15s on purpose — this is the
+ * one motion on the till that is meant to be watched.
+ *
+ * @see ./tokens.css — every colour and tap size below
+ * @see ./sales-terminal.css — where the two instances sit in the order rail
+ */
+
+/* ── The fieldset: structure only, no chrome ──────────────────────────────── */
+
+.segmented-control {
+  /*
+   * Unstyled on purpose. The pill you see is `.segmented-control__well`; a
+   * fieldset with its own background and a 999px radius would swallow the
+   * legend, and a 999px radius is only correct around the WELL.
+   */
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+/* Keyboard focus has to be visible somewhere. See the option rule below — the
+   ring is drawn on the OPTION, because the focused element is a clipped 1px
+   input that cannot show a ring of its own. */
+.segmented-control__input:focus-visible {
+  outline: none;
+}
+
+/* ── Legend ───────────────────────────────────────────────────────────────── */
+
+.segmented-control__legend {
+  padding: 0;
+  font-weight: 500;
+}
+
+/*
+ * Shown: three payment chips labelled only เงินสด / QR / พร้อมเพย์ leave a new
+ * cashier guessing what the row IS. The group needs to say what it is.
+ */
+.segmented-control__legend--shown {
+  margin-bottom: 8px;
+  color: var(--mut);
+  font-size: 13px;
+}
+
+/*
+ * Clipped, and kept in the accessibility tree.
+ *
+ * Not `display: none`, which would leave the radio group with NO accessible name
+ * at all — the exact failure the `<legend>` exists to prevent. Clipped instead:
+ * still announced, absent from the page.
+ */
+.segmented-control__legend--clipped {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* ── The well ─────────────────────────────────────────────────────────────── */
+
+.segmented-control__well {
+  /*
+   * Grid with equal tracks, so "every option the same width" is structural
+   * rather than a thing to be kept in step by hand. `n` options, `n` tracks,
+   * each `1fr` — adding an option cannot make one wider than the rest.
+   */
+  display: grid;
+  grid-auto-columns: 1fr;
+  grid-auto-flow: column;
+  position: relative;
+  gap: var(--seg-gap);
+  padding: var(--seg-pad);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--card-2);
+
+  /* The thumb's geometry reads these, so the arithmetic below lives in ONE
+     place instead of being repeated per option position. The values are the
+     same two the properties above use — a thumb that disagreed with the gap it
+     slides across would drift a few pixels per option and sit wrong by the
+     third. */
+  --seg-gap: 4px;
+  --seg-pad: 4px;
+
+  /*
+   * No default, ON PURPOSE, and this is the component's one degradation path.
+   *
+   * The `:has()` rules below set both values together from the checked radio, so
+   * in normal use they are always set. They are left undefined here so that if
+   * `value` and `options` are ever handed something inconsistent — a `value`
+   * matching no option, so no radio is checked — then `--seg-count` never
+   * resolves, the width divides by nothing, and the thumb is NOT PAINTED AT ALL.
+   *
+   * A missing thumb is the honest outcome. Defaulting to `--seg-count: 1` would
+   * instead draw a full-width pill at the first slot, over a selected option
+   * sitting elsewhere in the group: a control actively claiming "ทานที่ร้าน is
+   * selected" when nothing is. On a till, a wrong selection is worse than an
+   * absent hint, because the cashier reads the pill and stops looking.
+   */
+}
+
+/* ── The selected option, addressed by position ───────────────────────────── */
+
+/*
+ * ── HOW MANY OPTIONS, AND WHICH IS CHECKED ──
+ *
+ * Two independent numbers, and conflating them is what this comment exists to
+ * prevent:
+ *
+ *   --seg-count  how many options the group HAS (3 for the payment channels)
+ *   --seg-index  which option is CHECKED  (0-based)
+ *
+ * The thumb's WIDTH divides by the count and its POSITION multiplies by the
+ * index. Reading the count off the checked option's own position makes them the
+ * same number, which renders correctly for exactly one option — the last — and
+ * wrong for every other. On first paint, with the first of three channels
+ * checked, the pill was drawn as a single full-width segment covering the whole
+ * well, sitting on top of all three labels at once.
+ *
+ * ⚠️ THE SELECTORS NAME THE `<label>`, NOT THE `<input>`, and that is not
+ * interchangeable. `:nth-of-type()` counts among SIBLINGS OF THE SAME TYPE, and
+ * each radio is the only child of its own label — so `.segmented-control__input:
+ * nth-of-type(2)` matches nothing at all, because there is never a second input
+ * sibling to count. The labels are siblings of each other inside the well, and
+ * that is the sequence these rules walk.
+ *
+ * Like the bug above, that one is invisible to a component test: `happy-dom` has
+ * no layout engine and cannot measure a width, so every assertion passed while
+ * the pill was visibly wrong. Geometry claims are verified in a browser.
+ */
+
+/*
+ * The COUNT, summed rather than read off the checked option.
+ *
+ * Each `--seg-n<n>` is 1 when an nth option exists and 0 when it does not, so the
+ * sum IS the option count. Counting has to be done this way because every rule
+ * that matches contributes to one custom property, and a plain
+ * `--seg-count: 3` in five rules would just be the LAST one to match — five rules
+ * cannot express five different totals.
+ */
+.segmented-control__well {
+  --seg-n1: 0;
+  --seg-n2: 0;
+  --seg-n3: 0;
+  --seg-n4: 0;
+  --seg-n5: 0;
+}
+
+.segmented-control__well:has(.segmented-control__option:nth-of-type(1)) {
+  --seg-n1: 1;
+}
+
+.segmented-control__well:has(.segmented-control__option:nth-of-type(2)) {
+  --seg-n2: 1;
+}
+
+.segmented-control__well:has(.segmented-control__option:nth-of-type(3)) {
+  --seg-n3: 1;
+}
+
+.segmented-control__well:has(.segmented-control__option:nth-of-type(4)) {
+  --seg-n4: 1;
+}
+
+.segmented-control__well:has(.segmented-control__option:nth-of-type(5)) {
+  --seg-n5: 1;
+}
+
+.segmented-control__well {
+  /*
+   * `--seg-count: 0` when the group somehow has no options, which makes the
+   * thumb's `width` divide by zero. An invalid `calc()` is not rendered at all,
+   * so the pill disappears rather than appearing somewhere arbitrary — the same
+   * honest failure as having no checked option.
+   */
+  --seg-count: calc(var(--seg-n1) + var(--seg-n2) + var(--seg-n3) + var(--seg-n4) + var(--seg-n5));
+}
+
+/*
+ * The INDEX — from `:has()`, never from a class.
+ *
+ * The checked state is the DOM's own truth. A class kept in step with `checked`
+ * by hand is a second source, right only for as long as nobody forgets, and when
+ * they forget the pill moves to the wrong option while every test still passes.
+ *
+ * Exactly one of these matches at a time, because exactly one radio in a group is
+ * checked — which is what makes a plain `--seg-index` (rather than a sum) correct
+ * here.
+ */
+.segmented-control__well:has(.segmented-control__option:nth-of-type(1) input:checked) {
+  --seg-index: 0;
+}
+
+.segmented-control__well:has(.segmented-control__option:nth-of-type(2) input:checked) {
+  --seg-index: 1;
+}
+
+.segmented-control__well:has(.segmented-control__option:nth-of-type(3) input:checked) {
+  --seg-index: 2;
+}
+
+.segmented-control__well:has(.segmented-control__option:nth-of-type(4) input:checked) {
+  --seg-index: 3;
+}
+
+.segmented-control__well:has(.segmented-control__option:nth-of-type(5) input:checked) {
+  --seg-index: 4;
+}
+
+/* ── The thumb ────────────────────────────────────────────────────────────── */
+
+.segmented-control__thumb {
+  /*
+   * Positioned over the well, never IN the flow — it is decoration, and a
+   * thumb that took a grid cell would push the options it is meant to sit under.
+   */
+  position: absolute;
+  top: var(--seg-pad);
+  left: var(--seg-pad);
+  pointer-events: none;
+
+  /* Exactly one option's width: the well's inner width less the padding either
+     side and the gaps between options, divided by the options themselves. */
+  width: calc(
+    (
+        100% - 2 * var(--seg-pad) - (var(--seg-count) - 1) * var(--seg-gap)
+      ) / var(--seg-count)
+  );
+  height: calc(100% - 2 * var(--seg-pad));
+
+  /*
+   * Step by one option's width PLUS one gap, which is why `--seg-gap` is named
+   * above rather than left to the shorthand: translating by the width alone
+   * would leave each position one gap short of the option it belongs to.
+   */
+  transform: translateX(
+    calc(var(--seg-index) * (100% + var(--seg-gap)))
+  );
+
+  border-radius: 999px;
+  background: var(--acc-grad);
+  color: var(--on-acc);
+  box-shadow: var(--glow-acc);
+  transition: transform 200ms ease;
+}
+
+/* ── An option ────────────────────────────────────────────────────────────── */
+
+.segmented-control__option {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /*
+   * The full tap size, and NOT `--tap-sm`. This rule used to size the payment
+   * chips at 44px; it is now 48px because the control is a segment of a moving
+   * pill, and a target the cashier has to hit while watching the pill slide is
+   * the one target on this screen that must not be short.
+   */
+  min-height: var(--tap);
+  padding: 6px 8px;
+  color: var(--mut);
+  font-size: 13px;
+  text-align: center;
+  /* Thai stacks a vowel or tone mark ABOVE its consonant; a Latin-tight line
+     height clips the mark on a label like พร้อมเพย์. */
+  line-height: 1.4;
+  cursor: pointer;
+  transition: color 0.15s ease;
+}
+
+/*
+ * THE FOCUS RING, drawn here rather than on the input.
+ *
+ * The focused element is a clipped 1px input — it cannot render a ring a person
+ * could see, and the app-wide `:focus-visible` rule from `index.css` would draw
+ * one that is itself clipped away. A keyboard user tabbing to the fulfilment
+ * pair would have no idea where they were. `:has()` moves the ring to the visible
+ * option, which is what the rule was always for.
+ */
+.segmented-control__option:has(.segmented-control__input:focus-visible) {
+  outline: 2px solid var(--acc);
+  outline-offset: 1px;
+  border-radius: 999px;
+}
+
+/* The selected option's label turns white, because the accent pill has slid
+   UNDER it and dark grey on the orange gradient is the one pairing on this
+   screen that fails to read. */
+.segmented-control__option:has(.segmented-control__input:checked) {
+  color: var(--on-acc);
+  font-weight: 600;
+}
+
+.segmented-control__option:has(.segmented-control__input:disabled) {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* ── The radio itself ─────────────────────────────────────────────────────── */
+
+/*
+ * CLIPPED, NOT REMOVED.
+ *
+ * This is the load-bearing rule of the whole component. `display: none` or
+ * `visibility: hidden` would take the input out of the layout and out of
+ * dispatching events, and three things break at once:
+ *
+ *   • Tab could not reach the group, and the arrow keys — the standard way a
+ *     radio group is operated — would have nothing to operate on.
+ *   • The radio leaves the accessibility tree, so `getByRole('radio', …)` in the
+ *     screen's own tests finds nothing.
+ *   • A click dispatched straight at the input dispatches nothing, which is how
+ *     the payment tests select a channel.
+ *
+ * Clipped, the input keeps all three and occupies 1x1px.
+ *
+ * Placed BEFORE the label text in the DOM, so it is the first thing a click at
+ * the start of the option lands on — the option is the tap target either way,
+ * but a hit at its left edge should reach the control and not the text node.
+ */
+.segmented-control__input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ── Reduced motion ───────────────────────────────────────────────────────── */
+
+/*
+ * The pill still MOVES to the selected option — it must, or nothing on screen
+ * says which option is selected, and that is information, not decoration. What
+ * is dropped is the 200ms SLIDE across the gap between them.
+ *
+ * That distinction is the point. `prefers-reduced-motion` exists because motion
+ * can provoke vestibular symptoms, and a pill travelling the width of a control
+ * is exactly the kind of large-area movement that does it. Appearing in place is
+ * not.
+ */
+@media (prefers-reduced-motion: reduce) {
+  .segmented-control__thumb {
+    transition: none;
+  }
+}

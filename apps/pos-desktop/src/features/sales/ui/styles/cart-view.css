@@ -24,10 +24,17 @@
   top: 0;
   max-height: 100vh;
   min-width: 0;
-  padding: 14px;
+  padding: 16px;
   border: 1px solid var(--line);
-  border-radius: 16px;
+  border-radius: 18px;
   background: var(--card);
+  /* Resting elevation, matching the menu tiles: the basket is the OTHER object
+     on the page that money comes out of, and it earns the same lift. Inside
+     `.sales-terminal__rail` the sticky/max-height above are overridden — the
+     RAIL owns stickiness there so the pay button below can pin too — and this
+     block still applies when the panel renders standalone (its component
+     tests, and any future screen that embeds it alone). */
+  box-shadow: var(--shadow-1);
 }
 
 .cart-view__header {
@@ -37,21 +44,52 @@
   gap: 10px;
 }
 
+/*
+ * The heading and the count that qualifies it, grouped so the header's
+ * `space-between` still parks `ล้างตะกร้า` hard right while these two travel
+ * together as one unit. Without the wrapper the count would sit at the opposite
+ * end of the panel from the word it describes.
+ */
+.cart-view__title {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+
 .cart-view__header h2 {
   margin: 0;
   font-size: 18px;
 }
 
+/*
+ * The count — SECONDARY to the heading, and never a price.
+ *
+ * `--mut-strong` at 13px, rather than `--mut` at 12px: this is the line a cashier
+ * reads to tell whether the basket holds what the customer ordered, and `--mut`
+ * measures 3.94:1 on this panel's own `--card` in the light theme — under the
+ * 4.5:1 that text of this size owes. `tabular-nums` so a count growing from 9 to
+ * 10 does not shove the heading it sits beside sideways.
+ */
+.cart-view__count {
+  color: var(--mut-strong);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
 /* "Clear cart" stays quiet: one accidental press destroys every line in the
    basket and there is no undo. It keeps a full tap size — clearing should take
-   one deliberate press, not a hunt. */
+   one deliberate press, not a hunt. That press now ARMS a confirmation rather
+   than emptying the basket outright; see `.cart-view__confirm` below.
+   `--mut-strong` for the same reason as the count: this label is 13px text. */
 .cart-view__header button {
   min-height: var(--tap-sm);
   padding: 6px 12px;
   border: 1px solid var(--line);
   border-radius: 12px;
   background: var(--bg);
-  color: var(--mut);
+  color: var(--mut-strong);
   font: inherit;
   font-size: 13px;
   cursor: pointer;
@@ -65,6 +103,85 @@
 .cart-view__header button:not(:disabled):hover {
   border-color: var(--danger);
   color: var(--danger);
+}
+
+/*
+ * ── The clear-cart confirmation ────────────────────────────────────────────
+ *
+ * Inline, directly under the button that armed it, rather than centred over the
+ * screen: the question is about the basket, and the answer belongs beside the
+ * evidence rather than on top of it.
+ *
+ * A recessed `--bg-2` well rather than a second card: this is a two-button
+ * confirmation inside a panel that already has one edge, and a bordered box of
+ * its own would put the nesting back that the consolidation removed.
+ *
+ * `:focus-visible` is styled because the container takes focus on open
+ * (`autoFocus` + `tabIndex={-1}` in the TSX) — without a ring, a keyboard user
+ * would have no idea the dialog had appeared, only that their next Tab landed
+ * somewhere new.
+ */
+.cart-view__confirm {
+  flex: none;
+  padding: 12px 14px;
+  border-radius: 14px;
+  background: var(--bg-2);
+}
+
+.cart-view__confirm:focus-visible {
+  outline: 2px solid var(--acc);
+  outline-offset: 2px;
+}
+
+.cart-view__confirm-question {
+  margin: 0 0 10px;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.cart-view__confirm-actions {
+  display: flex;
+  gap: 8px;
+}
+
+/*
+ * Cancel first and quiet: it is the answer the dialog must make easy to reach,
+ * because the cashier who reached for `ล้างตะกร้า` by mistake is exactly the
+ * one who should not have to aim to put the basket back.
+ */
+.cart-view__confirm-actions button {
+  flex: 1;
+  min-height: var(--tap-sm);
+  padding: 8px 12px;
+  border-radius: 12px;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.cart-view__confirm-cancel {
+  border: 1px solid var(--line);
+  background: var(--card);
+  color: var(--ink);
+}
+
+.cart-view__confirm-cancel:hover {
+  border-color: var(--ink);
+}
+
+/* The destructive one. Danger-tinted, not accent-gradient: the accent on this
+   app means "go" (pay, add), and a confirm that destroys the basket should not
+   wear the same colour as the button that takes the money. */
+.cart-view__confirm-accept {
+  border: 1px solid var(--danger);
+  background: var(--card);
+  color: var(--danger);
+}
+
+.cart-view__confirm-accept:hover {
+  background: var(--danger);
+  color: var(--on-acc);
 }
 
 /*
@@ -148,10 +265,13 @@
   overflow-wrap: anywhere;
 }
 
-.cart-view__item-sku {
-  color: var(--mut);
-  font-size: 11px;
+/* Secondary line under the name: "จำนวน × ราคาต่อหน่วย". */
+.cart-view__item-unit-price {
+  color: var(--mut-strong);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
 }
+
 
 .cart-view__item-quantity {
   display: flex;
@@ -160,20 +280,51 @@
   flex: none;
 }
 
-/* The − and + steppers, at the prototype's own 48x48. Under 48px these are the
-   likeliest controls to be missed on a touchscreen, and a missed tap lands on the
-   neighbouring stepper: an item the customer did not ask for. */
+/*
+ * The − and + steppers, at the prototype's own 48x48 — but split into TWO
+ * treatments, the reference design's pair: − rests quiet on a recessed well
+ * (removing is the correction a cashier makes least often and should aim at
+ * deliberately), + is a solid accent disc with the accent's glow (adding is
+ * what a till does all shift long). Same silhouette, same tap size, one
+ * obvious "yes".
+ *
+ * Under 48px these are the likeliest controls to be missed on a touchscreen,
+ * and a missed tap lands on the neighbouring stepper: an item the customer did
+ * not ask for. `border-radius: 999px` makes each a circle — the one shape a
+ * thumb finds without looking.
+ */
 .cart-view__item-quantity button {
   width: var(--tap);
   height: var(--tap);
-  border: 0;
-  border-radius: 12px;
-  background: var(--accs);
-  color: var(--acc);
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: var(--bg-2);
+  color: var(--ink);
   font: inherit;
-  font-size: 20px;
+  font-size: 22px;
   line-height: 1;
   cursor: pointer;
+  transition:
+    background-color 0.15s ease,
+    border-color 0.15s ease,
+    color 0.15s ease,
+    box-shadow 0.15s ease;
+}
+
+/* First child of `.cart-view__item-quantity` is the − button, last is the + —
+   the JSX renders minus, count, plus in that order. Structural selectors, not
+   aria-label matching: the labels carry the product name and are the tests'
+   query surface; styling keyed off them would restyle the whole pair the
+   moment a product name changed wording. */
+.cart-view__item-quantity button:first-child {
+  border-color: var(--line);
+}
+
+.cart-view__item-quantity button:last-child {
+  background: var(--acc-grad);
+  border-color: transparent;
+  color: var(--on-acc);
+  box-shadow: var(--glow-acc);
 }
 
 .cart-view__item-count {
@@ -191,31 +342,23 @@
   flex: none;
 }
 
-.cart-view__item-unit {
-  color: var(--mut);
-  font-size: 11px;
-  font-variant-numeric: tabular-nums;
-}
-
 .cart-view__item-total {
   font-size: 14px;
   font-weight: 700;
   font-variant-numeric: tabular-nums;
 }
 
-/* Delete: full tap size, muted by default. It is destructive on a row the cashier
-   can also empty by pressing −, so it need not shout to be found. */
+/* Delete: full tap size (48x48), icon-only SVG. Muted by default, red on hover. */
 .cart-view__item-remove {
   flex: none;
-  min-width: var(--tap);
-  min-height: var(--tap);
-  padding: 0 8px;
+  width: var(--tap);
+  height: var(--tap);
+  padding: 0;
   border: 1px solid transparent;
   border-radius: 12px;
   background: none;
   color: var(--mut);
   font: inherit;
-  font-size: 13px;
   cursor: pointer;
 }
 
@@ -224,36 +367,53 @@
   color: var(--danger);
 }
 
-/* ── Summary ────────────────────────────────────────────────────────────── */
+.cart-view__item-remove svg {
+  width: 24px;
+  height: 24px;
+}
 
-/* Pinned to the bottom of the flex column so the subtotal stays in one place as
-   lines are added. A subtotal that moves is one a cashier must re-find mid-sale. */
-.cart-view__summary {
-  display: flex;
-  justify-content: space-between;
-  align-items: baseline;
-  gap: 10px;
+/* Thumbnail 48x48 circle for item preview */
+.cart-view__thumbnail-container {
   flex: none;
-  padding: 12px;
-  border-radius: 14px;
-  background: var(--bg);
-  font-size: 13px;
+  width: var(--tap);
+  height: var(--tap);
+  border-radius: 999px;
+  overflow: hidden;
+  background: var(--card-2);
 }
 
-.cart-view__summary-label {
-  color: var(--mut);
+/* Image thumbnail */
+.cart-view__thumbnail {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
 }
 
-.cart-view__summary-value {
-  font-size: 20px;
-  font-weight: 800;
-  font-variant-numeric: tabular-nums;
+/*
+ * Letter thumbnail — the fallback for a variant with no `image_url`.
+ *
+ * `--card-2` + `--ink`, NOT `--accs` + `--acc`: measured contrast for the
+ * accent pair is 2.80:1 in the light theme (5.78:1 dark), which fails for a
+ * glyph read at a glance, while `--ink` on `--card-2` is 15.1:1 light and
+ * 13.2:1 dark. One rule, both themes, because the tokens already flip in the
+ * dark blocks of `tokens.css`. `--card-2` is also the rung meant for an inner
+ * panel on a card, which is exactly what this is.
+ */
+.cart-view__thumbnail--letter {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--card-2);
+  color: var(--ink);
+  font-size: 18px;
+  font-weight: 700;
+  line-height: 1;
 }
 
 .cart-view__empty {
   margin: 0;
   padding: 28px 0;
-  color: var(--mut);
+  color: var(--mut-strong);
   text-align: center;
   font-size: 13px;
 }

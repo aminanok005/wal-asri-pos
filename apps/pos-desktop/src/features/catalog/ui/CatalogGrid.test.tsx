@@ -43,10 +43,27 @@ afterEach(() => {
 // need to scope their queries to the grid rather than to the whole page.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** A grid with the given index, an inert selection handler unless overridden. */
-function renderGrid(index: CatalogIndex, onSelect?: (entry: CatalogEntry) => void): void {
+/**
+ * A grid with the given index, an inert selection handler unless overridden, and
+ * an optional basket for the quantity badges.
+ *
+ * `quantities` is spread conditionally rather than passed as `undefined`: the
+ * repo compiles with `exactOptionalPropertyTypes`, so an explicit `undefined`
+ * is a type error against an optional prop.
+ */
+function renderGrid(
+  index: CatalogIndex,
+  onSelect?: (entry: CatalogEntry) => void,
+  quantities?: ReadonlyMap<string, bigint>,
+): void {
   const handler = onSelect ?? ((): void => {});
-  render(<CatalogGrid index={index} onSelect={handler} />);
+  render(
+    <CatalogGrid
+      index={index}
+      onSelect={handler}
+      {...(quantities === undefined ? {} : { quantities })}
+    />,
+  );
 }
 
 /** The grid container. */
@@ -69,15 +86,41 @@ function tileText(nameTh: string): string {
   return tile(nameTh).textContent ?? '';
 }
 
+/** The `<ul>` of tiles, or `null` when the grid is in its empty state. */
+function tiles(): HTMLElement | null {
+  return screen.queryByTestId('catalog-tiles');
+}
+
+/**
+ * The `<ul>` of tiles, loudly.
+ *
+ * For tests that cannot be about an empty grid: a fixture mistake that emptied
+ * the grid would otherwise turn "every tile has an accessible name" into a test
+ * that quietly passes over nothing at all.
+ */
+function mustTiles(): HTMLElement {
+  const found = tiles();
+  if (found === null) {
+    throw new Error('expected tiles, but the grid rendered its empty state instead');
+  }
+  return found;
+}
+
 /**
  * How many tiles are on the grid — zero included.
  *
- * `queryAll`, not `getAll`: an empty grid is one of the states under test, and a
- * helper that throws on it would turn "the empty state rendered" into a test that
- * fails for the wrong reason.
+ * Scoped to `data-testid="catalog-tiles"`, the `<ul>` of tiles, and NOT to the
+ * grid as a whole. The grid also holds the withheld-items chip, whose button is
+ * chrome: counting every button under the grid counted the warning as a ninth
+ * sellable drink. The list itself contains nothing but tile buttons — the
+ * quantity badge is a `<span>`, deliberately — so this is the tile count.
+ *
+ * Zero when the list is ABSENT: an empty grid renders the empty-state paragraph
+ * instead of a `<ul>`, and that is one of the states under test.
  */
 function tileCount(): number {
-  return within(grid()).queryAllByRole('button').length;
+  const list = tiles();
+  return list === null ? 0 : within(list).queryAllByRole('button').length;
 }
 
 /** The withheld-items warning line, or `null` when nothing was withheld. */
@@ -182,7 +225,7 @@ describe('CatalogGrid — the resolved menu', () => {
   it('gives every tile an accessible name that is the item and nothing else', () => {
     renderGrid(resolvedIndex());
 
-    const labels = within(grid())
+    const labels = within(mustTiles())
       .getAllByRole('button')
       .map((button) => button.getAttribute('aria-label') ?? '');
     expect(labels).toHaveLength(8);
@@ -356,6 +399,137 @@ describe('CatalogGrid — withheld items warning', () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 7. The quantity badge
+//
+// The badge answers "how many of this is already in the basket?" while the
+// cashier is looking at the MENU, not the cart. Without it, confirming a quantity
+// means looking away from the thing being chosen — and on a till that is how a
+// third latte gets rung up twice.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('CatalogGrid — the quantity badge', () => {
+  /** A map of variant id → how many are in the basket. */
+  function basket(quantities: readonly { readonly sku: string; readonly qty: bigint }[]) {
+    const map = new Map<string, bigint>();
+    for (const { sku, qty } of quantities) {
+      map.set(variantFor(sku), qty);
+    }
+    return map;
+  }
+
+  it('renders NO badge at all when no basket is passed', () => {
+    renderGrid(resolvedIndex());
+
+    // The default is an absent prop, not an empty map: a grid with no basket
+    // behind it still renders, and every existing caller is unaffected.
+    expect(grid().querySelector('.catalog-grid__tile-badge')).toBeNull();
+  });
+
+  it('shows the quantity on the tile for a variant in the basket', () => {
+    renderGrid(
+      resolvedIndex(),
+      undefined,
+      basket([{ sku: 'BEV-LATTE-12', qty: 2n }]),
+    );
+
+    expect(tile('กาแฟลาเต้').textContent).toContain('×2');
+    // And only on THAT tile — a badge that appeared on every card would say
+    // "2 of everything", which is a worse lie than no badge.
+    expect(tile('มอคค่า').textContent).not.toContain('×');
+  });
+
+  it('renders nothing for a zero quantity, rather than a "×0"', () => {
+    // A quantity of zero is not in the basket. "×0" on a menu tile reads as a
+    // real count the cashier has to interpret, and invites a tap that does
+    // nothing.
+    renderGrid(
+      resolvedIndex(),
+      undefined,
+      basket([{ sku: 'BEV-LATTE-12', qty: 0n }]),
+    );
+
+    expect(tile('กาแฟลาเต้').textContent).not.toContain('×0');
+    expect(grid().querySelector('.catalog-grid__tile-badge')).toBeNull();
+  });
+
+  it('does NOT change the tile button count — a badge is not a button', () => {
+    renderGrid(
+      resolvedIndex(),
+      undefined,
+      basket([
+        { sku: 'BEV-LATTE-12', qty: 2n },
+        { sku: 'BEV-MOCHA-12', qty: 1n },
+      ]),
+    );
+
+    // Every tile here is still ONE control. A badge rendered as a button would
+    // make the menu offer nine ways to sell something when it offers eight, and
+    // `tileCount()` — how the grid's own tests count tiles — would read it as an
+    // extra menu item.
+    expect(tileCount()).toBe(8);
+  });
+
+  it('keeps the badge OUT of the tile\'s accessible name', () => {
+    renderGrid(
+      resolvedIndex(),
+      undefined,
+      basket([{ sku: 'BEV-LATTE-12', qty: 3n }]),
+    );
+
+    // The name is the item and nothing else. A screen reader announcing
+    // "เพิ่ม กาแฟลาเต้ ×3" is reading the badge as part of the label, and the
+    // badge is decorative — the quantity is spoken by the cart row instead.
+    expect(tile('กาแฟลาเต้').getAttribute('aria-label')).toBe('เพิ่ม กาแฟลาเต้');
+  });
+
+  it('still shows the price, so a badged tile is as readable as an unbadged one', () => {
+    renderGrid(
+      resolvedIndex(),
+      undefined,
+      basket([{ sku: 'BEV-LATTE-12', qty: 2n }]),
+    );
+
+    // The badge is an addition to the card, never a replacement for any of it.
+    expect(tileText('กาแฟลาเต้')).toContain('฿45.50');
+    expect(tileText('กาแฟลาเต้')).toContain('กาแฟลาเต้');
+  });
+
+  it('gives each tile a colour panel, chosen from the variant id', () => {
+    renderGrid(resolvedIndex());
+
+    // A CLASS, never an inline `style`: the webview runs under
+    // `csp: "default-src 'self'"`, and an inline style attribute has no 'self'
+    // source — so the prototype's inline gradient would build cleanly and
+    // render every card colourless.
+    for (const button of within(mustTiles()).getAllByRole('button')) {
+      const media = button.querySelector('.catalog-grid__tile-media');
+      expect(media).not.toBeNull();
+      expect(media?.getAttribute('style')).toBeNull();
+      expect(media?.getAttribute('class')).toMatch(/catalog-grid__tile-media--\d/);
+    }
+  });
+
+  it('gives the SAME variant the SAME colour on every render', () => {
+    const index = resolvedIndex();
+    renderGrid(index);
+    const first = tile('กาแฟลาเต้').querySelector('[class*="tile-media--"]')?.getAttribute('class');
+
+    cleanup();
+    renderGrid(index);
+
+    // Keyed off the variant id rather than render order: a latte that changed
+    // colour because the branch added a category would make two tills showing
+    // different snapshots show the same drink in different colours.
+    expect(tile('กาแฟลาเต้').querySelector('[class*="tile-media--"]')?.getAttribute('class')).toBe(
+      first,
+    );
+    // Non-vacuous: the lookup above must actually have found a panel, or this
+    // would pass with two `undefined`s.
+    expect(first).toMatch(/tile-media--\d/);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // 6. Money on the tile
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -380,7 +554,7 @@ describe('CatalogGrid — money on the tile', () => {
   it('keeps two decimal places on every tile, whatever the satang count', () => {
     renderGrid(resolvedIndex());
 
-    for (const button of within(grid()).getAllByRole('button')) {
+    for (const button of within(mustTiles()).getAllByRole('button')) {
       expect(button.textContent).toMatch(/฿\d+\.\d{2}/);
     }
   });

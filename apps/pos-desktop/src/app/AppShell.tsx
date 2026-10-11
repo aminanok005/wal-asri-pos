@@ -33,6 +33,7 @@ import { createInMemoryOfflineOrdersRepository } from '../features/sales/applica
 import type { OfflineOrdersRepository } from '../features/sales/application/offlineOrders';
 import { OfflineOrdersView } from '../routes/OfflineOrdersView';
 import { SalesTerminalView } from '../routes/SalesTerminalView';
+import { EcosystemApp } from '../ecosystem/EcosystemApp';
 import {
   DEFAULT_ROUTE,
   ROUTES,
@@ -90,7 +91,7 @@ function resolveInitialRoute(initialRoute: RouteId | undefined): RouteId {
 }
 
 /**
- * The shell's standalone port: a REAL adapter with no rows behind it.
+ * The screen's standalone port: a REAL adapter with no rows behind it.
  *
  * Module-level and built once, deliberately. `createInMemoryOfflineOrdersRepository`
  * returns a fresh frozen object on every call, and `OfflineOrdersView` re-reads
@@ -99,6 +100,19 @@ function resolveInitialRoute(initialRoute: RouteId | undefined): RouteId {
  * screen would read, render, re-read and render forever.
  */
 const EMPTY_ORDERS_REPOSITORY: OfflineOrdersRepository = createInMemoryOfflineOrdersRepository();
+
+/**
+ * Async function that loads terminal identity from the native command.
+ * Uses dynamic import so tests (which don't have Tauri) can render AppShell
+ * without this function being called.
+ */
+async function loadTerminalIdentity(): Promise<{
+  readonly terminalId: string;
+  readonly branchId: string;
+}> {
+  const { getTerminalIdentity } = await import('../features/sales/infrastructure/tauriOfflineOrders');
+  return getTerminalIdentity();
+}
 
 /**
  * The compile-time half of the exhaustive check in `renderRoute`.
@@ -128,15 +142,24 @@ function assertRouteIsExhaustive(value: never): void {
  * sales screen the cashier did not ask for is a recoverable annoyance. A blank
  * one is a queue.
  */
-function renderRoute(route: RouteId, ordersRepository: OfflineOrdersRepository): JSX.Element {
+function renderRoute(
+  route: RouteId,
+  ordersRepository: OfflineOrdersRepository,
+  onGoToSales: () => void,
+): JSX.Element {
   switch (route) {
     case ROUTES.offline_orders:
-      return <OfflineOrdersView repository={ordersRepository} />;
+      // The history screen's empty state offers "กลับไปหน้าขาย", and the SHELL
+      // owns the route — so the way back is handed down rather than reached for
+      // in a global the route file is not allowed to know about.
+      return <OfflineOrdersView repository={ordersRepository} onGoToSales={onGoToSales} />;
+    case ROUTES.smart_restaurant:
+      return <EcosystemApp />;
     case ROUTES.sales:
-      return <SalesTerminalView />;
+      return <SalesTerminalView ordersRepository={ordersRepository} getTerminalIdentity={loadTerminalIdentity} />;
     default:
       assertRouteIsExhaustive(route);
-      return <SalesTerminalView />;
+      return <SalesTerminalView getTerminalIdentity={loadTerminalIdentity} />;
   }
 }
 
@@ -196,7 +219,21 @@ export function AppShell(props: AppShellProps = {}): JSX.Element {
   // in the heading and in the suite's assertions at once. `??` rather than a
   // required prop, because a shell that cannot render alone cannot be tested here.
   const activeDefinition = routeById(activeRoute);
-  const activeScreen = renderRoute(activeRoute, ordersRepository ?? EMPTY_ORDERS_REPOSITORY);
+
+  // The SAME repository object reaches both screens, resolved ONCE.
+  //
+  // The sales screen reads it for the recent-orders strip above the menu, and
+  // the history screen reads it for the full list. One object, not two: two
+  // ports is precisely how a strip says "you sold nothing" while the history
+  // screen lists three orders, and neither one would be able to explain why.
+  const resolvedOrdersRepository = ordersRepository ?? EMPTY_ORDERS_REPOSITORY;
+
+  // The way back to selling. A fresh closure rather than `setActiveRoute`
+  // itself: the child is handed "go to sales", not "set whatever route you
+  // like", so it cannot navigate somewhere the shell has no screen for.
+  const activeScreen = renderRoute(activeRoute, resolvedOrdersRepository, () => {
+    setActiveRoute(ROUTES.sales);
+  });
 
   // ── Render ────────────────────────────────────────────────────────────────
 

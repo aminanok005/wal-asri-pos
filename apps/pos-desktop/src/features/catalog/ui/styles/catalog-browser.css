@@ -1,0 +1,340 @@
+/*
+ * catalog-browser.css — the tabs and search box above the menu grid.
+ *
+ * Presentation only. Which entries are visible was settled by `filterEntries` in
+ * `../domain/catalog.ts` before this file sees an element; nothing below can add a
+ * tile, remove one, or change a price.
+ *
+ * The GRID's own styles are in `catalog-grid.css` and are deliberately not
+ * restyled here — the two components are separate so that `CatalogGrid.test.tsx`
+ * needs no awareness of the chrome around it.
+ *
+ * @see ./CatalogBrowser.tsx — where these classes belong
+ * @see ./catalog-grid.css — the grid this wraps
+ */
+
+/* ── Search ──────────────────────────────────────────────────────────────── */
+
+/*
+ * The row exists so the clear button sits BESIDE the field rather than inside
+ * it. A clear ✕ overlaid on the input's right edge is the prototype's arrangement,
+ * and on a till it lands exactly where a cashier's thumb already rests to reach
+ * the end of what they typed — one mis-tap clears a search they were halfway
+ * through writing. Beside it, it has to be aimed at deliberately.
+ */
+.catalog-browser__search-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.catalog-browser__search {
+  position: relative;
+  display: flex;
+  flex: 1;
+  align-items: center;
+  gap: 10px;
+  /* FULL WIDTH, the reference design's own arrangement: on a till the search
+     box is the first thing a cashier reaches for when a drink is not on the
+     visible page, and a box capped at 380px wastes the rest of the menu
+     column's width on nothing. The clear button beside it claims its own
+     space, so the field itself simply takes whatever is left. */
+  height: var(--tap);
+  padding: 0 16px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--card);
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+/*
+ * Focus lands on the FIELD's wrapper (the real `<input>` inside it is what has
+ * focus, `:focus-within` answers for the box a cashier can see). The glow is
+ * `--glow-acc` — the same warm light the pay button casts — because on a dark
+ * theme a border-colour change alone is too quiet to find while typing.
+ */
+.catalog-browser__search:focus-within {
+  border-color: var(--acc);
+  box-shadow: 0 0 0 3px var(--accs);
+}
+
+/*
+ * The 🔍 in its own accent-soft disc. A round chip behind a glyph is how the
+ * reference design's search reads, and it gives the eye an anchor at the left
+ * edge of a full-width pill — without it the icon floats and the field looks
+ * like a text line someone dropped an emoji on.
+ */
+.catalog-browser__search-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 30px;
+  height: 30px;
+  border-radius: 999px;
+  background: var(--accs);
+  font-size: 14px;
+  line-height: 1;
+}
+
+.catalog-browser__search-input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  background: none;
+  color: var(--ink);
+  font: inherit;
+  outline: none;
+}
+
+/*
+ * The UA's own search clear button (`::-webkit-search-cancel-button`) would put a
+ * SECOND clear control in this field — one the till did not design and cannot
+ * size for a thumb. Removed so the row's own button is the only one.
+ */
+.catalog-browser__search-input::-webkit-search-cancel-button {
+  appearance: none;
+}
+
+.catalog-browser__search-clear {
+  min-height: var(--tap);
+  padding: 6px 18px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--card);
+  color: var(--mut);
+  font: inherit;
+  font-size: 13px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.catalog-browser__search-clear:hover {
+  border-color: var(--acc);
+  color: var(--acc);
+}
+
+/*
+ * Visible to a screen reader, absent from the page.
+ *
+ * Not `display: none`, which removes an element from the accessibility tree
+ * entirely and would leave the search field with no name at all — the exact
+ * failure the real `<label>` element exists to prevent. Clipped instead, and
+ * declared before the clip so a browser that honours neither still shows the text
+ * rather than silently hiding a label.
+ */
+.catalog-browser__visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ── Category tabs ───────────────────────────────────────────────────────── */
+
+/*
+ * A single scrollable row, never a wrap.
+ *
+ * `overflow-x: auto` rather than `flex-wrap: wrap` because the tabs must occupy
+ * ONE line on a till: wrapped tabs push the grid down by a whole row when a
+ * branch gains a category, and the menu's top edge moves under the cashier's
+ * hand. Scrolling keeps the grid's position fixed and, per the prototype, is
+ * what a narrow terminal does anyway.
+ *
+ * CHIPS, NOT UNDERLINES: each tab is a bordered pill and the current one fills
+ * with the accent gradient — the reference design's category bar, and the same
+ * 999px silhouette the shell nav, fulfilment tabs and payment options use, so
+ * every selectable thing on the till is recognisably the same KIND of control.
+ * The `border-bottom` rule this row used to carry (an underline tab strip) is
+ * gone with the underline style; chips need a row, not a rule.
+ */
+.catalog-browser__tabs {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  margin-bottom: 12px;
+}
+
+/*
+ * EDGE ARROWS INSTEAD OF A SCROLLBAR.
+ *
+ * A 4px scrollbar strip under the tabs costs vertical space on a till whose
+ * height is the scarce resource, and it renders as a hairline that reads as a
+ * divider rather than as a control. The affordance is carried by arrows instead:
+ * they say "there is more over there" the way a scrollbar never does, and they
+ * cost nothing when the row does not overflow.
+ *
+ * The arrows are `pointer-events: none` and therefore NOT a control — they are
+ * the visual edge of the row, which still scrolls by touch, by wheel and by
+ * keyboard. Making them clickable would need a button per arrow, an accessible
+ * name each, and JS to move the scroll — three things this deliberately does not
+ * add, because a cashier who cannot see a category can still swipe to it.
+ *
+ * ⚠️ THE ARROWS ARE ALWAYS DRAWN, INCLUDING WHEN EVERY TAB FITS. Hiding them
+ * when the row does not overflow needs a measurement (`scrollWidth >
+ * clientWidth`) and a state flip on resize, and CSS alone cannot do it — there is
+ * no selector for "this element overflows its parent". With four demo
+ * categories they therefore sit beside tabs that were never hidden, which is
+ * cosmetic rather than harmful: they are muted, non-interactive, and read as
+ * the row's edges.
+ *
+ * If that is unacceptable, the honest fix is a `ResizeObserver` in
+ * `CatalogBrowser.tsx` setting `data-overflow="true|false"` on the nav, and the
+ * two rules below keyed off it. That is deliberately NOT done here — it adds a
+ * layout read on every resize to hide two glyphs, and this round's brief was not
+ * to touch JSX beyond the move.
+ */
+.catalog-browser__tabs {
+  /* No visible scrollbar of its own — the arrows are the affordance. */
+  scrollbar-width: none;
+  /* Room for the arrow glyphs, so neither sits on top of the first and last
+     tab's text. `padding-inline` rather than `margin` so the arrows stay out of
+     the row's own scroll width. */
+  position: relative;
+  padding-inline: 18px;
+}
+
+.catalog-browser__tabs::-webkit-scrollbar {
+  display: none;
+}
+
+/*
+ * The two arrows, drawn with `::before`/`::after` on the row.
+ *
+ * `position: absolute` against the `position: relative` above, vertically
+ * centred on the tab strip rather than on the whole column — a tab row's content
+ * is short, and centring on the row would put the arrows below the tabs where
+ * they read as a status line.
+ *
+ * `color: var(--mut)` so they read as chrome rather than as the accent the active
+ * tab uses; the accent on these would compete with the tab the cashier is
+ * actually on.
+ *
+ * The chevron itself is two borders rotated 45°, so no font, no SVG and no icon
+ * dependency — which matters twice over here: nothing may be fetched under
+ * `csp: "default-src 'self'"`, and an emoji arrow renders in a different colour
+ * and weight on every platform.
+ *
+ * ⚠️ ONLY DRAWN WHILE `data-overflow="true"`.
+ *
+ * `CatalogBrowser.tsx` measures `scrollWidth > clientWidth` with a
+ * `ResizeObserver` and sets that attribute, because CSS has no selector for
+ * "this element overflows" — without the measurement every four-category menu
+ * would carry arrows pointing at tabs that were already visible, which teaches a
+ * cashier to ignore the one cue that matters when a category IS off-screen.
+ *
+ * `content: ''` on the base rule and `content: '‹'` / `'›'` on the overflow
+ * rule: a pseudo-element with `content: ''` still generates a box, so the
+ * borders would show. Toggling the `content` string is what makes the glyph
+ * itself appear, and it needs no extra element in the DOM.
+ */
+.catalog-browser__tabs::before,
+.catalog-browser__tabs::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  width: 7px;
+  height: 7px;
+  border-top: 2px solid currentColor;
+  border-right: 2px solid currentColor;
+  color: var(--mut);
+  /* NOT a control — see the note in the block above. The row still scrolls by
+     touch, wheel and keyboard; clicking an arrow would need a button, a name
+     and JS to move the scroll, which is three things this deliberately skips. */
+  pointer-events: none;
+  transform: translateY(-50%) rotate(-135deg);
+}
+
+.catalog-browser__tabs::after {
+  transform: translateY(-50%) rotate(45deg);
+}
+
+.catalog-browser__tabs[data-overflow='true']::before {
+  content: '‹';
+  left: 0;
+  /* Reset to no rotation for the glyph form: the chevron above is drawn from
+     borders, but once `content` is a character the borders would show as a box
+     around it. */
+  border: 0;
+  width: auto;
+  height: auto;
+  font-size: 20px;
+  line-height: 1;
+  transform: translateY(-50%);
+}
+
+.catalog-browser__tabs[data-overflow='true']::after {
+  content: '›';
+  right: 0;
+  border: 0;
+  width: auto;
+  height: auto;
+  font-size: 20px;
+  line-height: 1;
+  transform: translateY(-50%);
+}
+
+.catalog-browser__tab {
+  flex: none;
+  padding: 8px 16px;
+  /* An explicit border rather than none: the transparent border occupies the
+     same space as the accent one the active state below paints, so switching
+     tabs never resizes the chip and shoves its neighbours sideways. */
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--card);
+  color: var(--mut);
+  font: inherit;
+  font-size: 14px;
+  white-space: nowrap;
+  cursor: pointer;
+  transition:
+    background-color 0.15s ease,
+    border-color 0.15s ease,
+    color 0.15s ease,
+    box-shadow 0.15s ease;
+}
+
+/*
+ * `min-height` from the prototype's own 46px: a tab is a tap target, and a
+ * text-sized one is the smallest thing on the screen a cashier has to hit
+ * accurately.
+ */
+.catalog-browser__tab {
+  min-height: 46px;
+}
+
+.catalog-browser__tab:hover {
+  border-color: var(--acc);
+  color: var(--acc);
+}
+
+/*
+ * The selected chip: accent gradient, white label, the accent's own warm glow.
+ * Same treatment as the shell nav's active item — one active-pill language for
+ * the whole app, keyed off `aria-current` exactly as before, so the attribute
+ * the tests and screen readers read remains the only truth about which tab is
+ * showing.
+ */
+.catalog-browser__tab[aria-current='true'] {
+  border-color: transparent;
+  background: var(--acc-grad);
+  color: var(--on-acc);
+  font-weight: 600;
+  box-shadow: var(--glow-acc);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .catalog-browser *,
+  .catalog-browser *::before,
+  .catalog-browser *::after {
+    transition: none !important;
+    animation: none !important;
+  }
+}

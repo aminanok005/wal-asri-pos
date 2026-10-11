@@ -1,0 +1,158 @@
+/*
+ * recent-orders-strip.css — the glanceable band of orders this terminal has
+ * already taken, above the menu.
+ *
+ * Presentation only. Rows arrive from `repository.listRecent` already ordered and
+ * paged, and this file neither re-sorts nor filters them.
+ *
+ * Nothing here is interactive, and nothing may become so: every action on an
+ * offline order is an outbox write (SKILL.md §2.2), and a chip that looked
+ * pressable would promise an action the strip has no port for. That is why no
+ * chip sets `cursor: pointer` and no hover state suggests one.
+ *
+ * @see ../RecentOrdersStrip.tsx — the component these classes belong to
+ */
+
+.recent-orders {
+  margin-bottom: 14px;
+}
+
+.recent-orders__heading {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 0 0 8px;
+  color: var(--mut);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+/*
+ * A small accent bullet in front of the heading — the same mark the shell
+ * header leads its title with, so "section label" has one glyph app-wide.
+ * Pseudo-element, so no node enters the strip: this region's tests assert it
+ * contains ZERO buttons and links, and while a ::before is neither, keeping
+ * decoration out of the DOM entirely keeps that guarantee trivially true.
+ */
+.recent-orders__heading::before {
+  content: '';
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: var(--acc);
+}
+
+/*
+ * One scrolling row, never a wrap — the same reason the tab bar is.
+ *
+ * Wrapping would push the menu down by a row whenever the strip has more orders
+ * than fit, which is exactly when the cashier is busiest, and it would move the
+ * grid under their hand mid-sale. `overflow-x: auto` keeps the menu's top edge
+ * fixed no matter how many orders the terminal has taken today.
+ */
+.recent-orders__list {
+  display: flex;
+  gap: 10px;
+  overflow-x: auto;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  scrollbar-width: none;
+}
+
+.recent-orders__list::-webkit-scrollbar {
+  display: none;
+}
+
+/*
+ * A chip, not a card.
+ *
+ * Bordered and lightly filled so a long band of them still reads as a list of
+ * separate receipts — but with no shadow and no lift on hover, because nothing
+ * here does anything when pressed. The reference's equivalent tiles have a
+ * progress ring; this strip has no per-order progress to show, and inventing a
+ * percentage would be a number no system computed.
+ */
+.recent-orders__chip {
+  display: flex;
+  flex: none;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 150px;
+  padding: 9px 14px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--card);
+  font-size: 12px;
+  /* Resting lift, matching the tiles below: the strip's chips are the only
+     other objects on the menu column that represent a completed sale, and
+     they read as cards rather than as table rows. Still NO hover lift and no
+     pointer — nothing in here is pressable, for the reason at the top of this
+     file. */
+  box-shadow: var(--shadow-1);
+}
+
+.recent-orders__receipt {
+  font-size: 14px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.recent-orders__status,
+.recent-orders__lines {
+  color: var(--mut);
+}
+
+/*
+ * The sync badge, coloured by rung exactly as on the history rows
+ * (`offline-orders.css:209-222`) and selected on the same `data-sync-state`
+ * attribute those rules already use — a parallel set of classes here could
+ * disagree with the attribute the tests read.
+ *
+ * `pending` stays muted: an order waiting to sync is the NORMAL state of a
+ * sale taken while offline, and colouring every chip on screen would make the
+ * strip an alarm rather than a status line. `conflict` earns the accent because
+ * it is the rung a lead must escalate, and `rejected` earns the danger red
+ * because the server refused the write outright.
+ */
+.recent-orders__sync[data-sync-state='synced'] {
+  color: var(--ok);
+  font-weight: 600;
+}
+
+.recent-orders__sync[data-sync-state='conflict'] {
+  color: var(--acc);
+  font-weight: 600;
+}
+
+.recent-orders__sync[data-sync-state='rejected'] {
+  color: var(--danger);
+  font-weight: 600;
+}
+
+/*
+ * Below the prototype's 560px the chips narrow rather than the row scrolling.
+ * Not a wrap, for the reason above — but a chip wider than the screen is worse
+ * than a tight one, so the floor drops and the text ellipses.
+ */
+@media (max-width: 560px) {
+  .recent-orders__chip {
+    min-width: 128px;
+  }
+
+  .recent-orders__status {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .recent-orders *,
+  .recent-orders *::before,
+  .recent-orders *::after {
+    transition: none !important;
+    animation: none !important;
+  }
+}

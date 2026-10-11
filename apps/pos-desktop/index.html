@@ -32,7 +32,18 @@
   unusable for a blind cashier. This attribute is the only thing carrying that
   information, so it is set correctly here rather than left to default to `en`.
 -->
-<html lang="th">
+<!--
+  `data-theme="dark"` — the terminal SHIPS DARK, matching the reference design
+  this UI is graded against. It is a content attribute on the root element, NOT
+  an inline style, so `csp: default-src 'self'` is untouched: a style attribute
+  has no 'self' source, a content attribute is not a style at all. Three states
+  exist and all three are deliberate — `tokens.css` documents each:
+
+    data-theme="dark"   → dark, whatever the OS says (the shipped default);
+    data-theme="light"  → light, whatever the OS says;
+    attribute removed   → follows `prefers-color-scheme`, exactly as before.
+-->
+<html lang="th" data-theme="dark">
   <head>
     <meta charset="utf-8" />
     <!-- The till is a fixed-format kiosk: the cashier must not be able to pinch

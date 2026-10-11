@@ -33,9 +33,18 @@ import type { RouteId } from './routes';
 // the tree is gone, which React reports as an update outside act() — and a warning
 // on every run teaches a reader to ignore the output of this suite. With it, each
 // test ends the same way a browser would: the read settles, then the tree goes.
+// `cleanup()` runs inside the `act` scope, after the flush.
+//
+// The order is the point. The sales screen renders the recent-orders strip, whose
+// read is async BY DESIGN; flushing first lets it settle against a live tree,
+// which is what a browser does. Unmounting INSIDE the scope means the teardown
+// is batched with whatever is still pending, so a read that had not landed cannot
+// report an update against a component that no longer exists.
 afterEach(async () => {
   await flush();
-  cleanup();
+  await act(async () => {
+    cleanup();
+  });
 });
 
 // The fragment is SHARED STATE between tests: the shell writes it on every mount
@@ -143,8 +152,9 @@ const SEEDED_ORDER: OfflineOrderSummary = {
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe('AppShell — where it opens', () => {
-  it('boots on the sales screen with no props at all', () => {
+  it('boots on the sales screen with no props at all', async () => {
     render(<AppShell />);
+    await flush();
 
     // A till that opens anywhere else puts a read-only list between the cashier
     // and a customer who is waiting to pay.
@@ -171,12 +181,13 @@ describe('AppShell — where it opens', () => {
     expect(salesVisible()).toBe(false);
   });
 
-  it('renders the sales screen for an invalid initialRoute instead of throwing', () => {
+  it('renders the sales screen for an invalid initialRoute instead of throwing', async () => {
     // Cast past the type on purpose: this is the shape of a bad value arriving
     // from JSON, from a stale bookmark, or from a caller that lost track. An
     // invalid route must never be RENDERED, and must never brick the mount.
     const bogus = 'sales_terminal_v2' as unknown as RouteId;
     render(<AppShell initialRoute={bogus} />);
+    await flush();
 
     expect(salesVisible()).toBe(true);
     expect(historyVisible()).toBe(false);
@@ -188,8 +199,9 @@ describe('AppShell — where it opens', () => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe('AppShell — the nav', () => {
-  it('renders one button per route, labelled with the Thai label the table gives', () => {
+  it('renders one button per route, labelled with the Thai label the table gives', async () => {
     render(<AppShell />);
+    await flush();
 
     // Driven off `ROUTE_DEFINITIONS`, NOT a hand-written list of two labels. A
     // copied list would still pass with a third screen added to the table, and the
@@ -202,8 +214,9 @@ describe('AppShell — the nav', () => {
     }
   });
 
-  it('marks the active item with aria-current, and it is sales on boot', () => {
+  it('marks the active item with aria-current, and it is sales on boot', async () => {
     render(<AppShell />);
+    await flush();
 
     // Exactly ONE item may claim to be the current page: two of them is a nav
     // that tells a screen reader the till is on two screens at once.
@@ -227,6 +240,7 @@ describe('AppShell — the nav', () => {
 
   it('swaps the sales screen for the history screen, and back again', async () => {
     render(<AppShell />);
+    await flush();
     expect(salesVisible()).toBe(true);
 
     fireEvent.click(navButton(ROUTES.offline_orders));
@@ -237,6 +251,7 @@ describe('AppShell — the nav', () => {
     expect(salesVisible()).toBe(false);
 
     fireEvent.click(navButton(ROUTES.sales));
+    await flush();
     expect(salesVisible()).toBe(true);
     expect(historyVisible()).toBe(false);
   });
@@ -247,20 +262,23 @@ describe('AppShell — the nav', () => {
     // is not looking at. So a basket is filled before navigating away, and the
     // terminal the shell shows afterwards must not carry it over.
     render(<AppShell />);
+    await flush();
     const grid = within(screen.getByTestId('catalog-grid'));
     fireEvent.click(grid.getByRole('button', { name: 'เพิ่ม กาแฟลาเต้' }));
-    expect(screen.getByTestId('sales-subtotal').textContent).toBe('฿45.50');
+    expect(screen.getByTestId('checkout-subtotal').textContent).toBe('฿45.50');
 
     fireEvent.click(navButton(ROUTES.offline_orders));
     await flush();
     expect(historyVisible()).toBe(true);
 
     fireEvent.click(navButton(ROUTES.sales));
-    expect(screen.getByTestId('sales-subtotal').textContent).toBe('฿0.00');
+    await flush();
+    expect(screen.getByTestId('checkout-subtotal').textContent).toBe('฿0.00');
   });
 
-  it('writes the fragment for the screen it just showed', () => {
+  it('writes the fragment for the screen it just showed', async () => {
     render(<AppShell />);
+    await flush();
     fireEvent.click(navButton(ROUTES.offline_orders));
 
     // Compared against `hashForRoute`, not against a literal '#/offline_orders':
@@ -268,6 +286,7 @@ describe('AppShell — the nav', () => {
     expect(window.location.hash).toBe(hashForRoute(ROUTES.offline_orders));
 
     fireEvent.click(navButton(ROUTES.sales));
+    await flush();
     expect(window.location.hash).toBe(hashForRoute(ROUTES.sales));
   });
 });

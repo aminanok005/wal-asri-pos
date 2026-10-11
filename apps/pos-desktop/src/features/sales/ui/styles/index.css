@@ -8,8 +8,26 @@
  */
 
 @import './tokens.css';
+/* The shell is the outermost frame, so it loads before every screen it frames.
+   Its rules are scoped to `.app-shell*` and cannot reach `.sales-terminal` or
+   `.offline-orders`, so the order here is for readability rather than for
+   cascade — but a file whose stated order is "tokens → components → screens"
+   should put the shell before the screens rather than after them. */
+@import '../../../../app/styles/app-shell.css';
 @import '../../../catalog/ui/styles/catalog-grid.css';
+/* After the grid and before the cart: the browser wraps the grid, so its own
+   rules must not be able to be overridden by anything below. */
+@import '../../../catalog/ui/styles/catalog-browser.css';
+/* After the browser, because the chip is drawn INSIDE its search row and its
+   `.skipped-warning` positioning must win over anything the row sets. */
+@import '../../../catalog/ui/styles/skipped-warning.css';
+@import './recent-orders-strip.css';
 @import './cart-view.css';
+/* After the cart and before the screen chrome: `SegmentedControl` is a component,
+   and `sales-terminal.css` below is where its two instances are arranged inside
+   the order rail — so the component's own rules must not be overridable by the
+   screen that places it. */
+@import './segmented-control.css';
 @import './sales-terminal.css';
 @import './offline-orders.css';
 
@@ -17,8 +35,54 @@ body {
   margin: 0;
   background: var(--bg);
   color: var(--ink);
-  font-family: 'Noto Sans Thai', system-ui, sans-serif;
+  font-family: var(--font);
   font-size: 15px;
+  /* Anti-alias the Thai loops at card sizes: a cashier reads 13px SKU text at
+     arm's length, and unantialiased strokes on a HiDPI till shimmer. */
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Selection tinted with the accent soft surface — copying a SKU or a receipt
+   number is a real action on a till, and the default blue clashes with the
+   palette every other element follows. */
+::selection {
+  background: var(--accs);
+  color: var(--acc);
+}
+
+/*
+ * Scrollbars styled here, once, for the menu grid, the basket list and the
+ * tab row alike. Thin and track-less so a scrollbar never reads as a divider
+ * (the reason `catalog-browser.css` hides the tab row's outright), and driven
+ * by tokens so it follows the theme — an unstyled scrollbar on a dark till is
+ * a bright grey stripe drawn across the cashier's menu. `scrollbar-color` is
+ * the Firefox pair, `::-webkit-scrollbar` the Chromium/WebKit one; a browser
+ * that knows neither simply keeps its default, which is the current look.
+ */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--line) transparent;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--line);
+  background-clip: padding-box;
+  border: 3px solid transparent;
+  border-radius: 999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--mut);
+  background-clip: padding-box;
 }
 
 /*
@@ -40,11 +104,129 @@ button {
   cursor: pointer;
 }
 
+/* ─────────────────────────────────────────────────────────────────────────────
+   Interaction performance
+   ─────────────────────────────────────────────────────────────────────────────
+   Three rules that make a till FEEL fast, none of which add a dependency.
+
+   `touch-action: manipulation` is the one with a visible effect. Without it a
+   touchscreen browser waits ~300ms to see whether a tap is the start of a
+   double-tap zoom before firing `click`, and on a terminal sold as "quick
+   tapping" that delay is on EVERY press. This removes the wait while KEEPING
+   pinch-zoom — `auto` would disable pinch-zoom entirely, which is a real
+   accessibility loss on a till nobody should be pinned to.
+   ───────────────────────────────────────────────────────────────────────────── */
+
+button,
+a,
+label,
+input[type='radio'],
+input[type='checkbox'] {
+  /* Not `auto`, which would disable pinch-zoom entirely. */
+  touch-action: manipulation;
+  /* `-webkit-tap-highlight-color` is the grey flash iOS/Android draw under a tap.
+     Left at its default it fires on top of the app's own pressed state, and the
+     two together read as a flicker rather than a press. */
+  -webkit-tap-highlight-color: transparent;
+}
+
+/*
+ * A pressed control, ONCE, for every control in the app.
+ *
+ * Previously each stylesheet had its own `transition` and most declared only
+ * colour changes, so a tap on a tile produced NO press feedback at all — the
+ * button simply did nothing visible until the basket updated a frame later. On a
+ * till, "did that register?" is asked dozens of times an hour, and the answer
+ * has to be visible within one frame.
+ *
+ * `transform` and `filter` only — never `width`, `height`, `margin` or `top`.
+ * Those are LAYOUT properties: animating one forces the browser to recompute
+ * geometry and re-run layout for that element and often its whole subtree, which
+ * on a grid of tiles is the opposite of fast. `transform` is composited on the
+ * GPU and leaves layout untouched.
+ *
+ * `:active` rather than `:hover` on purpose. A till is touched, not hovered:
+ * a mouse-only hover state never fires on the shop's hardware, so styling hover
+ * as the press feedback would mean the press feedback does not exist there.
+ */
+button:active,
+a:active,
+label:active {
+  transform: scale(0.97);
+  transition: transform 0.06s ease-out;
+}
+
+/*
+ * Every control animates its own state changes back to rest.
+ *
+ * `transition` sits on the base rule rather than on `:active` above, so the
+ * UN-press is animated too. Without it the control would snap back to full size
+ * instantly and the press would read as a flicker rather than a press-and-
+ * release. The 0.06s is deliberately short: this is a confirmation that the tap
+ * registered, not an animation anyone should wait for.
+ */
+button,
+a,
+label {
+  transition:
+    transform 0.12s ease-out,
+    background-color 0.15s ease,
+    border-color 0.15s ease,
+    color 0.15s ease,
+    opacity 0.15s ease;
+}
+
+/* Opt out for anything that opts IN elsewhere, so a component's own timing wins. */
+button:active {
+  transition-duration: 0.06s;
+}
+
+/*
+ * No transition while a control is focused by keyboard.
+ *
+ * A focus ring that animates lags the Tab key by the transition duration, which
+ * is the wrong thing to add to the one cue a keyboard user navigates entirely by.
+ */
+:focus-visible {
+  transition: none;
+}
+
+/*
+ * Smooth in-page scrolling for the menu grid and the basket's own scroll areas.
+ *
+ * `prefers-reduced-motion` is checked below and turns this OFF, because smooth
+ * scrolling is precisely the kind of motion that triggers vestibular symptoms —
+ * it moves a large area of the screen by a large distance.
+ */
+@media (prefers-reduced-motion: no-preference) {
+  html {
+    scroll-behavior: smooth;
+  }
+}
+
+/*
+ * Reduced motion, honoured app-wide.
+ *
+ * The `!important` is load-bearing: every component sheet carries its own
+ * `prefers-reduced-motion` block scoped to its own subtree, and a page-level
+ * rule with equal specificity would lose to a `.catalog-grid *` selector in
+ * `catalog-grid.css`. Without `!important` the cascade silently picks the
+ * component rule and the preference is only half honoured.
+ *
+ * `scroll-behavior` is reset as well as the transitions. A preference that stops
+ * the transitions but still glides the page on scroll has not been honoured:
+ * smooth scrolling moves a large area of the screen a large distance, which is
+ * the motion most likely to provoke vestibular symptoms.
+ */
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
   *::after {
     transition: none !important;
     animation: none !important;
+  }
+
+  html {
+    scroll-behavior: auto;
   }
 }

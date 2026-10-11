@@ -15,15 +15,41 @@
  */
 
 import { afterEach, describe, expect, it } from 'bun:test';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 
 import { SalesTerminalView } from './SalesTerminalView';
 import type { CheckoutRepository } from './SalesTerminalView';
 import type { SaveOfflineOrderInputWire } from '../features/sales/infrastructure/tauriOfflineOrders';
+import type { SalesTerminalViewProps } from './SalesTerminalView';
 
-afterEach(() => {
+// A valid UUIDv7 for testing (version=7, variant=10xx)
+const TEST_TERMINAL_ID = '018f3c2a-0000-7000-8000-000000000001';
+const TEST_BRANCH_ID = '018f3c2b-0000-7000-8000-000000000002';
+
+/** Render SalesTerminalView with test terminal identity injected. */
+function renderTerminal(props: Omit<SalesTerminalViewProps, 'terminalIdentity'>): ReturnType<typeof render> {
+  return render(<SalesTerminalView {...props} terminalIdentity={{ terminalId: TEST_TERMINAL_ID, branchId: TEST_BRANCH_ID }} />);
+}
+
+// Unmount between tests, and let every read still in flight land FIRST.
+//
+// The flush is not optional: the screen renders the recent-orders strip, whose
+// `listRecent` is async BY DESIGN and settles a microtask after the tree is gone.
+// A synchronous `cleanup()` leaves that update landing on an unmounted component
+// and React reports an act() warning on every run — which teaches a reader to
+// ignore this file's output and hides a real one that arrives later.
+afterEach(async () => {
+  await flush();
   cleanup();
 });
+
+/** Drain the microtask queue inside `act`, twice — see the note above. */
+async function flush(): Promise<void> {
+  await act(async () => {
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+}
 
 /** A tile's visible price, e.g. "฿45.50". */
 const LATTE = /ลาเต้/;
@@ -61,7 +87,7 @@ function addLatte(times = 1): void {
 describe('SalesTerminalView — the checkout button', () => {
   it('is disabled on an empty basket', () => {
     const { repo } = recordingRepository();
-    render(<SalesTerminalView repository={repo} />);
+    renderTerminal({ repository: repo });
 
     // An empty basket is not a sale. The button says so rather than pretending.
     expect(screen.getByRole('button', { name: /ชำระเงิน/ })).toHaveProperty('disabled', true);
@@ -69,7 +95,7 @@ describe('SalesTerminalView — the checkout button', () => {
 
   it('enables once something is in the basket, and shows the total', () => {
     const { repo } = recordingRepository();
-    render(<SalesTerminalView repository={repo} />);
+    renderTerminal({ repository: repo });
 
     addLatte();
     const button = screen.getByRole('button', { name: /ชำระเงิน/ });
@@ -79,7 +105,7 @@ describe('SalesTerminalView — the checkout button', () => {
 
   it('shows the VAT breakdown, and the three numbers reconcile', () => {
     const { repo } = recordingRepository();
-    render(<SalesTerminalView repository={repo} />);
+    renderTerminal({ repository: repo });
 
     addLatte();
 
@@ -99,7 +125,7 @@ describe('SalesTerminalView — the checkout button', () => {
 describe('SalesTerminalView — what reaches the database', () => {
   it('sends every satang field as a STRING', async () => {
     const { repo, saved } = recordingRepository();
-    render(<SalesTerminalView repository={repo} />);
+    renderTerminal({ repository: repo });
 
     addLatte();
     fireEvent.click(screen.getByRole('button', { name: /ชำระเงิน/ }));
@@ -123,7 +149,7 @@ describe('SalesTerminalView — what reaches the database', () => {
 
   it('sends the VAT-INCLUSIVE split: gross 4550, net 4252, tax 298', async () => {
     const { repo, saved } = recordingRepository();
-    render(<SalesTerminalView repository={repo} />);
+    renderTerminal({ repository: repo });
 
     addLatte();
     fireEvent.click(screen.getByRole('button', { name: /ชำระเงิน/ }));
@@ -142,7 +168,7 @@ describe('SalesTerminalView — what reaches the database', () => {
 
   it('sends line_tax 0 on every line, because VAT is per order', async () => {
     const { repo, saved } = recordingRepository();
-    render(<SalesTerminalView repository={repo} />);
+    renderTerminal({ repository: repo });
 
     addLatte(3);
     fireEvent.click(screen.getByRole('button', { name: /ชำระเงิน/ }));
@@ -157,7 +183,7 @@ describe('SalesTerminalView — what reaches the database', () => {
 
   it('carries Thai product names across the wire intact', async () => {
     const { repo, saved } = recordingRepository();
-    render(<SalesTerminalView repository={repo} />);
+    renderTerminal({ repository: repo });
 
     addLatte();
     fireEvent.click(screen.getByRole('button', { name: /ชำระเงิน/ }));
@@ -168,7 +194,7 @@ describe('SalesTerminalView — what reaches the database', () => {
 
   it('carries an outbox event, so the sale can sync later', async () => {
     const { repo, saved } = recordingRepository();
-    render(<SalesTerminalView repository={repo} />);
+    renderTerminal({ repository: repo });
 
     addLatte();
     fireEvent.click(screen.getByRole('button', { name: /ชำระเงิน/ }));
@@ -182,10 +208,10 @@ describe('SalesTerminalView — what reaches the database', () => {
 describe('SalesTerminalView — the basket clears only after the sale is recorded', () => {
   it('empties the basket and shows the receipt on success', async () => {
     const { repo, saved } = recordingRepository();
-    render(<SalesTerminalView repository={repo} />);
+    renderTerminal({ repository: repo });
 
     addLatte(2);
-    expect(screen.getByTestId('sales-item-count').textContent).toBe('2 รายการ');
+    expect(screen.getByTestId('cart-item-count').textContent).toBe('2 รายการ');
 
     fireEvent.click(screen.getByRole('button', { name: /ชำระเงิน/ }));
 
@@ -193,13 +219,13 @@ describe('SalesTerminalView — the basket clears only after the sale is recorde
     await waitFor(() => expect(screen.getByTestId('checkout-receipt')).toBeDefined());
 
     // Cleared because the transaction committed — not before.
-    expect(screen.getByTestId('sales-item-count').textContent).toBe('0 รายการ');
+    expect(screen.getByTestId('cart-item-count').textContent).toBe('0 รายการ');
   });
 
   it('KEEPS the basket and shows the error when the save fails', async () => {
     const { repo, failWith } = recordingRepository();
     failWith('SQLCipher: key rejected');
-    render(<SalesTerminalView repository={repo} />);
+    renderTerminal({ repository: repo });
 
     addLatte(2);
     fireEvent.click(screen.getByRole('button', { name: /ชำระเงิน/ }));
@@ -208,7 +234,7 @@ describe('SalesTerminalView — the basket clears only after the sale is recorde
     // to retry. Clearing here would lose an order the till has no record of.
     await waitFor(() => expect(screen.getByTestId('checkout-error')).toBeDefined());
     expect(screen.getByTestId('checkout-error').textContent).toContain('SQLCipher');
-    expect(screen.getByTestId('sales-item-count').textContent).toBe('2 รายการ');
+    expect(screen.getByTestId('cart-item-count').textContent).toBe('2 รายการ');
     expect(screen.queryByTestId('checkout-receipt')).toBeNull();
   });
 });

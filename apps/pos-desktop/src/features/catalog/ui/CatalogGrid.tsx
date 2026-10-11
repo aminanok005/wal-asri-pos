@@ -30,14 +30,13 @@
 import type { JSX } from 'react';
 
 import { entriesInCategory } from '../domain/catalog';
-import type {
-  CatalogEntry,
-  CatalogIndex,
-  SkipReason,
-  SkippedVariant,
-  UuidV7,
-} from '../domain/catalog';
+import type { CatalogEntry, CatalogIndex, UuidV7 } from '../domain/catalog';
 import { Money } from '../../payments/domain/money';
+// A VALUE import: the media span renders the glyph this returns. Presentation,
+// like everything else in this component — see `emoji.ts` for why the mapping
+// claims nothing about the product.
+import { emojiForName } from './emoji';
+import { SkippedWarning } from './SkippedWarning';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Props
@@ -70,62 +69,94 @@ export interface CatalogGridProps {
    * and has to go somewhere.
    */
   readonly categoryId?: UuidV7 | null;
+  /**
+   * Suppress the withheld-items warning, because something above already shows it.
+   *
+   * `false` — the default — keeps the grid owning it, which is what a bare
+   * `<CatalogGrid>` has always done and what its own tests render. `CatalogBrowser`
+   * passes `true` because it draws the chip beside the search box instead, and two
+   * warnings on one screen would say the same sentence twice.
+   */
+  readonly hideWithheldWarning?: boolean;
+  /**
+   * How many of each variant is already in the basket, for the tile's badge.
+   *
+   * KEYED BY VARIANT ID — the key `quantitiesByVariant` in `sales/domain/cart.ts`
+   * produces — because a tile knows which variant it is showing and has never
+   * heard of a cart line id.
+   *
+   * OPTIONAL, and the default is an empty map rather than a required prop: a
+   * caller with no basket behind it still gets a working grid, and every existing
+   * use of `<CatalogGrid>` keeps compiling unchanged. The badge renders only for a
+   * variant present in the map, so a missing entry reads as "none in the basket"
+   * rather than as a zero the cashier has to interpret.
+   */
+  readonly quantities?: ReadonlyMap<UuidV7, bigint>;
+  /**
+   * Draw exactly these entries, instead of resolving `index` itself.
+   *
+   * THE ESCAPE HATCH FOR A PRE-FILTERED MENU, NOT A REPLACEMENT FOR THE INDEX.
+   * `index` is still required and still the only source of the withheld-items
+   * warning — which is why supplying `entries` cannot hide a short menu from the
+   * shift lead. A caller filtering with `filterEntries` (or anything else)
+   * passes the result here and the grid draws it.
+   *
+   * `undefined` — the default — resolves `categoryId` through the domain exactly
+   * as it always has. It is optional rather than required so that every existing
+   * caller, and every existing test, is unaffected by its existence: `undefined`
+   * and "the caller computed the same thing the domain would" are
+   * indistinguishable here, which is the point.
+   *
+   * A caller passing both `entries` and `categoryId` gets a silent contradiction
+   * on screen, so `entries` WINS and `categoryId` is ignored. That is stated here
+   * rather than enforced at the type level because a type cannot express "exactly
+   * one of these two", and a runtime throw on a prop combination would be a
+   * worse failure than a documented precedence.
+   */
+  readonly entries?: readonly CatalogEntry[];
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Withheld items
+// Tile colour
 //
-// `SkipReason` is a closed set, so this record is exhaustive by construction: add
-// a reason to the domain and TypeScript fails here, on the screen that is supposed
-// to mention it, rather than in a support ticket a week later.
+// ── WHY A HASH AND NOT RENDER ORDER ──────────────────────────────────────────
+// The prototype gives each menu item a gradient in its data table. Nothing in the
+// contract describes a product's colour — `ProductVariant` has `image_url` and
+// `is_active` and nothing visual — so a colour cannot be READ, only chosen.
+//
+// Render order was the obvious way to choose one and it is wrong: it would give
+// a drink whichever colour happened to fall on its index, so adding a category
+// renames the colours of everything after it, and two tills showing different
+// snapshots would show the same latte in different colours. Hashing the variant
+// id instead makes the assignment a property OF THE ITEM: stable across
+// re-renders, across terminals, and across any change to the menu.
+//
+// Six classes over six token pairs, chosen modulo six. Six is arbitrary and
+// small — it is enough that a grid does not read as a repeating pattern of three.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** Thai wording for each reason a variant never reaches the grid. */
-const SKIP_REASON_LABELS: Readonly<Record<SkipReason, string>> = {
-  inactive_variant: 'ปิดการขายแล้ว',
-  no_price_entry: 'ไม่ได้ตั้งราคา',
-  ambiguous_price_list: 'ราคาไม่ชัดเจน',
-  invalid_price: 'ราคาไม่ถูกต้อง',
-};
-
-/** How many items were withheld, and one clause per distinct reason. */
-interface WithheldSummary {
-  readonly total: number;
-  /** e.g. `['ไม่ได้ตั้งราคา 1 รายการ', 'ปิดการขายแล้ว 1 รายการ']` */
-  readonly clauses: readonly string[];
-}
+/** How many gradient pairs `tokens.css` defines. */
+const TILE_GRADIENT_COUNT = 6;
 
 /**
- * Group the skips by reason.
+ * The gradient class for a variant, from a stable hash of its id.
  *
- * A single count ("3 รายการ") would not be actionable: three retired seasonal
- * sizes is expected, three missing prices is a broken price list, and those two
- * need different people to look at them. The order follows first appearance in
- * the snapshot, which is the same order the grid uses, so the warning and the menu
- * read consistently.
+ * A plain character-code sum, not a crypto hash: the requirement is
+ * *determinism*, not uniformity, and this runs once per tile per render over
+ * eight items. `charCodeAt` returns `NaN` for nothing — `id` is a non-empty
+ * UUIDv7 string from the contract — so every char contributes a real number.
  */
-function summariseWithheld(skipped: readonly SkippedVariant[]): WithheldSummary {
-  const counts = new Map<SkipReason, number>();
-  for (const item of skipped) {
-    counts.set(item.reason, (counts.get(item.reason) ?? 0) + 1);
+function gradientClass(variantId: string): string {
+  let sum = 0;
+  for (let i = 0; i < variantId.length; i += 1) {
+    sum += variantId.charCodeAt(i);
   }
-  const clauses = [...counts.entries()].map(
-    ([reason, count]) => `${SKIP_REASON_LABELS[reason]} ${count} รายการ`,
-  );
-  return { total: skipped.length, clauses };
+  return `catalog-grid__tile-media--${(sum % TILE_GRADIENT_COUNT) + 1}`;
 }
 
-/**
- * The warning line a shift lead reads when the menu is short.
- *
- * It states the count, then the reasons, then why it matters: an item with no
- * trustworthy price must not be sold, so a silently short menu is a revenue and a
- * compliance problem, not a cosmetic one.
- */
-function withheldText(summary: WithheldSummary): string {
-  const reasons = summary.clauses.join(' · ');
-  return `ซ่อนเมนูไว้ ${summary.total} รายการ (${reasons}) — เมนูที่ไม่มีราคาที่เชื่อถือได้ห้ามขาย ผู้ดูแลร้านต้องตรวจสอบก่อนเปิดขาย`;
-}
+// ─────────────────────────────────────────────────────────────────────────────
+// Money formatting
+// ─────────────────────────────────────────────────────────────────────────────
 
 /**
  * Render a `Money` as Thai baht, e.g. ฿45.50.
@@ -144,19 +175,26 @@ function formatBaht(amount: Money): string {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export function CatalogGrid(props: CatalogGridProps): JSX.Element {
-  const { index, onSelect, categoryId } = props;
+  const {
+    index,
+    onSelect,
+    categoryId,
+    quantities,
+    entries: entriesOverride,
+    hideWithheldWarning = false,
+  } = props;
 
   // The domain does the filtering, so the grid and any other consumer of the
   // index can never disagree about which entries a category contains. `undefined`
   // means "no filter" and passes the frozen `entries` straight through; `null` is
   // a real request — the uncategorised bucket — and goes through the domain.
+  //
+  // `entriesOverride` short-circuits both: a caller that already holds the
+  // answer hands it over, and asking the domain to narrow it a second time would
+  // be a second filtering rule for the same menu. See the prop's note for why the
+  // warning below still counts the whole snapshot either way.
   const entries =
-    categoryId === undefined ? index.entries : entriesInCategory(index, categoryId);
-
-  // Counted from the whole snapshot, not from the visible tiles. A filter
-  // narrowing the grid must not silence the warning: the shift lead still needs
-  // to know the branch is short of a drink while standing on any tab.
-  const withheld = summariseWithheld(index.skipped);
+    entriesOverride ?? (categoryId === undefined ? index.entries : entriesInCategory(index, categoryId));
 
   return (
     <div className="catalog-grid" data-testid="catalog-grid">
@@ -165,12 +203,17 @@ export function CatalogGrid(props: CatalogGridProps): JSX.Element {
           got three items shorter is exactly the kind of change a cashier should
           hear about rather than notice by looking. It renders nothing at all when
           nothing was skipped, so a healthy menu does not train anyone to ignore
-          the line. */}
-      {withheld.total > 0 && (
-        <p className="catalog-grid__warning" role="status">
-          {withheldText(withheld)}
-        </p>
-      )}
+          the line.
+
+          It counts the WHOLE snapshot, not the visible tiles, so a filter
+          narrowing the grid cannot silence it.
+
+          `hideWithheldWarning` is how `CatalogBrowser` moves this beside the
+          search box without two warnings on one screen. The default stays `false`
+          on purpose: this component used to own the warning outright, and every
+          test that renders `<CatalogGrid>` on its own still expects to find it
+          here. */}
+      {!hideWithheldWarning && <SkippedWarning index={index} />}
 
       {/* ── Tiles ──────────────────────────────────────────────────────────
           An explicit empty state, never a blank box: "nothing here" and "still
@@ -179,27 +222,70 @@ export function CatalogGrid(props: CatalogGridProps): JSX.Element {
       {entries.length === 0 ? (
         <p className="catalog-grid__empty">ยังไม่มีเมนูที่ขายได้ในหมวดนี้</p>
       ) : (
-        <ul className="catalog-grid__tiles">
-          {entries.map((entry) => (
-            <li key={entry.variant.id} className="catalog-grid__tile">
-              {/* The accessible name is the item's name and nothing else. A screen
-                  reader user pressing tiles one after another should hear
-                  "เพิ่ม กาแฟลาเต้", "เพิ่ม มอคค่า" — not a price recited before
-                  every name, and never the quantity controls that later sit in
-                  the same row of the cart. The price stays visible on the tile,
-                  where it belongs. */}
-              <button
-                type="button"
-                className="catalog-grid__tile-button"
-                aria-label={`เพิ่ม ${entry.variant.name_th}`}
-                onClick={() => onSelect(entry)}
-              >
-                <span className="catalog-grid__tile-name">{entry.variant.name_th}</span>
-                <span className="catalog-grid__tile-price">{formatBaht(entry.unitPrice)}</span>
-                <span className="catalog-grid__tile-sku">{entry.variant.sku}</span>
-              </button>
-            </li>
-          ))}
+        <ul className="catalog-grid__tiles" data-testid="catalog-tiles">
+          {entries.map((entry) => {
+            // `undefined` when the basket holds none of this variant — which is
+            // most tiles, most of the time. Only a positive quantity earns a
+            // badge, so "none" never has to be distinguished from "zero".
+            const inBasket = quantities?.get(entry.variant.id) ?? 0n;
+
+            return (
+              <li key={entry.variant.id} className="catalog-grid__tile">
+                {/* The accessible name is the item's name and nothing else. A screen
+                    reader user pressing tiles one after another should hear
+                    "เพิ่ม กาแฟลาเต้", "เพิ่ม มอคค่า" — not a price recited before
+                    every name, and never the quantity controls that later sit in
+                    the same row of the cart. The price stays visible on the tile,
+                    where it belongs. */}
+                <button
+                  type="button"
+                  className="catalog-grid__tile-button"
+                  aria-label={`เพิ่ม ${entry.variant.name_th}`}
+                  onClick={() => onSelect(entry)}
+                >
+                  {/* The colour panel, wearing a decorative emoji — the tile's
+                      stand-in for the product photo this contract has no field
+                      for. A CLASS, not an inline `style`: the CSP is
+                      `default-src 'self'` and an inline style is blocked, so the
+                      prototype's `style="background:linear-gradient(...)"` would
+                      build cleanly and render colourless. The glyph is TEXT —
+                      it needs no CSP source at all — and it lives inside the
+                      `aria-hidden` span, so it never enters the tile's
+                      accessible name: the `aria-label` above remains the whole
+                      name, exactly as the tests assert it. Which emoji comes
+                      from `emojiForName` — a keyword rule over THIS name,
+                      deterministic, decoration only; the price lives in the
+                      body below, where a screen reader and a cashier both want
+                      it. */}
+                  <span
+                    className={`catalog-grid__tile-media ${gradientClass(entry.variant.id)}`}
+                    aria-hidden="true"
+                  >
+                    {emojiForName(entry.variant.name_th)}
+                  </span>
+
+                  {/* The badge is inside the button but NOT focusable and NOT in
+                      the accessible name — `aria-hidden`, because the tile's
+                      `aria-label` above is the whole name and a screen reader
+                      announcing "2" between "เพิ่ม" and the item would be noise.
+                      It is a `<span>`, never a `<button>`: this tile's own tests
+                      count buttons to find tiles, and a badge button would read as
+                      an extra sellable item. */}
+                  {inBasket > 0n && (
+                    <span className="catalog-grid__tile-badge" aria-hidden="true">
+                      {`×${inBasket.toString()}`}
+                    </span>
+                  )}
+
+                  <span className="catalog-grid__tile-body">
+                    <span className="catalog-grid__tile-name">{entry.variant.name_th}</span>
+                    <span className="catalog-grid__tile-price">{formatBaht(entry.unitPrice)}</span>
+                    <span className="catalog-grid__tile-sku">{entry.variant.sku}</span>
+                  </span>
+                </button>
+              </li>
+            );
+          })}
         </ul>
       )}
     </div>

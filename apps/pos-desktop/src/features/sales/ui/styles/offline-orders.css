@@ -13,7 +13,7 @@
   padding: 20px;
   background: var(--bg);
   color: var(--ink);
-  font-family: 'Noto Sans Thai', system-ui, sans-serif;
+  font-family: var(--font);
   font-size: 15px;
 }
 
@@ -68,17 +68,61 @@
 }
 
 .offline-orders__sync-item {
-  display: flex;
-  align-items: baseline;
-  gap: 6px;
-  padding: 4px 10px;
-  border-radius: 10px;
-  background: var(--bg);
   font-size: 13px;
 }
 
+/*
+ * The chip itself — a real `<button>`, because it filters.
+ *
+ * The four bars sit on the button and NOT on the `<li>`, so the list slot stays
+ * an unmarked box and the thing a cashier aims at is the thing that responds.
+ * `min-height: var(--tap-sm)` is what makes it aimable at all: these are 13px
+ * labels in a 28px bar, which is below the tap size every other control on this
+ * till is held to.
+ */
+.offline-orders__sync-filter {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-height: var(--tap-sm);
+  padding: 4px 12px;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  background: var(--bg);
+  color: inherit;
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  transition:
+    background-color 0.15s ease,
+    border-color 0.15s ease;
+}
+
+/*
+ * THE PRESSED STATE, and the reason the control has a border at all: an
+ * unpressed chip is a `--bg` pill on a `--card` bar, and a pressed one is that
+ * pill plus a ring. `aria-pressed` rather than a class, so the thing that decides
+ * how it LOOKS is the same thing that tells a screen reader how it behaves — a
+ * parallel class could disagree with the accessibility tree and be the only
+ * thing broken.
+ *
+ * `min-width` keeps the ring from resizing the bar as labels are pressed.
+ */
+.offline-orders__sync-filter[aria-pressed='true'] {
+  border-color: currentColor;
+  font-weight: 700;
+}
+
+.offline-orders__sync-filter:focus-visible {
+  outline: 2px solid var(--acc);
+  outline-offset: 2px;
+}
+
+/* `--mut-strong`, not `--mut`: 13px body text, and `--mut` measures 3.94:1 on
+   this bar's `--card` in the light theme. The rung colours below override it
+   where a rung has its own; this is what the un-rung label falls back to. */
 .offline-orders__sync-label {
-  color: var(--mut);
+  color: var(--mut-strong);
 }
 
 /*
@@ -101,7 +145,7 @@
  * `conflict` the accent again because it must be escalated but is NOT a failure,
  * and `rejected` the danger red — the server refused the write outright.
  */
-.offline-orders__sync-item[data-sync-state='pending'] {
+.offline-orders__sync-item[data-sync-state='pending'] .offline-orders__sync-filter {
   background: var(--accs);
 }
 
@@ -110,7 +154,7 @@
   font-weight: 600;
 }
 
-.offline-orders__sync-item[data-sync-state='synced'] {
+.offline-orders__sync-item[data-sync-state='synced'] .offline-orders__sync-filter {
   background: var(--oks);
 }
 
@@ -119,7 +163,7 @@
   font-weight: 600;
 }
 
-.offline-orders__sync-item[data-sync-state='conflict'] {
+.offline-orders__sync-item[data-sync-state='conflict'] .offline-orders__sync-filter {
   background: var(--accs);
 }
 
@@ -128,7 +172,7 @@
   font-weight: 700;
 }
 
-.offline-orders__sync-item[data-sync-state='rejected'] {
+.offline-orders__sync-item[data-sync-state='rejected'] .offline-orders__sync-filter {
   background: color-mix(in srgb, var(--danger) 12%, var(--card));
 }
 
@@ -270,9 +314,100 @@
   font-variant-numeric: tabular-nums;
 }
 
+/*
+ * THE LOADED COUNT — ANNOUNCED, NOT SHOWN.
+ *
+ * Clipped rather than `display: none`, which would remove it from the
+ * accessibility tree and silence the one number that has to reach a screen
+ * reader: how many rows the port actually returned. `clip-path` is declared
+ * AFTER `width`/`height`/`overflow` so a browser honouring neither still paints
+ * the text rather than hiding it silently — the same recipe
+ * `.catalog-browser__visually-hidden` uses, kept identical on purpose.
+ *
+ * It was visible grey text at the bottom-left, where on an empty terminal it
+ * read "โหลดออเดอร์ 0 รายการ" underneath a heading already saying the same thing
+ * in 24px: the same fact twice, in the smallest type on the page.
+ */
 .offline-orders__summary {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ── Empty state ──────────────────────────────────────────────────────────── */
+
+/*
+ * A centred column rather than the bare 13px line this used to be.
+ *
+ * The old line named the condition and stopped, so the cashier's only move was
+ * to guess. This is the whole of the page when it is empty, so it has to say
+ * what the screen is doing (it watches this terminal), and offer the one action
+ * that always helps (go and sell something).
+ */
+.offline-orders__empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 44px 24px;
+  text-align: center;
+}
+
+.offline-orders__empty-icon {
+  color: var(--mut-strong);
+}
+
+/* `--mut-strong` on `--bg`: 13px secondary text has to clear 4.5:1, and `--mut`
+   is 3.30:1 here. */
+.offline-orders__empty-title {
   margin: 0;
-  color: var(--mut);
+  font-size: 15px;
+  font-weight: 700;
+}
+
+.offline-orders__empty-hint {
+  max-width: 34ch;
+  margin: 0;
+  color: var(--mut-strong);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.offline-orders__empty-action {
+  margin-top: 6px;
+  min-height: var(--tap-sm);
+  padding: 10px 20px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--card);
+  color: var(--ink);
+  font: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.offline-orders__empty-action:hover {
+  border-color: var(--ink);
+}
+
+/*
+ * "Filtered to nothing" is NOT the empty state and must not look like it: the
+ * terminal HAS orders and a chip is hiding them, so this stays one quiet line
+ * rather than a full empty column with a button that would send the cashier away
+ * from a screen that is working.
+ */
+.offline-orders__empty-filtered {
+  margin: 0;
+  padding: 28px 0;
+  color: var(--mut-strong);
+  text-align: center;
   font-size: 13px;
 }
 

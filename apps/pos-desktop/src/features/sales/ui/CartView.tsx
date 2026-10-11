@@ -39,10 +39,10 @@ import type { JSX } from 'react';
 import {
   addItem,
   calculateLineTotal,
-  calculateSubtotal,
   createCart,
   isEmpty,
   removeItem,
+  totalUnits,
   updateQuantity,
 } from '../domain/cart';
 import type { Cart, ProductVariant, UuidV7 } from '../domain/cart';
@@ -50,6 +50,8 @@ import type { Cart, ProductVariant, UuidV7 } from '../domain/cart';
 // panel and the sales screen both mint lines, and two counters mint the same id.
 import { nextCartLineId } from '../domain/lineId';
 import { Money } from '../../payments/domain/money';
+import { playTick } from '../application/tickSound';
+import { getFirstLetter } from './getFirstLetter';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Props
@@ -273,10 +275,13 @@ export function CartView(props?: CartViewProps): JSX.Element {
     [cart, onCartChange],
   );
 
-  // Derived values. `useMemo` because the subtotal walks every line and this
-  // recomputes on every quantity change; the domain function is pure, so
-  // memoising it is safe and correct.
-  const subtotal = useMemo(() => calculateSubtotal(currentCart), [currentCart]);
+  // The unit count for the heading, from the DOMAIN's `totalUnits` — the same
+  // function the sales screen's own count came from, rather than a second reduce
+  // that could disagree with it about what "one item" means.
+  //
+  // `useMemo` because it walks every line on every quantity change; the domain
+  // function is pure, so memoising it is safe and correct.
+  const units = useMemo(() => totalUnits(currentCart), [currentCart]);
   const empty = useMemo(() => isEmpty(currentCart), [currentCart]);
 
   // ── Handlers ──────────────────────────────────────────────────────────────
@@ -301,6 +306,10 @@ export function CartView(props?: CartViewProps): JSX.Element {
   const handleIncrement = useCallback(
     (itemId: UuidV7, quantity: bigint) => {
       commit(updateQuantity(cartRef.current, itemId, quantity + 1n));
+      // Same tone as the grid tile, because it is the same event: one more unit
+      // of something is in the basket. A distinct sound here would imply these
+      // are different actions when they are two routes to one outcome.
+      playTick('add');
     },
     [commit],
   );
@@ -310,6 +319,7 @@ export function CartView(props?: CartViewProps): JSX.Element {
       // A quantity of zero removes the line, which is the domain's rule and not
       // something this component needs to special-case.
       commit(updateQuantity(cartRef.current, itemId, quantity - 1n));
+      playTick('remove');
     },
     [commit],
   );
@@ -317,12 +327,51 @@ export function CartView(props?: CartViewProps): JSX.Element {
   const handleRemove = useCallback(
     (itemId: UuidV7) => {
       commit(removeItem(cartRef.current, itemId));
+      playTick('remove');
     },
     [commit],
   );
 
-  const handleClear = useCallback(() => {
+  // ── Clearing the basket: a two-state machine, NOT `window.confirm` ─────────
+  //
+  // Clearing destroys every line in the basket and there is no undo, so it is
+  // confirmed. Confirmed IN THIS COMPONENT for two reasons:
+  //
+  //   1. IT IS TESTABLE. A native modal is not in the document, so the only
+  //      thing a test could ever assert is that a global was called — never
+  //      that the basket SURVIVED when the cashier said no. That is the branch
+  //      worth testing, and here both branches are ordinary DOM a test can press.
+  //   2. IT IS THE TILL'S OWN DIALOG. Everything else on this screen is the
+  //      app's own chrome; a browser-styled modal is the one control a cashier
+  //      would meet here and nowhere else.
+  //
+  // ONE boolean and not a modal-lifecycle state machine, because there is only
+  // one question to ask. The state that actually needs guarding is the prompt
+  // outliving its own subject: `commit` writes to the PARENT in controlled mode,
+  // and a parent that swaps the customer mid-prompt empties the basket without
+  // going through here. So the render below asks `empty` itself and simply does
+  // not draw the prompt for an empty basket — a boolean would have left it up
+  // over nothing, offering to confirm a clear that had already happened.
+  const [clearArmed, setClearArmed] = useState(false);
+
+  // Arming is allowed even while empty: the button is disabled there instead,
+  // which keeps this handler free of a guard that could only ever be dead.
+  const handleArmClear = useCallback(() => {
+    setClearArmed(true);
+  }, []);
+
+  const handleCancelClear = useCallback(() => {
+    setClearArmed(false);
+  }, []);
+
+  const handleConfirmClear = useCallback(() => {
     commit(createCart());
+    // `remove`, not `success`: nothing was sold and no money moved. The
+    // destructive button keeps a full tap size and has no undo, and it is worth
+    // confirming out loud — but it must never borrow the tone that means "this
+    // sale is committed".
+    playTick('remove');
+    setClearArmed(false);
   }, [commit]);
 
   // What is on offer: the parent's catalogue when it supplied one, the built-in
@@ -333,12 +382,76 @@ export function CartView(props?: CartViewProps): JSX.Element {
 
   return (
     <section className="cart-view" aria-label="ตะกร้าสินค้า">
+      {/* ── Header ─────────────────────────────────────────────────────────
+          The heading, the count that qualifies it, and the one destructive
+          control. `cart-view__title` groups the first two so the header's
+          `space-between` still parks `ล้างตะกร้า` hard right while the heading
+          and its count travel together as one unit.
+
+          THE COUNT LIVES HERE, NOT IN A STRIP OF ITS OWN. It used to sit in a
+          totals bar ABOVE this panel beside the subtotal, which meant the number
+          of items and their price were announced once at the top of the rail
+          and then repeated again in the panel's own footer. Here it is
+          secondary text qualifying the heading it describes: part of
+          "ตะกร้าสินค้า", not a fourth figure competing with the total the
+          checkout shows once, in full. */}
       <header className="cart-view__header">
-        <h2>ตะกร้าสินค้า</h2>
-        <button type="button" onClick={handleClear} disabled={empty}>
+        <div className="cart-view__title">
+          <h2>ตะกร้าสินค้า</h2>
+          <span className="cart-view__count" data-testid="cart-item-count">
+            {`${units.toString()} รายการ`}
+          </span>
+        </div>
+        <button type="button" onClick={handleArmClear} disabled={empty}>
           ล้างตะกร้า
         </button>
       </header>
+
+      {/* ── Clear-cart confirmation ─────────────────────────────────────────
+          Drawn INLINE, directly under the button that armed it, rather than
+          centred over the screen: the question is about the basket, and the
+          answer belongs beside the evidence.
+
+          `alertdialog` and not `dialog`, because this interrupts — it must not
+          be tabbed past without an answer. Focus moves to the CONTAINER
+          (`autoFocus` + `tabIndex={-1}`) rather than to either button: a
+          destructive dialog that preselects its own "yes" destroys the basket on
+          a stray Enter.
+
+          The two buttons carry DIFFERENT names on purpose. "ล้างตะกร้า" would
+          otherwise mean two different things — arm this, and do it — and a
+          screen reader listing two identically-named buttons cannot tell them
+          apart either. */}
+      {clearArmed && !empty && (
+        <div
+          className="cart-view__confirm"
+          role="alertdialog"
+          aria-labelledby="cart-clear-question"
+          aria-describedby="cart-clear-actions"
+          tabIndex={-1}
+          autoFocus
+        >
+          <p className="cart-view__confirm-question" id="cart-clear-question">
+            ล้างสินค้าทั้งหมดในตะกร้าใช่ไหม
+          </p>
+          <div className="cart-view__confirm-actions" id="cart-clear-actions">
+            <button
+              type="button"
+              className="cart-view__confirm-cancel"
+              onClick={handleCancelClear}
+            >
+              ยกเลิก
+            </button>
+            <button
+              type="button"
+              className="cart-view__confirm-accept"
+              onClick={handleConfirmClear}
+            >
+              ยืนยันล้างตะกร้า
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* ── Catalogue: the buttons that exercise the domain ─────────────
           Exposed as a labelled `group` so the region can be named on its own.
@@ -379,13 +492,37 @@ export function CartView(props?: CartViewProps): JSX.Element {
             // The line total comes from the domain, never from arithmetic here.
             const lineTotal = calculateLineTotal(item);
 
+            // Thumbnail: use image_url if available, otherwise first consonant in circle.
+            const thumbnail =
+              item.variant.image_url != null ? (
+                <img
+                  src={item.variant.image_url}
+                  alt=""
+                  className="cart-view__thumbnail"
+                  aria-hidden="true"
+                />
+              ) : (
+                <div className="cart-view__thumbnail cart-view__thumbnail--letter">
+                  {getFirstLetter(item.variant.name_th)}
+                </div>
+              );
+
             return (
-              <li key={item.id} className="cart-view__item">
+              <li key={item.id} className="cart-view__item" data-sku={item.variant.sku}>
+                {/* Thumbnail 48x48 at left */}
+                <div className="cart-view__thumbnail-container">{thumbnail}</div>
+
+                {/* Item name and unit price row */}
                 <div className="cart-view__item-main">
                   <span className="cart-view__item-name">{item.variant.name_th}</span>
-                  <span className="cart-view__item-sku">{item.variant.sku}</span>
+                  {/* Secondary line: quantity × unit price. One text node, so a
+                      query for a bare number finds only the stepper's count. */}
+                  <span className="cart-view__item-unit-price">
+                    {item.quantity.toString()} × {formatBaht(item.unitPrice)}
+                  </span>
                 </div>
 
+                {/* Stepper − 1 + — kept in round A, to be removed in A2 */}
                 <div className="cart-view__item-quantity">
                   <button
                     type="button"
@@ -404,18 +541,33 @@ export function CartView(props?: CartViewProps): JSX.Element {
                   </button>
                 </div>
 
+                {/* Right column: line total and delete button */}
                 <div className="cart-view__item-prices">
-                  <span className="cart-view__item-unit">{formatBaht(item.unitPrice)}</span>
-                  <span className="cart-view__item-total">{formatBaht(lineTotal)}</span>
+                  <span className="cart-view__item-total" data-testid="cart-line-total">
+                    {formatBaht(lineTotal)}
+                  </span>
                 </div>
 
+                {/* Delete button — icon only, 48x48, aria-label with product name */}
                 <button
                   type="button"
                   className="cart-view__item-remove"
                   aria-label={`ลบ ${item.variant.name_th}`}
                   onClick={() => handleRemove(item.id)}
                 >
-                  ลบ
+                  <svg
+                    width="24"
+                    height="24"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    aria-hidden="true"
+                  >
+                    <path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                  </svg>
                 </button>
               </li>
             );
@@ -423,15 +575,19 @@ export function CartView(props?: CartViewProps): JSX.Element {
         </ul>
       )}
 
-      {/* ── Summary ─────────────────────────────────────────────────────── */}
-      <footer className="cart-view__summary">
-        <span className="cart-view__summary-label">ยอดรวม</span>
-        {/* The subtotal is a Money. `toString()` is exact — no float is involved
-            anywhere between the scan and this number on screen. */}
-        <span className="cart-view__summary-value" data-testid="cart-subtotal">
-          {formatBaht(subtotal)}
-        </span>
-      </footer>
+      {/* NO TOTAL HERE, AND THAT IS THE POINT OF THIS PANEL'S SHAPE.
+
+          This footer used to read "ยอดรวม ฿45.50" — the same figure the checkout
+          breakdown below lists, at the same moment, in the same column. A cashier
+          could read two prices off one screen and have no way to know they were
+          the same number, or that the one nearer their thumb was the stale copy.
+
+          So the basket panel lists what is IN the basket and nothing about what
+          it costs. Money appears once, in the summary that breaks it down, and
+          once more on the button that charges it — the two places a total is
+          actually acted on. The lines, the count on the heading and the total are
+          then never a screen apart without the breakdown explaining the gap
+          between them. */}
     </section>
   );
 }
