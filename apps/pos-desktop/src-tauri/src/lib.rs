@@ -54,6 +54,8 @@ pub mod migrate;
 // `stock_balances` table migration 0003 created. Quantities cross the Tauri
 // bridge as strings for the same reason satang does — see the module header.
 pub mod stock_balances;
+// The local Recipe cache: exact milli-unit strings in, SQLite INTEGER columns out.
+pub mod recipes;
 // Strict CP874 encoding, shared by the coverage test and the byte compiler so
 // the two cannot drift — the compiler must never be more permissive than the
 // test that vouched for it. See src/cp874.rs.
@@ -136,7 +138,7 @@ fn start_sync_drain(app: &tauri::AppHandle) {
     let terminal_id = identity.terminal_id.clone();
     let sink = std::sync::Arc::new(sync_http::HttpBatchSink::new(sync_http::SyncConfig::new(
         base_url.trim(),
-        terminal_id.clone(),  // guaranteed UUIDv7
+        terminal_id.clone(), // guaranteed UUIDv7
     )));
 
     log::info!(target: "sync_outbox", "offline outbox drain starting (terminal={})", terminal_id);
@@ -158,30 +160,35 @@ fn start_sync_drain(app: &tauri::AppHandle) {
 /// refuses to start and leaves a log.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-  tauri::Builder::default()
-    // Logging first, so plugin-setup errors below are visible.
-    //
-    // Registered unconditionally. The practical difference between this and
-    // `cfg!(debug_assertions)` is nil: `LevelFilter::Info` writes to stdout
-    // plus the platform log, and a POS terminal that cannot be diagnosed from
-    // its own logs is worse than one extra log line.
-    .plugin(tauri_plugin_log::Builder::default().level(log::LevelFilter::Info).build())
-    .setup(|app| {
-      // Opened here rather than lazily on first command, so the database exists
-      // before the frontend can issue a query against it and so a bad key or a
-      // corrupt file is reported at launch instead of at the first sale.
-      let conn = db::open_database(app.handle()).map_err(std::io::Error::other)?;
-      app.manage(Mutex::new(conn));
-      start_sync_drain(app.handle());
-      Ok(())
-    })
-    .invoke_handler(tauri::generate_handler![
-      commands::save_offline_order,
-      commands::list_recent_orders,
-      commands::apply_stock_balances,
-      commands::get_terminal_identity,
-      printer_commands::print_receipt,
-    ])
-    .run(tauri::generate_context!())
-    .expect("error while building tauri application");
+    tauri::Builder::default()
+        // Logging first, so plugin-setup errors below are visible.
+        //
+        // Registered unconditionally. The practical difference between this and
+        // `cfg!(debug_assertions)` is nil: `LevelFilter::Info` writes to stdout
+        // plus the platform log, and a POS terminal that cannot be diagnosed from
+        // its own logs is worse than one extra log line.
+        .plugin(
+            tauri_plugin_log::Builder::default()
+                .level(log::LevelFilter::Info)
+                .build(),
+        )
+        .setup(|app| {
+            // Opened here rather than lazily on first command, so the database exists
+            // before the frontend can issue a query against it and so a bad key or a
+            // corrupt file is reported at launch instead of at the first sale.
+            let conn = db::open_database(app.handle()).map_err(std::io::Error::other)?;
+            app.manage(Mutex::new(conn));
+            start_sync_drain(app.handle());
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            commands::save_offline_order,
+            commands::list_recent_orders,
+            commands::apply_stock_balances,
+            commands::apply_recipes,
+            commands::get_terminal_identity,
+            printer_commands::print_receipt,
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while building tauri application");
 }
