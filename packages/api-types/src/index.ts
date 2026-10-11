@@ -148,6 +148,138 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/branches": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List branches
+         * @description Returns every branch. This is read-only; branches are created and managed
+         *     by an administrator, not by terminals.
+         *
+         *     **Auth stub (Phase 1):** `REPORTS_TOKEN` environment variable required,
+         *     `X-Report-Token` header must match, and the caller must be localhost.
+         *     Without these, 503 with code `auth_stub_required`.
+         */
+        get: operations["getBranches"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/terminals": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List terminals with last sync time
+         * @description Returns every terminal that has pushed orders or has records in the sync
+         *     outbox, with the last time it successfully synced.
+         *
+         *     **Auth stub (Phase 1):** Same as `/branches`.
+         *
+         *     **Derived fields:** `last_sync_at` is computed from `sync_outbox_items`
+         *     as `MAX(processed_at)` where `state IN ('ACKNOWLEDGED', 'CONFLICT_HELD')`.
+         *     A terminal that only exists in `orders.terminal_id` but never pushed to
+         *     the outbox will have `null` for `last_sync_at`.
+         */
+        get: operations["getTerminals"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/reports/summary": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Revenue summary
+         * @description Returns total revenue (VAT-inclusive), VAT amount, order count, and
+         *     voided count for a branch within a date range.
+         *
+         *     **Revenue definition:**
+         *     - Excludes `draft` status orders
+         *     - Excludes `voided` status orders
+         *     - Includes `void_requested` orders (committed sales awaiting void decision)
+         *
+         *     **Time bucketing:** Dates are interpreted in `Asia/Bangkok` timezone.
+         *     `as_of` is the latest `created_at` of counted orders (UTC).
+         *
+         *     **Auth stub (Phase 1):** Same as `/branches`.
+         */
+        get: operations["getReportSummary"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/reports/revenue-by-branch": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Revenue broken down by branch
+         * @description Returns revenue and order count per branch, ordered by revenue descending.
+         *
+         *     **Revenue definition:** Same as `/reports/summary`.
+         *
+         *     **Auth stub (Phase 1):** Same as `/branches`.
+         */
+        get: operations["getRevenueByBranch"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/reports/revenue-series": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Revenue time series
+         * @description Returns revenue and order count aggregated by day or month.
+         *
+         *     **Revenue definition:** Same as `/reports/summary`.
+         *
+         *     **Auth stub (Phase 1):** Same as `/branches`.
+         */
+        get: operations["getRevenueSeries"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -971,6 +1103,113 @@ export interface components {
                 [key: string]: unknown;
             } | null;
         };
+        /**
+         * @description Response for `GET /branches`. No pagination: branches are small and
+         *     fetched once per shift.
+         */
+        BranchesResponse: {
+            branches: components["schemas"]["Branch"][];
+        };
+        /**
+         * @description A branch. The server's authoritative list of shops. Currently only the
+         *     branch that holds this server's data exists, but the contract is written
+         *     to support multiple branches in the future.
+         */
+        Branch: {
+            id: components["schemas"]["UuidV7"];
+            /**
+             * @description Branch display name.
+             * @example Siam
+             */
+            name: string;
+            currency: components["schemas"]["CurrencyCode"];
+            vat_rate_bp: components["schemas"]["VatRateBp"];
+            /**
+             * Format: date-time
+             * @description RFC 3339 UTC.
+             */
+            created_at: string;
+            /**
+             * Format: date-time
+             * @description RFC 3339 UTC.
+             */
+            updated_at: string;
+        };
+        /**
+         * @description Response for `GET /terminals`. No pagination: terminals are small and
+         *     fetched once per shift.
+         */
+        TerminalsResponse: {
+            terminals: components["schemas"]["Terminal"][];
+        };
+        /**
+         * @description A terminal that has pushed orders to this server. The `id` is the
+         *     `terminal_id` UUID (not a sequence), and `last_sync_at` is derived from
+         *     `sync_outbox_items`.
+         */
+        Terminal: {
+            /**
+             * @description The terminal UUIDv7, derived from `orders.terminal_id` and
+             *     `sync_outbox_items.terminal_id`.
+             */
+            id: components["schemas"]["UuidV7"];
+            /**
+             * Format: date-time
+             * @description Latest successful sync time, derived from `MAX(processed_at)` of
+             *     `sync_outbox_items` where `state IN ('ACKNOWLEDGED', 'CONFLICT_HELD')`.
+             *     Null if the terminal exists only in `orders` but never pushed.
+             */
+            last_sync_at: string | null;
+            /** @description Count of orders pushed by this terminal. */
+            order_count: number;
+        };
+        /**
+         * @description Response for `GET /reports/summary`. All monetary fields are `Satang`
+         *     strings.
+         */
+        ReportSummaryResponse: {
+            /**
+             * Format: date-time
+             * @description Latest `created_at` of counted orders (UTC). This is the "point in
+             *     time" for the summary — a client can resume from this timestamp.
+             */
+            as_of: string;
+            /** @description Total revenue (VAT-inclusive), excluding draft and voided orders. */
+            revenue_total_satang: components["schemas"]["Satang"];
+            /** @description VAT amount extracted from revenue. */
+            vat_satang: components["schemas"]["Satang"];
+            /** @description Count of counted orders (excludes draft and voided). */
+            order_count: number;
+            /** @description Count of orders with `status = 'voided'` within the date range. */
+            voided_count: number;
+        };
+        /** @description Response for `GET /reports/revenue-by-branch`. */
+        RevenueByBranchResponse: {
+            revenue_by_branch: components["schemas"]["RevenueByBranchItem"][];
+        };
+        /** @description Revenue and order count for one branch. */
+        RevenueByBranchItem: {
+            branch_id: components["schemas"]["UuidV7"];
+            /** @description Branch name. */
+            name: string;
+            revenue_satang: components["schemas"]["Satang"];
+            order_count: number;
+        };
+        /** @description Response for `GET /reports/revenue-series`. */
+        RevenueSeriesResponse: {
+            series: components["schemas"]["RevenueSeriesItem"][];
+        };
+        /** @description Revenue and order count for one time bucket (day or month). */
+        RevenueSeriesItem: {
+            /**
+             * @description ISO 8601 bucket identifier: `YYYY-MM-DD` for day, `YYYY-MM` for month.
+             *     Dates are interpreted in `Asia/Bangkok` timezone.
+             * @example 2026-10-01
+             */
+            bucket: string;
+            revenue_satang: components["schemas"]["Satang"];
+            order_count: number;
+        };
     };
     responses: {
         /** @description Malformed or missing parameter. */
@@ -1275,6 +1514,177 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             500: components["responses"]["InternalError"];
+        };
+    };
+    getBranches: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description List of branches. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BranchesResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Auth stub not configured. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getTerminals: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description List of terminals. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TerminalsResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Auth stub not configured. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getReportSummary: {
+        parameters: {
+            query: {
+                /** @description Branch to report on. */
+                branch_id: components["schemas"]["UuidV7"];
+                /** @description Start date (inclusive, Asia/Bangkok). */
+                from: string;
+                /** @description End date (inclusive, Asia/Bangkok). */
+                to: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Revenue summary. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ReportSummaryResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Auth stub not configured. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getRevenueByBranch: {
+        parameters: {
+            query: {
+                /** @description Start date (inclusive, Asia/Bangkok). */
+                from: string;
+                /** @description End date (inclusive, Asia/Bangkok). */
+                to: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Revenue by branch. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RevenueByBranchResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Auth stub not configured. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getRevenueSeries: {
+        parameters: {
+            query: {
+                /** @description Branch to report on. */
+                branch_id: components["schemas"]["UuidV7"];
+                /** @description Time bucket size. */
+                granularity: "day" | "month";
+                /** @description Start date (inclusive, Asia/Bangkok). */
+                from: string;
+                /** @description End date (inclusive, Asia/Bangkok). */
+                to: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Revenue time series. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RevenueSeriesResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Auth stub not configured. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
         };
     };
 }

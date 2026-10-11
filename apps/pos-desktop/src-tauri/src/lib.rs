@@ -10,7 +10,7 @@
 //!   - [`db`]: finding the SQLCipher key and opening the encrypted database, with
 //!     the connection-level pragmas that a migration file cannot set.
 //!   - [`migrate`]: forward-only schema application keyed on `PRAGMA user_version`.
-//!   - [`commands`]: the two commands the frontend may call, and nothing else.
+//!   - [`commands`]: the three commands the frontend may call, and nothing else.
 //!
 //! What does NOT live here: tax rounding policy, cart arithmetic, promotion
 //! eligibility, or any check that could be expressed in the domain layer. Those
@@ -49,6 +49,11 @@ pub type AppState = Mutex<Connection>;
 pub mod commands;
 pub mod db;
 pub mod migrate;
+// The local StockBalance cache: parses a pulled snapshot's `Quantity` strings
+// into exact milli-units and UPSERTs them, in one transaction, into the
+// `stock_balances` table migration 0003 created. Quantities cross the Tauri
+// bridge as strings for the same reason satang does — see the module header.
+pub mod stock_balances;
 // Strict CP874 encoding, shared by the coverage test and the byte compiler so
 // the two cannot drift — the compiler must never be more permissive than the
 // test that vouched for it. See src/cp874.rs.
@@ -70,6 +75,9 @@ pub mod sync_outbox;
 // format and nothing about the state machine; `sync_outbox::drain_tick` takes
 // it as a closure, so the ledger logic stays testable without a socket.
 pub mod sync_http;
+// Terminal identity validator: UUIDv7 gate before any network call.
+// Fail-fast at startup to prevent infinite HTTP 400 retry loops.
+pub mod terminal_identity;
 // Proves the receipt printer's code page can encode the Thai this POS actually
 // uses — especially ๐–๙, which post-date windows-874 and were the likeliest
 // unmappable characters. See the module for why this runs before any receipt.
@@ -102,44 +110,43 @@ const DRAIN_BATCH_LIMIT: i64 = 64;
 /// shop whose server has not been deployed. Nothing is claimed, nothing is lost,
 /// and the outbox waits — those rows are already durable in SQLite.
 ///
-/// Deliberately not a compile-time constant and not a Tauri command: a till's
-/// backend address is per-deployment, so it belongs to the environment the
-/// terminal is launched in, exactly as the SQLCipher key already does.
+/// ── FAIL-FAST UUIDv7 VALIDATION ──────────────────────────────────────────────
+/// `WAL_ASRI_TERMINAL_ID` and `WAL_ASRI_BRANCH_ID` are client-asserted.
+/// An invalid UUIDv7 causes EVERY batch to be Refused (HTTP 400) by the server.
+/// The drain treats Refused as RETRYABLE, so the same bad ID loops forever.
+/// This function validates ONCE at startup and refuses to start the drain
+/// if validation fails, logging the VARIABLE name for the operator to fix.
 fn start_sync_drain(app: &tauri::AppHandle) {
-  let Ok(base_url) = std::env::var("WAL_ASRI_SYNC_URL") else {
-    log::info!(
-      target: "sync_outbox",
-      "WAL_ASRI_SYNC_URL is not set; the offline outbox will not drain until this terminal is pointed at a server"
+    // 1. Validate identity BEFORE creating any HTTP client
+    let identity = match crate::terminal_identity::load_and_validate() {
+        Ok(id) => id,
+        Err(e) => {
+            log::error!(target: "sync_outbox", "drain will not start: {e}");
+            return;
+        }
+    };
+
+    // 2. Sync URL (optional — unset means "not configured to sync yet")
+    let Ok(base_url) = std::env::var("WAL_ASRI_SYNC_URL") else {
+        log::info!(target: "sync_outbox", "WAL_ASRI_SYNC_URL not set; drain idle until configured");
+        return;
+    };
+
+    // 3. Create sink with VALIDATED identity
+    let terminal_id = identity.terminal_id.clone();
+    let sink = std::sync::Arc::new(sync_http::HttpBatchSink::new(sync_http::SyncConfig::new(
+        base_url.trim(),
+        terminal_id.clone(),  // guaranteed UUIDv7
+    )));
+
+    log::info!(target: "sync_outbox", "offline outbox drain starting (terminal={})", terminal_id);
+
+    sync_outbox::spawn_drain(
+        app.clone(),
+        DRAIN_INTERVAL,
+        DRAIN_BATCH_LIMIT,
+        move |batch| sink.push(batch),
     );
-    return;
-  };
-
-  let Ok(terminal_id) = std::env::var("WAL_ASRI_TERMINAL_ID") else {
-    log::warn!(
-      target: "sync_outbox",
-      "WAL_ASRI_SYNC_URL is set but WAL_ASRI_TERMINAL_ID is not; refusing to drain — `terminal_id` is client-asserted and an empty one would attribute another till's sales to this one"
-    );
-    return;
-  };
-
-  if terminal_id.trim().is_empty() {
-    log::warn!(target: "sync_outbox", "WAL_ASRI_TERMINAL_ID is empty; refusing to drain");
-    return;
-  }
-
-  let sink = std::sync::Arc::new(sync_http::HttpBatchSink::new(sync_http::SyncConfig::new(
-    base_url.trim(),
-    terminal_id.trim(),
-  )));
-
-  log::info!(target: "sync_outbox", "offline outbox drain starting");
-
-  sync_outbox::spawn_drain(
-    app.clone(),
-    DRAIN_INTERVAL,
-    DRAIN_BATCH_LIMIT,
-    move |batch| sink.push(batch),
-  );
 }
 
 /// Entry point for both desktop and mobile (the `#[cfg_attr(mobile, ...)]`
@@ -171,6 +178,8 @@ pub fn run() {
     .invoke_handler(tauri::generate_handler![
       commands::save_offline_order,
       commands::list_recent_orders,
+      commands::apply_stock_balances,
+      commands::get_terminal_identity,
       printer_commands::print_receipt,
     ])
     .run(tauri::generate_context!())

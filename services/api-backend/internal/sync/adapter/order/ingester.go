@@ -187,12 +187,12 @@ type lineBody struct {
 // in parsing, so all of these are rejections rather than infrastructure errors.
 func parseOrderPayload(payload []byte) (order.Order, error) {
 	var body orderBody
-	// DisallowUnknownFields is DELIBERATE and is the one place in this service
-	// where it applies. A terminal built against a NEWER contract may send a field
-	// this server does not know; silently dropping it would drop the facts that
-	// field carries. Refusing loudly means the mismatch is visible at the drain
-	// rather than becoming an order priced without a term the client thought it
-	// sent.
+	// json.Unmarshal is used (NOT DisallowUnknownFields). This means extra fields
+	// in the payload are silently ignored. The contract's SyncCommand.payload is
+	// typed as a free-form object (additionalProperties: true) so an old terminal
+	// draining a queue written by a new build must be able to hand the server
+	// something the server recognises. The ingester extracts only the fields it
+	// needs to re-price; unknown fields are dropped without error.
 	if err := json.Unmarshal(payload, &body); err != nil {
 		return order.Order{}, rejected("malformed_payload",
 			"the payload is not an order this server can read: "+err.Error())

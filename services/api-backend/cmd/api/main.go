@@ -65,6 +65,9 @@ import (
 	syncorder "wal-asri-pos/services/api-backend/internal/sync/adapter/order"
 	syncdomain "wal-asri-pos/services/api-backend/internal/sync/domain"
 	syncuc "wal-asri-pos/services/api-backend/internal/sync/usecase"
+	reportinghttp "wal-asri-pos/services/api-backend/internal/reporting/adapter/http"
+	reportingpostgres "wal-asri-pos/services/api-backend/internal/reporting/adapter/postgres"
+	reportinguc "wal-asri-pos/services/api-backend/internal/reporting/usecase"
 )
 
 // version is stamped from the build, not from a constant that drifts.
@@ -125,7 +128,7 @@ func run() error {
 	// The in-memory adapters are NOT an option for the fallback. They are excellent
 	// for tests and catastrophic in production: a process restart would take every
 	// acknowledged sale with it, and nothing would say so.
-	ingest, drainIdem, closePersistence, err := buildPersistence(clock, logger)
+	ingest, drainIdem, pool, closePersistence, err := buildPersistence(clock, logger)
 	if err != nil {
 		return err
 	}
@@ -139,6 +142,22 @@ func run() error {
 		Now:    clock,
 	})
 	orderhttp.NewHandler(drain, func() int64 { return clock().UnixNano() }).Route(mux)
+
+	// ── reporting (Phase 1 — read-only analytics) ──────────────────────────────
+	//
+	// The reporting endpoints are wired to Postgres via the same pool as orders.
+	// They are read-only and reuse the same database connection pool, so the
+	// migration above (0001_orders.sql + 0002_inventory.sql) has already applied
+	// the schema that includes branches and sync_outbox_items.
+	//
+	// Auth stub (Phase 1): The handler checks X-Report-Token header against the
+	// REPORTS_TOKEN environment variable and requires localhost. Without the
+	// token, 503 with code `auth_stub_required`.
+	if pool != nil {
+		if err := wireReporting(mux, pool, clock, logger); err != nil {
+			return err
+		}
+	}
 
 	srv := &http.Server{
 		Addr:         *addr,
@@ -236,10 +255,12 @@ var _ cataloguc.CatalogRepository = unwiredCatalogRepository{}
 // The drain's idempotency port is the SAME postgres type as the order's: one table,
 // one writer, and therefore one answer when two batches overlap. Two implementations
 // of one store would be two sources of truth for whether a sale was already applied.
+// buildPersistence returns the pool along with the ingest and idempotency.
+// The caller is responsible for closing the pool when done.
 func buildPersistence(
 	clock func() time.Time,
 	logger *slog.Logger,
-) (*orderuc.IngestOrder, syncuc.BatchIdempotency, func(), error) {
+) (*orderuc.IngestOrder, syncuc.BatchIdempotency, *pgxpool.Pool, func(), error) {
 	dsn := os.Getenv(databaseURLEnv)
 	if dsn == "" {
 		logger.Warn("POST "+orderhttp.BasePath+"/sync/push is routed but will REFUSE every submission",
@@ -254,13 +275,9 @@ func buildPersistence(
 			Rates:  unwiredBranchRates{},
 			Idem:   unwiredIdempotencyStore{},
 			Outbox: unwiredOutboxLedger{},
-			// The stock ledger refuses too, and for the same reason as the four
-			// above: a sale acknowledged without its stock recorded is a shelf that
-			// silently drifts. A terminal pushing in this state is told "retry", keeps
-			// its outbox row, and the deduction happens once persistence exists.
 			Stock: unwiredStockLedger{},
 			Now:   clock,
-		}), unwiredBatchIdempotency{}, nil, nil
+		}), unwiredBatchIdempotency{}, nil, nil, nil
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -268,32 +285,21 @@ func buildPersistence(
 
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("opening the Postgres pool: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("opening the Postgres pool: %w", err)
 	}
 	if err := pool.Ping(ctx); err != nil {
 		pool.Close()
-		return nil, nil, nil, fmt.Errorf(
+		return nil, nil, nil, nil, fmt.Errorf(
 			"connecting to Postgres: %w. Check the host and port: this project is on 5433, and 5432 "+
 				"belongs to the sibling project pos-walasri (dev/DEV-SETUP.md)", err)
 	}
 	if err := postgres.Migrate(ctx, pool); err != nil {
 		pool.Close()
-		// Fatal on purpose: serving into a schema missing its money CHECKs is worse
-		// than not serving at all.
-		return nil, nil, nil, fmt.Errorf("applying the schema: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("applying the schema: %w", err)
 	}
 
 	store := postgres.NewIdempotencyStore(pool)
 
-	// The stock deduction, wired over the SAME pool and therefore the same
-	// transaction-visible schema the orders land in.
-	//
-	// Sharing the pool rather than opening a second one is deliberate: the
-	// deduction reads `inventory_items` and writes `stock_movements`, and a second
-	// pool would mean a second set of connections against the same database for no
-	// benefit. It also means the migration above has already applied
-	// 0002_inventory.sql — the store would fail on a missing table otherwise, and
-	// failing at startup is far better than failing on the first sale of the shift.
 	stockStore := inventorypostgres.NewStockStore(pool)
 	logger.Info("the sync endpoint is wired to Postgres",
 		"schema", "applied from the embedded db/migrations at startup",
@@ -313,7 +319,7 @@ func buildPersistence(
 		})),
 		Now: clock,
 	})
-	return ingest, store, pool.Close, nil
+	return ingest, store, pool, pool.Close, nil
 }
 
 // databaseURLEnv is the connection string's environment variable.
@@ -321,6 +327,35 @@ func buildPersistence(
 // Matches DEV-SETUP.md §4, which says the Go backend "connects over the host ports
 // instead, via DATABASE_URL / REDIS_URL in .env".
 const databaseURLEnv = "DATABASE_URL"
+
+// ── reporting wiring ───────────────────────────────────────────────────────────
+//
+// wireReporting wires the Phase 1 reporting endpoints with auth stub protection.
+
+func wireReporting(mux *http.ServeMux, pool *pgxpool.Pool, now func() time.Time, logger *slog.Logger) error {
+	branchRepo := reportingpostgres.NewBranchRepository(pool)
+	terminalRepo := reportingpostgres.NewTerminalRepository(pool)
+	revenueRepo := reportingpostgres.NewRevenueRepository(pool)
+
+	getBranches := reportinguc.NewGetBranches(branchRepo)
+	getTerminals := reportinguc.NewGetTerminals(terminalRepo)
+	getSummary := reportinguc.NewGetReportSummary(revenueRepo)
+	getRevenueByBranch := reportinguc.NewGetRevenueByBranch(revenueRepo)
+	getRevenueSeries := reportinguc.NewGetRevenueSeries(revenueRepo)
+
+	reportingHandler := reportinghttp.NewHandler(
+		getBranches,
+		getTerminals,
+		getSummary,
+		getRevenueByBranch,
+		getRevenueSeries,
+		now,
+		logger,
+	)
+	reportingHandler.Route(mux)
+
+	return nil
+}
 
 // ── the refusing placeholders ──────────────────────────────────────────────────
 //

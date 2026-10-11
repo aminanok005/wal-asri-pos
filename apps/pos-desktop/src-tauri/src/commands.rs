@@ -1,10 +1,14 @@
 //! The Tauri command surface: the only place the frontend can touch the database.
 //!
 //! ── What lives here ──────────────────────────────────────────────────────────
-//! Two commands, both thin, neither clever:
+//! Three commands, all thin, none clever:
 //!
 //!   * `save_offline_order` — the three-write checkout, in one transaction.
 //!   * `list_recent_orders` — the history screen's projection query.
+//!   * `apply_stock_balances` — one pulled stock snapshot into the local cache.
+//!     Only the shim lives here: the quantity parse and the UPSERT belong to
+//!     `stock_balances.rs`, which owns that table's rules, exactly as this module
+//!     owns the checkout's.
 //!
 //! Per SKILL.md §2.3 this is an adapter. It holds NO business rules: it does not
 //! compute tax, does not sum a total, does not decide an order's status. Every
@@ -36,6 +40,7 @@ use rusqlite::{Connection, Statement};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 
+use crate::stock_balances::{StockBalanceInput, StockBalanceWriteResult};
 use crate::AppState;
 
 /// A command failure, shaped for the wire.
@@ -65,14 +70,18 @@ pub enum CommandErrorKind {
 }
 
 impl CommandError {
-  fn invalid(field: &str, why: &str) -> Self {
+  /// `pub(crate)`: this module is an adapter like `commands` is, and it must be
+  /// able to shape its own rejections the same way — a stock quantity that
+  /// arrives malformed is the same class of failure as a satang field that does,
+  /// and the frontend branches on `kind` for both.
+  pub(crate) fn invalid(field: &str, why: &str) -> Self {
     CommandError {
       kind: CommandErrorKind::InvalidPayload,
       message: format!("{field}: {why}"),
     }
   }
 
-  fn storage(what: &str, e: rusqlite::Error) -> Self {
+  pub(crate) fn storage(what: &str, e: rusqlite::Error) -> Self {
     CommandError {
       kind: CommandErrorKind::Storage,
       message: format!("{what}: {e}"),
@@ -99,9 +108,16 @@ pub struct OrderInput {
   pub branch_id: String,
   pub terminal_id: String,
   pub staff_user_id: String,
-  /// `type` is a Rust keyword, so the field is `order_type` on the wire as
-  /// `type` — matching the column name, which is what the SQL will read.
-  #[serde(rename = "type")]
+  /// `type` is a Rust keyword, so in Rust the field is `order_type`.
+  ///
+  /// On the wire its primary spelling is `orderType` — what
+  /// `SaveOfflineOrderInputWire` (`tauriOfflineOrders.ts:78`) actually declares
+  /// and what `SalesTerminalView` sends. This struct used to demand `type`
+  /// (`rename = "type"`), and with `deny_unknown_fields` below that drift meant
+  /// EVERY real checkout died at the bridge: the key sent was unknown, the key
+  /// expected was absent. `type` stays as an accepted alias so either spelling
+  /// deserialises and neither side's spelling can strand a sale.
+  #[serde(alias = "type")]
   pub order_type: String,
   /// Absent means the schema's own default. Rust does not choose a rung: that is
   /// a domain decision, made in `sales/domain/checkout.ts`.
@@ -167,8 +183,26 @@ pub struct OutboxInput {
   /// not a JSON object, so a truncated or array-shaped payload fails at INSERT.
   pub payload: String,
   pub idempotency_key: String,
+  /// When the drain may first claim this row.
+  ///
+  /// The frontend does not choose it: a fresh outbox row is due the moment it
+  /// exists, so a missing value defaults to NOW via the crate's single clock
+  /// read (`sync_outbox::now_iso`) — the same clock `drain_tick` compares
+  /// against, in the one timestamp format the schema stores.
+  ///
+  /// The default is load-bearing, not a convenience: `SaveOfflineOrderInputWire`
+  /// (`tauriOfflineOrders.ts:121-129`) has no `nextAttemptAt` field at all, and
+  /// without this default every real checkout failed here while every test that
+  /// builds `OutboxInput` by hand kept passing.
+  #[serde(default = "default_next_attempt_at")]
   pub next_attempt_at: String,
   pub created_at: String,
+}
+
+/// `OutboxInput::next_attempt_at` when the wire omits it: immediately due, in
+/// `YYYY-MM-DDTHH:MM:SSZ`.
+fn default_next_attempt_at() -> String {
+  crate::sync_outbox::now_iso()
 }
 
 /// The whole checkout.
@@ -670,10 +704,103 @@ pub async fn list_recent_orders(app: AppHandle, limit: i64) -> Result<Vec<OrderS
   blocking(app, move |conn| query_recent(conn, limit)).await
 }
 
+/// Store one pulled stock snapshot in the local `stock_balances` cache.
+///
+/// A shim and nothing more, deliberately. Every quantity string is parsed, every
+/// row is probed for insert-vs-update, and the whole batch is written in ONE
+/// transaction by [`crate::stock_balances::apply_stock_balances`] — code that
+/// has its own tests and its own header explaining why the quantities cross as
+/// strings. Duplicating any of that here would put the rule in two places, and
+/// the two copies would drift.
+///
+/// The one thing this layer decides is threading the managed connection through
+/// `blocking`, because `rusqlite` is synchronous and a snapshot of a few hundred
+/// balances held on the async runtime is a visible stall on a till.
+#[tauri::command]
+pub async fn apply_stock_balances(
+  app: AppHandle,
+  balances: Vec<StockBalanceInput>,
+) -> Result<StockBalanceWriteResult, CommandError> {
+  blocking(app, move |conn| crate::stock_balances::apply_stock_balances(conn, &balances)).await
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Terminal identity
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Who this terminal is, as its environment declares it.
+///
+/// `camelCase` on the wire for the same reason as every other command's
+/// payload (`SaveOfflineOrderOutput`, `CommandError`): the frontend reads
+/// `terminalId` / `branchId`, not snake_case.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalIdentity {
+  pub terminal_id: String,
+  pub branch_id: String,
+}
+
+/// The two variables this command reads. Neither has a default: a silent
+/// fallback would attribute a sale to a till or a branch nobody chose, and the
+/// server's `terminal_id` is client-asserted precisely because this crate is
+/// the only thing that ever states it.
+const TERMINAL_ID_ENV: &str = "WAL_ASRI_TERMINAL_ID";
+const BRANCH_ID_ENV: &str = "WAL_ASRI_BRANCH_ID";
+
+/// Which till, which branch — asked of the environment, not of the database.
+///
+/// Unlike the commands above, this one is synchronous: there is nothing to hand
+/// to `blocking`, because it reads no SQLite and takes no lock.
+///
+/// `WAL_ASRI_BRANCH_ID` is a NEW variable, and it exists because the checkout
+/// screen currently hard-codes `branch-siam` — a value the Go ingester refuses
+/// (`invalid_branch_id`, permanent). Once the UI calls this command, both ids
+/// come from one validated place instead of two literals in a React file.
+///
+/// Failure is loud and named: an unset or malformed variable is an error
+/// carrying the VARIABLE's name, never a quiet empty string or placeholder.
+#[tauri::command]
+pub fn get_terminal_identity() -> Result<TerminalIdentity, CommandError> {
+  identity_from_env(
+    std::env::var(TERMINAL_ID_ENV).ok().as_deref(),
+    std::env::var(BRANCH_ID_ENV).ok().as_deref(),
+  )
+}
+
+/// The environment values, validated.
+///
+/// Split from the command so tests pass values as arguments: `std::env::set_var`
+/// is `unsafe` in edition 2024, and mutating the process environment from a
+/// test suite that runs in parallel is a race nobody needs to debug.
+/// Delegates to `crate::terminal_identity::load_and_validate_from_values` for
+/// shared validation logic (single source of truth for UUIDv7 rules).
+fn identity_from_env(
+    terminal_id: Option<&str>,
+    branch_id: Option<&str>,
+) -> Result<TerminalIdentity, CommandError> {
+    let validated = crate::terminal_identity::load_and_validate_from_values(terminal_id, branch_id)
+        .map_err(|e| match e {
+            crate::terminal_identity::IdentityError::Missing { var } => CommandError::invalid(
+                var,
+                "is not set; this command never invents an identity — launch the terminal with it configured",
+            ),
+            crate::terminal_identity::IdentityError::InvalidFormat { var, value } => CommandError::invalid(
+                var,
+                &format!("must be a UUIDv7 like 0192f6c4-7c1e-7a3f-9b2d-4e6f8a1b2c3d; got {value:?}"),
+            ),
+        })?;
+
+    Ok(TerminalIdentity {
+        terminal_id: validated.terminal_id,
+        branch_id: validated.branch_id,
+    })
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
   use crate::migrate::migrate;
+  use crate::sync_outbox::claim_ready;
 
   fn conn() -> Connection {
     let mut c = Connection::open_in_memory().expect("open in-memory database");
@@ -747,6 +874,209 @@ mod tests {
     conn
       .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
       .unwrap_or_else(|e| panic!("count {table}: {e}"))
+  }
+
+  // ── THE BRIDGE: the JSON the checkout screen actually sends ────────────────
+  //
+  // Every other test here builds `SaveOfflineOrderInput` BY HAND — which is
+  // exactly how two wire drifts survived the whole suite while breaking every
+  // real checkout: the screen sends `orderType` where serde demanded `type`,
+  // and it sends no `nextAttemptAt` at all. Hand-built structs cannot catch a
+  // spelling mismatch they never spell. These tests push the REAL wire shape
+  // through real `serde` and into a real transaction instead.
+
+  /// Byte-for-byte the object `SalesTerminalView` + `toWireInput` produce:
+  /// `orderType` as the type key, an outbox with NO `nextAttemptAt`, satang as
+  /// strings, `null` for the optional outbox trio. Source of truth:
+  /// `tauriOfflineOrders.ts:72-130` (wire type) and `SalesTerminalView.tsx:424-509`.
+  const UI_CHECKOUT_JSON: &str = r#"{
+    "order": {
+      "id": "018f3c2a-0000-7000-8000-000000000001",
+      "branchId": "branch-siam",
+      "terminalId": "terminal-01",
+      "staffUserId": "staff-01",
+      "orderType": "takeaway",
+      "status": "submitted",
+      "source": "pos_desktop",
+      "currency": null,
+      "vatRateBp": 700,
+      "subtotalSatang": "4550",
+      "discountSatang": "0",
+      "taxableSatang": "4252",
+      "taxSatang": "298",
+      "serviceChargeSatang": "0",
+      "roundingAdjustmentSatang": "0",
+      "totalSatang": "4550",
+      "idempotencyKey": "idem-018f3c2a-0000-7000-8000-000000000001",
+      "localReceiptNumber": "R-1",
+      "createdAt": "2026-10-03T09:00:00.000Z"
+    },
+    "lines": [{
+      "id": "line-1",
+      "variantId": "variant-1",
+      "productId": null,
+      "sku": "BEV-LATTE",
+      "nameTh": "กาแฟลาเต้",
+      "nameEn": null,
+      "quantity": "1",
+      "unitPriceSatang": "4550",
+      "lineDiscountSatang": "0",
+      "lineTaxSatang": "0",
+      "lineTotalSatang": "4550",
+      "createdAt": "2026-10-03T09:00:00.000Z"
+    }],
+    "outbox": {
+      "id": "outbox-1",
+      "aggregateType": null,
+      "eventType": null,
+      "action": null,
+      "payload": "{\"order_id\":\"018f3c2a-0000-7000-8000-000000000001\"}",
+      "idempotencyKey": "idem-outbox-1",
+      "createdAt": "2026-10-03T09:00:00.000Z"
+    }
+  }"#;
+
+  #[test]
+  fn the_json_the_screen_actually_saves_deserialises_and_commits() {
+    let input: SaveOfflineOrderInput = serde_json::from_str(UI_CHECKOUT_JSON).expect(
+      "the real wire shape must deserialise — a failure here is a checkout the till cannot save",
+    );
+
+    // `orderType` is the spelling the screen sends; the field reads back as its
+    // Rust name because that is what the SQL binds.
+    assert_eq!(input.order.order_type, "takeaway");
+
+    // Absent on the wire → defaulted to the crate's one clock read, not "".
+    // Shape, not equality with a fresh `now_iso()`: the default was taken a
+    // few microseconds ago and the second may have rolled over since.
+    let defaulted = &input.outbox.next_attempt_at;
+    assert_eq!(
+      defaulted.len(),
+      20,
+      "must be YYYY-MM-DDTHH:MM:SSZ, got {defaulted}"
+    );
+    assert!(defaulted.ends_with('Z'), "must be UTC, got {defaulted}");
+
+    let mut c = conn();
+    write_order(&mut c, &input).expect("checkout commits");
+    assert_eq!(count(&c, "local_orders"), 1);
+    assert_eq!(count(&c, "local_order_lines"), 1);
+    assert_eq!(count(&c, "sync_outbox"), 1);
+
+    // THE POINT OF THE DEFAULT: the row must be claimable by the very next
+    // drain tick. A next_attempt_at in the future would leave the sale sitting
+    // in the queue with no delivery scheduled by anyone.
+    let now = crate::sync_outbox::now_iso();
+    let claimed = claim_ready(&mut c, 10, &now).expect("claim");
+    assert_eq!(claimed.len(), 1, "a fresh outbox row is due immediately");
+    assert_eq!(claimed[0].idempotency_key, "idem-outbox-1");
+  }
+
+  #[test]
+  fn the_older_type_spelling_still_deserialises() {
+    // `type` was this struct's declared wire name before the TS side settled on
+    // `orderType`. Both must keep working: fixtures and tests built against
+    // either spelling must not be stranded by which side moves first.
+    let json = UI_CHECKOUT_JSON.replace("\"orderType\"", "\"type\"");
+    let input: SaveOfflineOrderInput =
+      serde_json::from_str(&json).expect("`type` remains an accepted alias");
+    assert_eq!(input.order.order_type, "takeaway");
+  }
+
+  #[test]
+  fn an_explicit_next_attempt_at_is_stored_verbatim() {
+    // The default must never override a value the wire DID choose.
+    let json = UI_CHECKOUT_JSON.replace(
+      "\"idempotencyKey\": \"idem-outbox-1\",",
+      "\"nextAttemptAt\": \"2026-10-03T09:00:00.000Z\",\n      \"idempotencyKey\": \"idem-outbox-1\",",
+    );
+    let input: SaveOfflineOrderInput =
+      serde_json::from_str(&json).expect("an explicit nextAttemptAt is a known field");
+    assert_eq!(input.outbox.next_attempt_at, "2026-10-03T09:00:00.000Z");
+
+    let mut c = conn();
+    write_order(&mut c, &input).expect("checkout commits");
+    let stored: String = c
+      .query_row("SELECT next_attempt_at FROM sync_outbox", [], |r| r.get(0))
+      .expect("row exists");
+    assert_eq!(stored, "2026-10-03T09:00:00.000Z");
+  }
+
+  // ── get_terminal_identity ───────────────────────────────────────────────────
+
+  /// Both valid: version nibble `7` at index 14, variant nibble in `89ab` at
+  /// index 19, hex and hyphens everywhere the layout demands.
+  const ID_TERMINAL: &str = "0192f6c4-7c1e-7a3f-9b2d-4e6f8a1b2c3d";
+  const ID_BRANCH: &str = "0192f6c5-1a2b-7c4d-8e5f-0123456789ab";
+
+  #[test]
+  fn terminal_identity_serialises_camel_case_for_the_frontend() {
+    let id = identity_from_env(Some(ID_TERMINAL), Some(ID_BRANCH)).expect("both set and valid");
+    assert_eq!(id.terminal_id, ID_TERMINAL);
+    assert_eq!(id.branch_id, ID_BRANCH);
+
+    let json = serde_json::to_string(&id).expect("serialises");
+    // THE EXACT WIRE SHAPE LUE 3 WILL READ — printed so a `--nocapture` run
+    // puts the real bytes in the report rather than a hand-copied claim.
+    println!("get_terminal_identity → {json}");
+    assert_eq!(
+      json,
+      r#"{"terminalId":"0192f6c4-7c1e-7a3f-9b2d-4e6f8a1b2c3d","branchId":"0192f6c5-1a2b-7c4d-8e5f-0123456789ab"}"#
+    );
+  }
+
+  #[test]
+  fn a_missing_terminal_id_names_the_variable_and_never_falls_back() {
+    let err = identity_from_env(None, Some(ID_BRANCH)).expect_err("unset must fail");
+    assert_eq!(err.kind, CommandErrorKind::InvalidPayload);
+    assert!(err.message.contains("WAL_ASRI_TERMINAL_ID"), "{}", err.message);
+    assert!(err.message.contains("is not set"), "{}", err.message);
+  }
+
+  #[test]
+  fn a_missing_branch_id_names_the_variable_and_never_falls_back() {
+    let err = identity_from_env(Some(ID_TERMINAL), None).expect_err("unset must fail");
+    assert_eq!(err.kind, CommandErrorKind::InvalidPayload);
+    assert!(err.message.contains("WAL_ASRI_BRANCH_ID"), "{}", err.message);
+  }
+
+  #[test]
+  fn a_blank_value_counts_as_missing() {
+    let err = identity_from_env(Some("   "), Some(ID_BRANCH)).expect_err("blank is not an id");
+    assert!(err.message.contains("WAL_ASRI_TERMINAL_ID"), "{}", err.message);
+  }
+
+  #[test]
+  fn a_non_uuid_identity_is_refused_with_the_shape_it_expected() {
+    // The literal the checkout screen hard-codes today.
+    let err = identity_from_env(Some("terminal-01"), Some(ID_BRANCH)).expect_err("not a uuid");
+    assert_eq!(err.kind, CommandErrorKind::InvalidPayload);
+    assert!(err.message.contains("UUIDv7"), "{}", err.message);
+    assert!(err.message.contains("terminal-01"), "{}", err.message);
+  }
+
+  #[test]
+  fn both_the_version_and_the_variant_nibble_are_checked() {
+    // Version 4 — otherwise a perfect UUID shape.
+    let v4 = "0192f6c4-7c1e-4a3f-9b2d-4e6f8a1b2c3d";
+    assert!(identity_from_env(Some(v4), Some(ID_BRANCH)).is_err(), "version nibble");
+
+    // Variant 0 — not the RFC 9562 `10xx` variant.
+    let variant_zero = "0192f6c4-7c1e-7a3f-0b2d-4e6f8a1b2c3d";
+    assert!(
+      identity_from_env(Some(variant_zero), Some(ID_BRANCH)).is_err(),
+      "variant nibble"
+    );
+
+    // Uppercase variant letters spell the SAME variant and must pass.
+    let upper = "0192f6c4-7c1e-7a3f-Bb2d-4e6f8a1b2c3d";
+    assert!(
+      identity_from_env(Some(upper), Some(ID_BRANCH)).is_ok(),
+      "uppercase variant is valid"
+    );
+
+    // Wrong length.
+    assert!(identity_from_env(Some("0192f6c4-7c1e-7a3f-9b2d"), Some(ID_BRANCH)).is_err());
   }
 
   // ── satang parsing ────────────────────────────────────────────────────────

@@ -296,6 +296,228 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
 
+  # ==========================================================================
+  # Reporting (Phase 1 — read-only analytics)
+  # ==========================================================================
+
+  /branches:
+    get:
+      tags: [Reporting]
+      operationId: getBranches
+      summary: List branches
+      description: |
+        Returns every branch. This is read-only; branches are created and managed
+        by an administrator, not by terminals.
+
+        **Auth stub (Phase 1):** `REPORTS_TOKEN` environment variable required,
+        `X-Report-Token` header must match, and the caller must be localhost.
+        Without these, 503 with code `auth_stub_required`.
+      responses:
+        '200':
+          description: List of branches.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BranchesResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '503':
+          description: Auth stub not configured.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /terminals:
+    get:
+      tags: [Reporting]
+      operationId: getTerminals
+      summary: List terminals with last sync time
+      description: |
+        Returns every terminal that has pushed orders or has records in the sync
+        outbox, with the last time it successfully synced.
+
+        **Auth stub (Phase 1):** Same as `/branches`.
+
+        **Derived fields:** `last_sync_at` is computed from `sync_outbox_items`
+        as `MAX(processed_at)` where `state IN ('ACKNOWLEDGED', 'CONFLICT_HELD')`.
+        A terminal that only exists in `orders.terminal_id` but never pushed to
+        the outbox will have `null` for `last_sync_at`.
+      responses:
+        '200':
+          description: List of terminals.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TerminalsResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '503':
+          description: Auth stub not configured.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /reports/summary:
+    get:
+      tags: [Reporting]
+      operationId: getReportSummary
+      summary: Revenue summary
+      description: |
+        Returns total revenue (VAT-inclusive), VAT amount, order count, and
+        voided count for a branch within a date range.
+
+        **Revenue definition:**
+        - Excludes `draft` status orders
+        - Excludes `voided` status orders
+        - Includes `void_requested` orders (committed sales awaiting void decision)
+
+        **Time bucketing:** Dates are interpreted in `Asia/Bangkok` timezone.
+        `as_of` is the latest `created_at` of counted orders (UTC).
+
+        **Auth stub (Phase 1):** Same as `/branches`.
+      parameters:
+        - name: branch_id
+          in: query
+          required: true
+          description: Branch to report on.
+          schema:
+            $ref: '#/components/schemas/UuidV7'
+        - name: from
+          in: query
+          required: true
+          description: Start date (inclusive, Asia/Bangkok).
+          schema:
+            type: string
+            format: date
+            example: '2026-10-01'
+        - name: to
+          in: query
+          required: true
+          description: End date (inclusive, Asia/Bangkok).
+          schema:
+            type: string
+            format: date
+            example: '2026-10-31'
+      responses:
+        '200':
+          description: Revenue summary.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReportSummaryResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '503':
+          description: Auth stub not configured.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /reports/revenue-by-branch:
+    get:
+      tags: [Reporting]
+      operationId: getRevenueByBranch
+      summary: Revenue broken down by branch
+      description: |
+        Returns revenue and order count per branch, ordered by revenue descending.
+
+        **Revenue definition:** Same as `/reports/summary`.
+
+        **Auth stub (Phase 1):** Same as `/branches`.
+      parameters:
+        - name: from
+          in: query
+          required: true
+          description: Start date (inclusive, Asia/Bangkok).
+          schema:
+            type: string
+            format: date
+            example: '2026-10-01'
+        - name: to
+          in: query
+          required: true
+          description: End date (inclusive, Asia/Bangkok).
+          schema:
+            type: string
+            format: date
+            example: '2026-10-31'
+      responses:
+        '200':
+          description: Revenue by branch.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RevenueByBranchResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '503':
+          description: Auth stub not configured.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /reports/revenue-series:
+    get:
+      tags: [Reporting]
+      operationId: getRevenueSeries
+      summary: Revenue time series
+      description: |
+        Returns revenue and order count aggregated by day or month.
+
+        **Revenue definition:** Same as `/reports/summary`.
+
+        **Auth stub (Phase 1):** Same as `/branches`.
+      parameters:
+        - name: branch_id
+          in: query
+          required: true
+          description: Branch to report on.
+          schema:
+            $ref: '#/components/schemas/UuidV7'
+        - name: granularity
+          in: query
+          required: true
+          description: Time bucket size.
+          schema:
+            type: string
+            enum: [day, month]
+            example: day
+        - name: from
+          in: query
+          required: true
+          description: Start date (inclusive, Asia/Bangkok).
+          schema:
+            type: string
+            format: date
+            example: '2026-10-01'
+        - name: to
+          in: query
+          required: true
+          description: End date (inclusive, Asia/Bangkok).
+          schema:
+            type: string
+            format: date
+            example: '2026-10-31'
+      responses:
+        '200':
+          description: Revenue time series.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RevenueSeriesResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '503':
+          description: Auth stub not configured.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
 components:
 
   # ==========================================================================
@@ -1558,4 +1780,200 @@ components:
           nullable: true
           additionalProperties: true
           description: Optional structured context.
+      additionalProperties: false
+
+    # ── Reporting (Phase 1) ───────────────────────────────────────────────────
+
+    BranchesResponse:
+      type: object
+      description: |
+        Response for `GET /branches`. No pagination: branches are small and
+        fetched once per shift.
+      required: [branches]
+      properties:
+        branches:
+          type: array
+          items:
+            $ref: '#/components/schemas/Branch'
+      additionalProperties: false
+
+    Branch:
+      type: object
+      description: |
+        A branch. The server's authoritative list of shops. Currently only the
+        branch that holds this server's data exists, but the contract is written
+        to support multiple branches in the future.
+      required:
+        - id
+        - name
+        - currency
+        - vat_rate_bp
+        - created_at
+        - updated_at
+      properties:
+        id:
+          $ref: '#/components/schemas/UuidV7'
+        name:
+          type: string
+          description: Branch display name.
+          example: Siam
+        currency:
+          $ref: '#/components/schemas/CurrencyCode'
+        vat_rate_bp:
+          $ref: '#/components/schemas/VatRateBp'
+        created_at:
+          type: string
+          format: date-time
+          description: RFC 3339 UTC.
+        updated_at:
+          type: string
+          format: date-time
+          description: RFC 3339 UTC.
+      additionalProperties: false
+
+    TerminalsResponse:
+      type: object
+      description: |
+        Response for `GET /terminals`. No pagination: terminals are small and
+        fetched once per shift.
+      required: [terminals]
+      properties:
+        terminals:
+          type: array
+          items:
+            $ref: '#/components/schemas/Terminal'
+      additionalProperties: false
+
+    Terminal:
+      type: object
+      description: |
+        A terminal that has pushed orders to this server. The `id` is the
+        `terminal_id` UUID (not a sequence), and `last_sync_at` is derived from
+        `sync_outbox_items`.
+      required:
+        - id
+        - last_sync_at
+        - order_count
+      properties:
+        id:
+          $ref: '#/components/schemas/UuidV7'
+          description: |
+            The terminal UUIDv7, derived from `orders.terminal_id` and
+            `sync_outbox_items.terminal_id`.
+        last_sync_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: |
+            Latest successful sync time, derived from `MAX(processed_at)` of
+            `sync_outbox_items` where `state IN ('ACKNOWLEDGED', 'CONFLICT_HELD')`.
+            Null if the terminal exists only in `orders` but never pushed.
+        order_count:
+          type: integer
+          minimum: 0
+          description: Count of orders pushed by this terminal.
+      additionalProperties: false
+
+    ReportSummaryResponse:
+      type: object
+      description: |
+        Response for `GET /reports/summary`. All monetary fields are `Satang`
+        strings.
+      required:
+        - as_of
+        - revenue_total_satang
+        - vat_satang
+        - order_count
+        - voided_count
+      properties:
+        as_of:
+          type: string
+          format: date-time
+          description: |
+            Latest `created_at` of counted orders (UTC). This is the "point in
+            time" for the summary — a client can resume from this timestamp.
+        revenue_total_satang:
+          $ref: '#/components/schemas/Satang'
+          description: |
+            Total revenue (VAT-inclusive), excluding draft and voided orders.
+        vat_satang:
+          $ref: '#/components/schemas/Satang'
+          description: VAT amount extracted from revenue.
+        order_count:
+          type: integer
+          minimum: 0
+          description: Count of counted orders (excludes draft and voided).
+        voided_count:
+          type: integer
+          minimum: 0
+          description: |
+            Count of orders with `status = 'voided'` within the date range.
+      additionalProperties: false
+
+    RevenueByBranchResponse:
+      type: object
+      description: |
+        Response for `GET /reports/revenue-by-branch`.
+      required: [revenue_by_branch]
+      properties:
+        revenue_by_branch:
+          type: array
+          items:
+            $ref: '#/components/schemas/RevenueByBranchItem'
+      additionalProperties: false
+
+    RevenueByBranchItem:
+      type: object
+      description: |
+        Revenue and order count for one branch.
+      required:
+        - branch_id
+        - name
+        - revenue_satang
+        - order_count
+      properties:
+        branch_id:
+          $ref: '#/components/schemas/UuidV7'
+        name:
+          type: string
+          description: Branch name.
+        revenue_satang:
+          $ref: '#/components/schemas/Satang'
+        order_count:
+          type: integer
+          minimum: 0
+      additionalProperties: false
+
+    RevenueSeriesResponse:
+      type: object
+      description: |
+        Response for `GET /reports/revenue-series`.
+      required: [series]
+      properties:
+        series:
+          type: array
+          items:
+            $ref: '#/components/schemas/RevenueSeriesItem'
+      additionalProperties: false
+
+    RevenueSeriesItem:
+      type: object
+      description: |
+        Revenue and order count for one time bucket (day or month).
+      required:
+        - bucket
+        - revenue_satang
+        - order_count
+      properties:
+        bucket:
+          type: string
+          description: |
+            ISO 8601 bucket identifier: `YYYY-MM-DD` for day, `YYYY-MM` for month.
+            Dates are interpreted in `Asia/Bangkok` timezone.
+          example: '2026-10-01'
+        revenue_satang:
+          $ref: '#/components/schemas/Satang'
+        order_count:
+          type: integer
+          minimum: 0
       additionalProperties: false

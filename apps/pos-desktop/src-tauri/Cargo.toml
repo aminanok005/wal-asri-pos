@@ -26,7 +26,7 @@ name = "wasri_pos_desktop_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
-tauri-build = { version = "=2.7.1" }
+tauri-build = { version = "=2.7.1", features = [] }
 
 [dependencies]
 # serde / serde_json are needed at the command boundary: every monetary value
@@ -36,7 +36,7 @@ tauri-build = { version = "=2.7.1" }
 serde = { version = "=1.0", features = ["derive"] }
 serde_json = "=1.0"
 log = "0.4"
-tauri = { version = "=2.12.1" }
+tauri = { version = "=2.12.1", features = [] }
 tauri-plugin-log = "2"
 
 # ── Thai receipt encoding (ESC/POS) ───────────────────────────────────────────
@@ -103,6 +103,7 @@ rusqlite = { version = "=0.40.2", features = ["bundled-sqlcipher"] }
 # manifest for that single call.
 getrandom = "0.3"
 ureq = { version = "3.4.2", features = ["json", "rustls"] }
+thiserror = "2.0"
 
 [profile.release]
 # The template ships no [profile] section. We add one because a POS terminal
