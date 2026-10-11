@@ -25,9 +25,14 @@ export function EcosystemApp() {
   const [orders, setOrders] = useState<readonly EcoOrder[]>(ECO_INITIAL_ORDERS);
   const [notice, setNotice] = useState<string | null>(null);
 
+  // Dynamic count, from the rows this shell actually holds: adding an order
+  // grows the CEO's total because the total is a COUNT of the list, not a
+  // number from another table.
+  const totalOrders = orders.length;
+
   const complete = (o: EcoOrder): string => {
     setOrders((prev) => prev.map((x) => (x.id === o.id ? { ...x, status: 'completed' as const } : x)));
-    const next = orders.find((x) => x.id !== o.id && (x.status === 'new' || x.status === 'cooking'));
+    const next = orders.find((x) => x.id !== o.id && (x.status === 'submitted' || x.status === 'in_preparation'));
     const msg = next ? `Order #${o.num} done! AI assigned #${next.num} to you. 🤖` : `Order #${o.num} done! 🎉`;
     setNotice(msg);
     return msg;
@@ -35,7 +40,7 @@ export function EcosystemApp() {
   const place = (items: { name: string; qty: number; price: number }[]): EcoOrder => {
     const num = Math.max(...orders.map((o) => o.num)) + 1;
     const total = items.reduce((a, i) => a + i.qty * i.price, 0);
-    const o: EcoOrder = { id: `o${num}`, num, customer: 'Walk-in', table: 'โต๊ะ 4', type: 'Dine-in', status: 'new', items, total, timeAgo: 'just now' };
+    const o: EcoOrder = { id: `o${num}`, num, customer: 'Walk-in', table: 'โต๊ะ 4', type: 'Dine-in', status: 'submitted', items, total, timeAgo: 'just now' };
     setOrders((prev) => [o, ...prev]);
     return o;
   };
@@ -55,7 +60,7 @@ export function EcosystemApp() {
         {persona === 'pos' && <POSView orders={orders} onPlaceOrder={place} onViewOrder={view} />}
         {persona === 'staff' && <StaffView orders={orders} onDone={complete} />}
         {persona === 'manager' && <ManagerView orders={orders} onViewOrder={view} />}
-        {persona === 'ceo' && <CEOView />}
+        {persona === 'ceo' && <CEOView totalOrders={totalOrders} />}
         {notice && persona !== 'staff' && <div className="eco-toast" role="status">{notice}</div>}
       </div>
     </div>
