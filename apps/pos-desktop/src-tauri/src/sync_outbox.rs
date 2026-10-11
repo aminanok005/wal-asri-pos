@@ -55,13 +55,52 @@ use tauri::Manager;
 
 use crate::AppState;
 
-/// Attempts after which an event stops being retried.
+/// Backoff parameters for the exponential retry delay.
 ///
-/// Not a business rule — it is the point where continuing to retry starts
-/// delaying the rows queued behind this one. With [`retry_later`]'s backoff,
-/// 8 attempts span a useful window without an operator having to prune the
-/// table by hand.
-pub const MAX_ATTEMPTS: i64 = 8;
+/// The delay is `BASE * 2^(attempt_count - 1)`, capped at `CEILING`:
+/// 30s, 60s, 120s, 240s, 300s, 300s, … for attempts 1, 2, 3, 4, 5, 6, ….
+///
+/// The ceiling caps how long a row WAITS, never how many times it is TRIED:
+/// recoverable failures retry indefinitely. Only a per-command `Rejected`
+/// ends a row, and that is a decision about the sale, not about the network.
+pub const BACKOFF_BASE_SECONDS: i64 = 30;
+pub const BACKOFF_CEILING_SECONDS: i64 = 300;
+
+/// How long to wait before the delivery AFTER `attempt_count`.
+///
+/// This is the per-ROW half of the retry schedule: callers pass the row's own
+/// `attempt_count`, never a batch-wide constant. Two rows drained in the same
+/// tick therefore get two different delays — a row that has already failed
+/// three times waits longer than its neighbour that failed once.
+///
+/// Overflow-safe without any checked-math ceremony: `30 * 2^4` is already 480,
+/// past the 300s ceiling, so every attempt from the fifth onward is the ceiling
+/// and the exponent is never computed. Evaluating `2^attempt_count` first and
+/// clamping after would overflow `i64` on a row that has been retrying for a
+/// few weeks — and an overflow in the drain would panic, not degrade.
+pub fn backoff_seconds(attempt_count: i64) -> i64 {
+  // A row that has never been delivered (0), or has just failed its first
+  // attempt (1), waits the base delay. Never zero: re-claiming instantly would
+  // spin a row that cannot have become deliverable in zero elapsed time.
+  if attempt_count <= 1 {
+    return BACKOFF_BASE_SECONDS;
+  }
+  if attempt_count >= 5 {
+    return BACKOFF_CEILING_SECONDS;
+  }
+  // attempt_count is 2..=4 here, so the shift is at most 3 and cannot overflow.
+  let delay = BACKOFF_BASE_SECONDS << (attempt_count - 1);
+  delay.min(BACKOFF_CEILING_SECONDS)
+}
+
+/// The instant THIS row should be retried, in the schema's ISO-8601 `...Z`.
+///
+/// `now` is a parameter rather than a second clock read so that the schedule is
+/// testable at a fixed instant, and so a drain reuses the `now` it was already
+/// given instead of reading a slightly later clock mid-tick.
+pub fn exponential_backoff_next_attempt(now: &str, attempt_count: i64) -> String {
+  add_seconds(now, backoff_seconds(attempt_count))
+}
 
 /// One event the drain has claimed from the outbox.
 ///
@@ -259,8 +298,8 @@ pub fn mark_done(
 ///
 /// Used for [`BatchOutcome::Retryable`], [`BatchOutcome::Refused`], and for a
 /// command the server returned no result for. The row KEEPS its incremented
-/// `attempt_count`, so backoff and the [`MAX_ATTEMPTS`] ceiling still see the
-/// true history — a retry that reset the counter would retry forever.
+/// `attempt_count`, so [`backoff_seconds`] still sees the true history — a
+/// retry that reset the counter would retry forever at the base delay.
 ///
 /// `last_error` is what a shift lead reads when an event will not drain. A row
 /// that silently returns to `pending` looks identical to one that is merely
@@ -335,6 +374,22 @@ fn last_error_of(conn: &Connection, sequence: i64) -> Option<String> {
     .expect("row exists")
 }
 
+/// Read one row's scheduled `next_attempt_at` — the backoff schedule, as stored.
+///
+/// Asserting on the COLUMN rather than on a recomputed string is what makes
+/// these tests about the drain's decision: the value compared here is the one
+/// the next `claim_ready` scan will actually obey.
+#[cfg(test)]
+fn next_attempt_of(conn: &Connection, sequence: i64) -> String {
+  conn
+    .query_row(
+      "SELECT next_attempt_at FROM sync_outbox WHERE sequence = ?1",
+      params![sequence],
+      |row| row.get(0),
+    )
+    .expect("row exists")
+}
+
 /// One full drain cycle: claim → push the batch → settle each row.
 ///
 /// This is the ACK / ROLLBACK decision point, and it is deliberately NOT
@@ -387,7 +442,12 @@ where
     return Ok(claimed);
   }
 
-  let retry_at = add_minute(now);
+  // NOT computed once per batch: the delay belongs to each ROW, and a row's
+  // `attempt_count` is its own history. One batch can hold a row on its first
+  // attempt beside a row that has already been refused the network six times,
+  // and scheduling both with a single timestamp gives the exhausted row a fresh
+  // 30s every tick — the backoff never climbs for exactly the rows that need it.
+  // So the delay is derived per row, at each `retry_later` call site below.
 
   match deliver(&claimed) {
     BatchOutcome::Processed(results) => {
@@ -412,7 +472,8 @@ where
               target: "sync_outbox",
               "no result for outbox event {}; scheduling a retry", event.id
             );
-            retry_later(conn, event.sequence, &retry_at, "server returned no result for this command")?;
+            let next_attempt_at = exponential_backoff_next_attempt(now, event.attempt_count);
+            retry_later(conn, event.sequence, &next_attempt_at, "server returned no result for this command")?;
           }
         }
       }
@@ -423,7 +484,11 @@ where
     BatchOutcome::Retryable { reason } | BatchOutcome::Refused { reason } => {
       log::warn!(target: "sync_outbox", "outbox batch not delivered: {reason}");
       for event in &claimed {
-        retry_later(conn, event.sequence, &retry_at, &reason)?;
+        // Each row waits in proportion to its OWN history, so a batch-wide
+        // constant cannot keep re-hammering the server for the rows that have
+        // been failing longest.
+        let next_attempt_at = exponential_backoff_next_attempt(now, event.attempt_count);
+        retry_later(conn, event.sequence, &next_attempt_at, &reason)?;
       }
     }
   }
@@ -529,14 +594,19 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
   (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
-/// Move an ISO-8601 `...Z` instant forward by exactly one minute.
+/// Move an ISO-8601 `...Z` instant forward by `seconds`.
+///
+/// The general form the backoff needs, generalised from the one-minute step it
+/// used to be: the delays are 30s, 60s, 120s, 240s and 300s, and a ladder of
+/// per-magnitude branches would be a second place for the schedule to go wrong.
+/// One function serves every magnitude, including the minute rollover.
 ///
 /// Textual rather than `chrono`, for the same reason as [`now_iso`]: this code
 /// base has one time format on purpose. It only understands the `HH:MM:SSZ`
 /// suffix the outbox writes, and returns the input unchanged if the shape is
 /// not what it expects — a retry time that failed to move is visible in the
 /// next scan, whereas a panic here would take down the drain loop.
-fn add_minute(now: &str) -> String {
+fn add_seconds(now: &str, seconds: i64) -> String {
   // `"2026-10-05T12:00:00Z"`: the `HH:MM:SSZ` suffix is 9 bytes, so `index` is
   // the position AFTER the `T` — the split must leave the `T` on the prefix side.
   let Some(index) = now.len().checked_sub(9) else {
@@ -561,39 +631,49 @@ fn add_minute(now: &str) -> String {
     return now.to_string();
   };
 
-  let (Ok(mut hour), Ok(mut minute), Ok(second)) = (
-    hour_text.parse::<u32>(),
-    minute_text.parse::<u32>(),
-    second_text.trim_end_matches('Z').parse::<u32>(),
+  let (Ok(hour), Ok(minute), Ok(second)) = (
+    hour_text.parse::<i64>(),
+    minute_text.parse::<i64>(),
+    second_text.trim_end_matches('Z').parse::<i64>(),
   ) else {
     return now.to_string();
   };
 
-  if minute >= 60 || hour >= 24 {
+  if hour >= 24 || minute >= 60 || second >= 60 {
     return now.to_string();
   }
 
-  minute += 1;
-  if minute == 60 {
-    minute = 0;
-    hour += 1;
-  }
+  // Collapse the clock to one count of seconds, add, then let the carry walk it
+  // back apart. One code path serves 30s, 60s and the 300s ceiling alike.
+  let total = hour * 3600 + minute * 60 + second + seconds;
+  // `div_euclid`/`rem_euclid` keep the remainder in `0..86_400` even when
+  // `seconds` is negative, so this can never format a negative hour.
+  let whole_days = total.div_euclid(86_400);
+  let rest = total.rem_euclid(86_400);
+  let (out_hour, out_minute, out_second) = (rest / 3600, (rest % 3600) / 60, rest % 60);
 
   // Rolling past midnight must advance the DATE as well as the clock, or a
-  // retry scheduled at 23:59 comes back as 00:00 THE SAME DAY — a `next_attempt_at`
-  // in the past, so the row is re-claimed immediately and backoff collapses
-  // exactly at the moment the terminal is most likely to be left overnight.
-  if hour == 24 {
-    return match parse_date(prefix) {
-      Some((year, month, day)) => {
-        let (next_year, next_month, next_day) = next_day(year, month, day);
-        format!("{next_year:04}-{next_month:02}-{next_day:02}T00:00:{second:02}Z")
-      }
-      None => now.to_string(),
+  // retry scheduled at 23:59 comes back as 00:00 THE SAME DAY — a
+  // `next_attempt_at` in the past, so the row is re-claimed immediately and
+  // backoff collapses exactly at the moment the terminal is most likely to be
+  // left overnight.
+  if whole_days > 0 {
+    let Some((year, month, day)) = parse_date(prefix) else {
+      return now.to_string();
     };
+    let (mut year, mut month, mut day) = (year, month, day);
+    for _ in 0..whole_days {
+      let next = next_day(year, month, day);
+      year = next.0;
+      month = next.1;
+      day = next.2;
+    }
+    return format!(
+      "{year:04}-{month:02}-{day:02}T{out_hour:02}:{out_minute:02}:{out_second:02}Z"
+    );
   }
 
-  format!("{prefix}{hour:02}:{minute:02}:{second:02}Z")
+  format!("{prefix}{out_hour:02}:{out_minute:02}:{out_second:02}Z")
 }
 
 /// `"2026-10-05T"` → `(2026, 10, 5)`, or `None` if the prefix is not that shape.
@@ -818,8 +898,9 @@ mod tests {
     assert!(retry_later(&mut c, seq, "2026-10-05T12:01:00Z", "connection reset").expect("retry"));
 
     assert_eq!(status_of(&c, seq), "pending");
-    // If this reset to 0 the row would be retried forever — the entire point of
-    // MAX_ATTEMPTS is defeated by a counter that forgets.
+    // If this reset to 0 the row would be retried forever at the base delay —
+    // the whole point of the backoff schedule is defeated by a counter that
+    // forgets.
     assert_eq!(attempts_of(&c, seq), 1, "the attempt must be remembered");
 
     // `last_error` is what a shift lead reads to find out why it is stuck.
@@ -1056,18 +1137,180 @@ mod tests {
     assert_eq!(civil_from_days(47_541), (2100, 3, 1));
   }
 
+
   #[test]
-  fn add_minute_crosses_the_hour_and_leaves_a_bad_shape_alone() {
-    assert_eq!(add_minute("2026-10-05T12:00:00Z"), "2026-10-05T12:01:00Z");
-    assert_eq!(add_minute("2026-10-05T12:59:00Z"), "2026-10-05T13:00:00Z");
-    assert_eq!(add_minute("2026-10-05T23:59:00Z"), "2026-10-06T00:00:00Z");
-    // Midnight rollover crosses the MONTH correctly too — 2028 is a leap year
-    // so 28 Feb → 29 Feb, while 2100 is NOT and must go 28 Feb → 1 Mar.
-    assert_eq!(add_minute("2028-02-28T23:59:00Z"), "2028-02-29T00:00:00Z");
-    assert_eq!(add_minute("2100-02-28T23:59:00Z"), "2100-03-01T00:00:00Z");
-    // A timestamp that is not the outbox's format is passed through rather than
-    // panicking inside the drain loop.
-    assert_eq!(add_minute("not-a-timestamp"), "not-a-timestamp");
-    assert_eq!(add_minute(""), "");
+  fn add_seconds_crosses_the_hour_and_leaves_a_bad_shape_alone() {
+    // The 60s case is the minute rollover the backoff's second step actually
+    // uses, so it keeps its own pin even though the function is general.
+    let minute = |now: &str| add_seconds(now, 60);
+    assert_eq!(minute("2026-10-05T12:00:00Z"), "2026-10-05T12:01:00Z");
+    assert_eq!(minute("2026-10-05T12:59:00Z"), "2026-10-05T13:00:00Z");
+    assert_eq!(minute("2026-10-05T23:59:00Z"), "2026-10-06T00:00:00Z");
+    assert_eq!(minute("2028-02-28T23:59:00Z"), "2028-02-29T00:00:00Z");
+    assert_eq!(minute("2100-02-28T23:59:00Z"), "2100-03-01T00:00:00Z");
+    // Seconds carry too, not just whole minutes.
+    assert_eq!(add_seconds("2026-10-05T12:00:45Z", 30), "2026-10-05T12:01:15Z");
+    // A bad shape is returned untouched rather than panicking in the drain.
+    assert_eq!(add_seconds("not-a-timestamp", 60), "not-a-timestamp");
+    assert_eq!(add_seconds("", 60), "");
+  }
+
+  /// THE SCHEDULE ITSELF: double, then stop.
+  ///
+  /// Exact equality, not a tolerance. `now` is a parameter, so these are fixed
+  /// instants — there is no moving wall clock left to measure against, and a
+  /// ±2s window around "about 30s" is not a spec.
+  #[test]
+  fn backoff_seconds_doubles_and_then_stops_at_the_ceiling() {
+    assert_eq!(backoff_seconds(0), 30, "never delivered: the first retry is the base delay");
+    assert_eq!(backoff_seconds(1), 30);
+    assert_eq!(backoff_seconds(2), 60);
+    assert_eq!(backoff_seconds(3), 120);
+    assert_eq!(backoff_seconds(4), 240);
+    assert_eq!(backoff_seconds(5), 300, "30 * 16 is already past the ceiling");
+    assert_eq!(backoff_seconds(6), 300, "and it stays there");
+    assert_eq!(backoff_seconds(50), 300);
+  }
+
+  #[test]
+  fn exponential_backoff_schedules_exact_instants_from_a_fixed_now() {
+    // 12:00:00 plus each delay. The first retry is +30s, not +60s: the exponent
+    // is `attempt_count - 1`, and the attempt that just failed was attempt 1.
+    assert_eq!(
+      exponential_backoff_next_attempt(NOW, 1),
+      "2026-10-05T12:00:30Z"
+    );
+    assert_eq!(
+      exponential_backoff_next_attempt(NOW, 2),
+      "2026-10-05T12:01:00Z"
+    );
+    assert_eq!(
+      exponential_backoff_next_attempt(NOW, 3),
+      "2026-10-05T12:02:00Z"
+    );
+    assert_eq!(
+      exponential_backoff_next_attempt(NOW, 4),
+      "2026-10-05T12:04:00Z"
+    );
+    assert_eq!(
+      exponential_backoff_next_attempt(NOW, 5),
+      "2026-10-05T12:05:00Z",
+      "the ceiling: five minutes out"
+    );
+    assert_eq!(
+      exponential_backoff_next_attempt(NOW, 9),
+      "2026-10-05T12:05:00Z",
+      "still the ceiling — the schedule never runs away"
+    );
+  }
+
+  /// A retry that crosses midnight must move the DATE too, or the row is
+  /// scheduled into its own past and re-claimed instantly.
+  #[test]
+  fn the_ceiling_delay_crosses_midnight_by_moving_the_date() {
+    assert_eq!(
+      exponential_backoff_next_attempt("2026-10-05T23:58:00Z", 5),
+      "2026-10-06T00:03:00Z"
+    );
+    assert_eq!(
+      exponential_backoff_next_attempt("2028-02-28T23:58:00Z", 5),
+      "2028-02-29T00:03:00Z",
+      "leap day"
+    );
+  }
+
+  /// Overflow in a drain is a PANIC, not a degraded value — so an attempt count
+  /// a long-lived row could genuinely reach must land on the ceiling rather than
+  /// wrap, underflow, or shift past the width of the type.
+  #[test]
+  fn an_absurd_attempt_count_yields_the_ceiling_and_does_not_panic() {
+    assert_eq!(backoff_seconds(i64::MAX), 300);
+    assert_eq!(backoff_seconds(i64::MIN), 30, "nonsense clamps to the base delay");
+    assert_eq!(backoff_seconds(-5), 30);
+    assert_eq!(backoff_seconds(0), 30);
+
+    // And the full call, timestamp included, still yields a well-formed instant.
+    for attempt in [i64::MAX, i64::MAX - 1, 1_000_000, 64, 5] {
+      assert_eq!(
+        exponential_backoff_next_attempt(NOW, attempt),
+        "2026-10-05T12:05:00Z",
+        "attempt {attempt} must sit at the ceiling"
+      );
+    }
+  }
+
+  /// THE LOAD-BEARING TEST: the delay is the ROW's, not the batch's.
+  ///
+  /// `stale` is driven through three real failing ticks until it is on its
+  /// fourth attempt; `fresh` is queued afterwards and enters on its first. Both
+  /// are then due at the same instant, so one `drain_tick` claims and settles
+  /// them together — precisely the situation a batch-wide timestamp gets wrong.
+  /// Scheduling a whole batch from a hard-coded attempt 1 hands the row that has
+  /// already failed three times another 30s, every tick, forever.
+  #[test]
+  fn each_row_is_scheduled_by_its_own_attempt_count() {
+    let mut c = conn();
+    let stale = enqueue(&c, "evt-stale", "key-stale", "2026-10-05T11:00:00Z");
+
+    // Three real failures: attempt 1 (+30s), 2 (+60s), 3 (+120s). Each tick
+    // instant is past the previous scheduled retry, so the row really is
+    // re-claimed — the counter climbs through the drain, never by being SET.
+    for now in ["2026-10-05T12:00:00Z", "2026-10-05T12:01:00Z", "2026-10-05T12:03:00Z"] {
+      drain_tick(&mut c, 10, now, &mut |_: &[ClaimedEvent]| {
+        BatchOutcome::Retryable { reason: "connection reset".into() }
+      })
+      .expect("tick");
+    }
+    assert_eq!(attempts_of(&c, stale), 3, "three failed deliveries so far");
+
+    // Queued only now: `fresh` enters the shared tick on its FIRST attempt while
+    // `stale` enters it on its fourth.
+    let fresh = enqueue(&c, "evt-fresh", "key-fresh", "2026-10-05T11:00:00Z");
+
+    let settled = drain_tick(&mut c, 10, "2026-10-05T12:10:00Z", &mut |_: &[ClaimedEvent]| {
+      BatchOutcome::Retryable { reason: "connection reset".into() }
+    })
+    .expect("shared tick");
+
+    assert_eq!(settled.len(), 2, "both rows were claimed by the same tick");
+    assert_eq!(attempts_of(&c, stale), 4);
+    assert_eq!(attempts_of(&c, fresh), 1);
+
+    // Same tick, same outcome, DIFFERENT schedule — because the history differs.
+    assert_eq!(next_attempt_of(&c, stale), "2026-10-05T12:14:00Z", "attempt 4 waits 240s");
+    assert_eq!(next_attempt_of(&c, fresh), "2026-10-05T12:10:30Z", "attempt 1 waits 30s");
+  }
+
+  /// A per-command `Rejected` is the ONLY permanent failure.
+  ///
+  /// The batch did not fail: the envelope was well-formed and the server refused
+  /// this one command. Retrying it unchanged would fail identically forever, so
+  /// the row is terminal. Transport failures, 5xx and 4xx envelopes all stay on
+  /// the retry schedule instead.
+  #[test]
+  fn rejected_outcome_leads_to_failed_permanent() {
+    let mut c = conn();
+    let seq = enqueue(&c, "evt-bad", "key-bad", "2026-10-05T11:00:00Z");
+
+    let claimed = drain_tick(&mut c, 10, NOW, &mut |events: &[ClaimedEvent]| {
+      BatchOutcome::Processed(
+        events
+          .iter()
+          .map(|event| CommandResult {
+            event_id: event.id.clone(),
+            outcome: CommandOutcome::Rejected,
+            error: Some("unknown product sku".into()),
+          })
+          .collect(),
+      )
+    })
+    .expect("tick");
+
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(status_of(&c, seq), "failed_permanent");
+    // The reason is kept verbatim for the shift lead — never parsed.
+    assert_eq!(last_error_of(&c, seq), Some("unknown product sku".into()));
+    // Terminal: no schedule, never re-claimed — but still on disk to escalate.
+    assert!(claim_ready(&mut c, 10, NOW).expect("claim").is_empty());
   }
 }

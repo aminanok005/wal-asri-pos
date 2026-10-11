@@ -61,7 +61,11 @@ const MIGRATIONS_DIR = join(import.meta.dir, '..', 'src-tauri', 'migrations');
  * negative cash-rounding adjustment that production now accepts, and every
  * signed-rounding test below would fail for the wrong reason.
  */
-const MIGRATION_SQL: string = ['0001_init.sql', '0002_signed_rounding.sql']
+const MIGRATION_SQL: string = [
+  '0001_init.sql',
+  '0002_signed_rounding.sql',
+  '0003_stock_balances.sql',
+]
   .map((file) => readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
   .join('\n');
 
@@ -285,11 +289,11 @@ describe('0001_init.sql — schema objects', () => {
   it('records the migration version so the Rust side can detect drift', () => {
     const row = db.prepare('PRAGMA user_version').get() as { user_version: number } | null;
 
-    // 2, not 1: the suite applies BOTH shipped migrations (see MIGRATION_SQL).
+    // 3, not 1: the suite applies ALL shipped migrations (see MIGRATION_SQL).
     // This must stay in step with `LATEST_VERSION` in `src/migrate.rs` — if it
     // drifts, `src/migrate.rs`'s refusal to open a database from a NEWER
     // terminal starts firing on this build's own database.
-    expect(row?.user_version).toBe(2);
+    expect(row?.user_version).toBe(3);
   });
 
   it('agrees with LATEST_VERSION in the Rust migration runner', () => {
@@ -1447,5 +1451,280 @@ describe('0002_signed_rounding.sql — the child foreign key still points at loc
         .prepare('UPDATE local_order_lines SET line_total_satang = 9100 WHERE id = ?')
         .run('0190f3a0-0000-7000-8000-0000000000a1'),
     ).toThrow();
+  });
+});
+/**
+ * 9. `0003_stock_balances.sql` — the offline stock cache.
+ *
+ * The terminal's read cache of the cloud's `StockBalance`. It exists because the
+ * sell path must be able to answer "is there enough of this?" with the network
+ * unplugged, and a Thai branch loses its link constantly.
+ *
+ * The tests below attack the SCHEMA rather than the mapping code, for the same
+ * reason every other block in this file does: a POS terminal is offline-first, so
+ * a buggy UI, a malformed IPC payload, or a half-migrated database must still be
+ * unable to store a float where a quantity belongs. The TypeScript
+ * (`inventory/domain/quantity.ts`) and Rust (`stock_balances.rs`) parsers both
+ * refuse a bad quantity — these prove the DATABASE refuses it too, so neither
+ * one is the only thing standing between a drift and a stock count.
+ */
+describe('0003_stock_balances.sql — the local stock cache', () => {
+  const BRANCH = '0199b1a0-0000-7000-8000-000000000001';
+  const OTHER_BRANCH = '0199b1a0-0000-7000-8000-0000000000ff';
+  const FLOUR = '0199b1a0-0000-7000-8000-0000000000f1';
+  const MILK = '0199b1a0-0000-7000-8000-0000000000f2';
+  const NOW = '2026-10-05T09:00:00.000Z';
+  const SERVER = '2026-10-05T08:59:00.000Z';
+
+  /** Insert a balance in the shape the Rust UPSERT actually writes. */
+  function insertBalance(
+    overrides: {
+      id?: string;
+      inventoryItemId?: string;
+      branchId?: string;
+      onHandMilli?: number;
+      reservedMilli?: number;
+      version?: number;
+      remoteId?: string | null;
+    } = {},
+  ): void {
+    const item = overrides.inventoryItemId ?? FLOUR;
+    const branch = overrides.branchId ?? BRANCH;
+    db.prepare(
+      `INSERT INTO stock_balances
+         (id, inventory_item_id, branch_id, remote_id, on_hand_milli, reserved_milli, version, updated_at, synced_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      // The local row id carries the BRANCH too, because a UUIDv7 minted per row
+      // would not collide — and two rows for one article at two branches must
+      // both be insertable without the PRIMARY KEY getting in the way of the
+      // UNIQUE pair the identity actually rests on.
+      overrides.id ?? `local-${branch}-${item}`,
+      item,
+      branch,
+      overrides.remoteId === undefined ? `remote-${item}` : overrides.remoteId,
+      overrides.onHandMilli ?? 2500,
+      overrides.reservedMilli ?? 250,
+      overrides.version ?? 7,
+      SERVER,
+      NOW,
+    );
+  }
+
+  it('creates the table the offline sell path reads', () => {
+    const row = db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'stock_balances'")
+      .get();
+    expect(row).not.toBeNull();
+  });
+
+  it('stores a quantity in milli-units, as an integer', () => {
+    // `2.500 kg` is 2500. The column is INTEGER so the drift is unrepresentable
+    // rather than merely unlikely.
+    insertBalance({ onHandMilli: 2500 });
+
+    const row = db
+      .prepare('SELECT on_hand_milli, typeof(on_hand_milli) AS storage FROM stock_balances')
+      .get() as { on_hand_milli: number; storage: string };
+
+    expect(row.on_hand_milli).toBe(2500);
+    expect(row.storage).toBe('integer');
+  });
+
+  // ── Why the CHECKs are load-bearing, not decoration ──────────────────────
+
+  it('refuses a REAL in a quantity column', () => {
+    // SQLite has type AFFINITY, not types: an INTEGER column happily accepts
+    // 0.3, which is `0.299999999999999988897769753748`. The `typeof(...) =
+    // 'integer'` CHECK is the only thing standing between that and a stock
+    // count, and `typeof` is the only test that sees past affinity coercion.
+    expect(() => insertBalance({ onHandMilli: 0.3 })).toThrow();
+    expect(() => insertBalance({ reservedMilli: 0.1 + 0.2 })).toThrow();
+  });
+
+  it('coerces a numeric-looking TEXT into an integer, which is why the wire must never send one', () => {
+    // THE honest test for this column, and it documents a behaviour the 0001
+    // header already warns about rather than pretending otherwise.
+    //
+    // The intuition is that `typeof(on_hand_milli) = 'integer'` catches the
+    // string '2500'. It does not — and it CANNOT, because affinity coercion runs
+    // first: an INTEGER-affinity column converts numeric text on the way in, so
+    // `typeof` sees an integer and the evidence that it was ever text is already
+    // gone. This test asserts that explicitly, so nobody later "strengthens" the
+    // CHECK expecting it to catch this.
+    //
+    // What it means in practice: the CHECK is defence against REAL and against
+    // non-numeric text, and the string rule in `stockBalanceSync.ts` /
+    // `parse_milli_quantity` is what actually guarantees a number arrives. The
+    // column is still declared INTEGER rather than TEXT for the reasons the
+    // migration header gives — `SUM()` and comparison must not silently ignore
+    // half a column.
+    expect(() =>
+      db
+        .prepare(
+          `INSERT INTO stock_balances
+             (id, inventory_item_id, branch_id, on_hand_milli, reserved_milli, version, updated_at, synced_at)
+           VALUES ('text-quantity', ?, ?, '2500', '0', 1, ?, ?)`,
+        )
+        .run(FLOUR, BRANCH, SERVER, NOW),
+    ).not.toThrow();
+
+    const row = db
+      .prepare("SELECT typeof(on_hand_milli) AS storage FROM stock_balances WHERE id = 'text-quantity'")
+      .get() as { storage: string };
+
+    expect(row.storage).toBe('integer');
+  });
+
+  it('refuses a non-numeric TEXT, which affinity cannot rescue', () => {
+    // The case the CHECK does catch: a value affinity cannot convert. If this
+    // ever stops throwing, the column has silently become TEXT-typed and every
+    // comparison against it changes meaning.
+    expect(() =>
+      db
+        .prepare(
+          `INSERT INTO stock_balances
+             (id, inventory_item_id, branch_id, on_hand_milli, reserved_milli, version, updated_at, synced_at)
+           VALUES ('junk-quantity', ?, ?, 'two and a half', '0', 1, ?, ?)`,
+        )
+        .run(FLOUR, BRANCH, SERVER, NOW),
+    ).toThrow();
+  });
+
+  it('accepts a negative on_hand, because an offline terminal can oversell', () => {
+    // The contract's own `Quantity` docs say a balance may go negative and the
+    // server reconciles it. A `>= 0` CHECK here would make the terminal unable
+    // to RECORD the oversell an operator needs to see.
+    insertBalance({ onHandMilli: -1500 });
+
+    const row = db
+      .prepare('SELECT on_hand_milli FROM stock_balances')
+      .get() as { on_hand_milli: number };
+    expect(row.on_hand_milli).toBe(-1500);
+  });
+
+  it('refuses a negative reservation', () => {
+    // The opposite bound, and not an inconsistency. Reserved means "committed to
+    // open orders but not yet deducted", so a negative one would report MORE
+    // stock available than physically exists — the one direction of drift that
+    // sells product a shop does not have.
+    expect(() => insertBalance({ reservedMilli: -1 })).toThrow();
+  });
+
+  it('refuses an empty article id or branch id', () => {
+    // A row belonging to nothing is a row the sell path can never join against,
+    // and it silently accumulates.
+    expect(() => insertBalance({ inventoryItemId: '' })).toThrow();
+    expect(() => insertBalance({ inventoryItemId: '   ' })).toThrow();
+    expect(() => insertBalance({ branchId: '' })).toThrow();
+  });
+
+// ── Identity ──────────────────────────────────────────────────────────────
+
+  it('treats the branch and article pair as the identity, so a re-pull is idempotent', () => {
+    // This UNIQUE is what makes the sync an UPSERT. Without it a terminal that
+    // reconnects twice accumulates two rows per article and the sell path has to
+    // guess which one is current.
+    expect(() => insertBalance({ onHandMilli: 2500 })).not.toThrow();
+    expect(() => insertBalance({ onHandMilli: 9999, id: 'a-second-row' })).toThrow();
+
+    const count = db.prepare('SELECT COUNT(*) AS n FROM stock_balances').get() as { n: number };
+    expect(count.n).toBe(1);
+  });
+
+  it('lets the same article be tracked separately at two branches', () => {
+    // Balances are per BRANCH: two branches of one shop stock different things,
+    // so the uniqueness must be on the pair and not on the article alone.
+    expect(() => insertBalance({ branchId: BRANCH })).not.toThrow();
+    expect(() => insertBalance({ branchId: OTHER_BRANCH })).not.toThrow();
+
+    const count = db.prepare('SELECT COUNT(*) AS n FROM stock_balances').get() as { n: number };
+    expect(count.n).toBe(2);
+  });
+
+  // ── The trigger ───────────────────────────────────────────────────────────
+
+  it('refuses an UPDATE that re-attributes a balance to another article', () => {
+    // THE test for `stock_balances_identity_immutable`. A sync bug that moved
+    // `inventory_item_id` would silently file one article's stock under another,
+    // and the cashier would be told flour is on the shelf when it is not.
+    insertBalance();
+
+    expect(() =>
+      db
+        .prepare('UPDATE stock_balances SET inventory_item_id = ? WHERE inventory_item_id = ?')
+        .run(MILK, FLOUR),
+    ).toThrow();
+  });
+
+  it('refuses an UPDATE that re-attributes a balance to another branch', () => {
+    insertBalance();
+
+    expect(() =>
+      db.prepare('UPDATE stock_balances SET branch_id = ? WHERE branch_id = ?').run(OTHER_BRANCH, BRANCH),
+    ).toThrow();
+  });
+
+  it('refuses an UPDATE that rewrites the server identity', () => {
+    // `remote_id` is the server's own identifier for the row. Changing it would
+    // make the next pull address a row the server does not know about.
+    insertBalance();
+
+    expect(() => db.prepare("UPDATE stock_balances SET remote_id = 'somewhere-else'").run()).toThrow();
+  });
+
+  it("allows an UPDATE that replaces the quantities — the sync's whole purpose", () => {
+    // The counterpart to the three rejections above, and the reason the trigger
+    // is narrow. Replacing an older snapshot with a newer one is the only thing
+    // this table exists to do, and a trigger that blocked it would break the
+    // feature rather than protect it.
+    insertBalance({ onHandMilli: 2500 });
+
+    expect(() =>
+      db
+        .prepare('UPDATE stock_balances SET on_hand_milli = 1800, version = 8, synced_at = ?')
+        .run('2026-10-05T10:00:00.000Z'),
+    ).not.toThrow();
+
+    const row = db.prepare('SELECT on_hand_milli, version FROM stock_balances').get() as {
+      on_hand_milli: number;
+      version: number;
+    };
+    expect(row.on_hand_milli).toBe(1800);
+    expect(row.version).toBe(8);
+  });
+
+  // ── The invariants the schema states in prose ─────────────────────────────
+
+  it('declares no stock_movements table, because a balance is derived', () => {
+    // `contracts/openapi.yaml` schema `StockBalance`: "Derived, never written by
+    // a client", computed server-side from the movement ledger. A local write
+    // surface for movements would make "which number is right?" answerable two
+    // ways, and reconciliation is the server's job.
+    const tables = (
+      db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as { name: string }[]
+    ).map((row) => row.name);
+
+    expect(tables).not.toContain('stock_movements');
+    expect(tables).toContain('stock_balances');
+  });
+
+  it('records the server clock and the terminal clock as separate columns', () => {
+    // A till whose network just came back routinely disagrees with the server
+    // about the time, and ageing stale stock on screen needs the terminal's own
+    // reading rather than a belief that the two agree.
+    insertBalance();
+
+    const row = db.prepare('SELECT updated_at, synced_at FROM stock_balances').get() as {
+      updated_at: string;
+      synced_at: string;
+    };
+    expect(row.updated_at).toBe(SERVER);
+    expect(row.synced_at).toBe(NOW);
+  });
+
+  it('bumps user_version to 3, so an upgraded terminal is recorded as upgraded', () => {
+    const version = db.prepare('PRAGMA user_version').get() as { user_version: number };
+    expect(version.user_version).toBe(3);
   });
 });

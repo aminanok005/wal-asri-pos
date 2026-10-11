@@ -41,12 +41,17 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
     "signed rounding — allow a negative rounding_adjustment_satang",
     include_str!("../migrations/0002_signed_rounding.sql"),
   ),
+  (
+    3,
+    "stock balances — the terminal's local StockBalance cache, in milli-units",
+    include_str!("../migrations/0003_stock_balances.sql"),
+  ),
 ];
 
 /// The highest migration this build knows about. Used to refuse a database
 /// written by a NEWER terminal, which is a downgrade the current code cannot
 /// reason about.
-pub const LATEST_VERSION: i64 = 2;
+pub const LATEST_VERSION: i64 = 3;
 
 /// Read the schema version recorded in the database header.
 pub fn current_version(conn: &Connection) -> Result<i64, rusqlite::Error> {
@@ -177,7 +182,15 @@ mod tests {
     let mut conn = in_memory();
     migrate(&mut conn).expect("migrate");
 
-    for table in ["local_orders", "local_order_lines", "sync_outbox"] {
+    for table in [
+      "local_orders",
+      "local_order_lines",
+      "sync_outbox",
+      // The offline stock cache. Without it a terminal cannot answer a stock
+      // question with the network unplugged, which is the normal condition of a
+      // branch with a bad router.
+      "stock_balances",
+    ] {
       let found: i64 = conn
         .query_row(
           "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -200,6 +213,7 @@ mod tests {
       "idx_local_orders_sync_state",
       "idx_local_order_lines_order_id",
       "idx_sync_outbox_drain",
+      "idx_stock_balances_stale",
     ] {
       let found: i64 = conn
         .query_row(
