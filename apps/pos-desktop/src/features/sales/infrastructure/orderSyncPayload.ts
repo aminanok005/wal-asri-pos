@@ -3,12 +3,20 @@
  * `sync_outbox.payload` and is POSTed as the command body.
  *
  * SHAPE: `services/api-backend/internal/sync/adapter/order/ingester.go` parses
- * this into `orderBody`/`lineBody` with `DisallowUnknownFields`. An extra key is
- * a PERMANENT rejection, so the field list here is closed and must match.
+ * this into `orderBody`/`lineBody` with `json.Unmarshal` (NOT `DisallowUnknownFields`).
+ * Extra keys are ACCEPTED SILENTLY — the field list here documents what we send,
+ * but the server does not reject unknown fields. This is intentional: forward
+ * compatibility means a newer client can send fields an older server ignores.
  *
- * SATANG IS A STRING: every `*_satang` is `money.Satang`, whose UnmarshalJSON
- * refuses a bare JSON number. Money takes `bigint` in, this emits a decimal
- * string, which is the only form the server will accept.
+ * SATANG IS A STRING — WITH ONE DELIBERATE EXCEPTION. Every `*_satang` is
+ * `money.Satang`, whose UnmarshalJSON refuses a bare JSON number, so money
+ * takes `bigint` in and emits a decimal string — EXCEPT
+ * `rounding_adjustment_satang`. The server types that one `money.SignedSatang`:
+ * a BARE JSON integer that explicitly refuses a quoted string (the mirror-image
+ * rule, same file in the Go money kernel). Sending `"-2"` there is a permanent
+ * rejection (`malformed_payload`) for every order that carried a cash
+ * rounding — at this till that is every order, because the field is always
+ * present. Do NOT "normalise" it back to `.toString()`.
  *
  * `line_tax_satang` is deliberately absent — the ingester states VAT is per
  * order and accepts no per-line value.
@@ -27,7 +35,13 @@ export interface SyncOrderPayload {
   readonly taxableSatang: bigint;
   readonly taxSatang: bigint;
   readonly serviceChargeSatang: bigint;
-  /** The one SIGNED field: the server's `money.SignedSatang`. */
+  /**
+   * The one SIGNED field — and the one money field that crosses as a BARE JSON
+   * INTEGER, not a string: the server types it `money.SignedSatang`, whose
+   * UnmarshalJSON refuses a quoted digit string exactly the way `money.Satang`
+   * refuses a bare number. Stays `bigint` at this edge; only
+   * `buildOrderSyncPayload` turns it into a JSON number.
+   */
   readonly roundingAdjustmentSatang: bigint;
   readonly totalSatang: bigint;
   /** A rate, not an amount — a JSON number on both sides of this wire. */
@@ -54,8 +68,10 @@ export interface SyncOrderLinePayload {
  *
  * Key order matches the ingester's struct so a diff of this file against it is
  * readable. `.toString()` on every satang is the load-bearing part: `bigint` has
- * no JSON representation, and a `Number` here would lose satang above 2^53
- * silently — which is the failure `money.Satang` exists to make impossible.
+ * no JSON representation, and a `Number` there would lose satang above 2^53
+ * silently — which is the failure `money.Satang` exists to make impossible. The
+ * single exception is `rounding_adjustment_satang`, emitted as a bare integer
+ * because the server types it `money.SignedSatang` (see the module header).
  */
 export function buildOrderSyncPayload(order: SyncOrderPayload): string {
   return JSON.stringify({
@@ -70,7 +86,11 @@ export function buildOrderSyncPayload(order: SyncOrderPayload): string {
     taxable_satang: order.taxableSatang.toString(),
     tax_satang: order.taxSatang.toString(),
     service_charge_satang: order.serviceChargeSatang.toString(),
-    rounding_adjustment_satang: order.roundingAdjustmentSatang.toString(),
+    // BARE INTEGER — the inverse of every other satang field here. `Number()` is
+    // safe on this field and only this field: it is a cash-rounding adjustment,
+    // bounded by the payable coin (a handful of satang), nowhere near the 2^53
+    // precision cliff that keeps every AMOUNT a string. The sign survives: -2n → -2.
+    rounding_adjustment_satang: Number(order.roundingAdjustmentSatang),
     total_satang: order.totalSatang.toString(),
     vat_rate_bp: order.vatRateBp,
     created_at: order.createdAt,

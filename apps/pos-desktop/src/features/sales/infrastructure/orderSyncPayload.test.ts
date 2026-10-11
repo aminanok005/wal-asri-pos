@@ -49,7 +49,6 @@ describe('buildOrderSyncPayload — satang crosses as a STRING', () => {
       'taxable_satang',
       'tax_satang',
       'service_charge_satang',
-      'rounding_adjustment_satang',
       'total_satang',
     ]) {
       expect(typeof body[field], `${field} must be a string`).toBe('string');
@@ -61,12 +60,25 @@ describe('buildOrderSyncPayload — satang crosses as a STRING', () => {
     expect(body.total_satang).toBe('4548');
   });
 
-  it('keeps the minus sign on the rounding adjustment, as a string', () => {
-    // `money.SignedSatang` on the server; a dropped sign reports a till that was
-    // short by 4 satang instead of one that balanced.
+  it('emits the rounding adjustment as a BARE integer — the one non-string money field', () => {
+    // `money.SignedSatang` on the server REFUSES a quoted string (the mirror of
+    // `money.Satang` refusing a bare number), so a string here would be a
+    // permanent `malformed_payload` rejection. The sign must survive too: a
+    // dropped sign reports a till that was short by 2 satang instead of one
+    // that balanced.
     const body = parse();
-    expect(body.rounding_adjustment_satang).toBe('-2');
-    expect(typeof body.rounding_adjustment_satang).toBe('string');
+    expect(body.rounding_adjustment_satang).toBe(-2);
+    expect(typeof body.rounding_adjustment_satang).toBe('number');
+  });
+
+  it('emits a zero adjustment as the number 0, not the string "0"', () => {
+    // The field is ALWAYS present, so the no-rounding case ships on every
+    // order — and `"0"` is rejected by `SignedSatang` exactly as firmly as
+    // `"-2"` is. `totalSatang` moves with the adjustment so the payload keeps
+    // its own money identity: gross 4550 + rounding 0 = total 4550.
+    const body = parse({ ...ORDER, roundingAdjustmentSatang: 0n, totalSatang: 4550n });
+    expect(body.rounding_adjustment_satang).toBe(0);
+    expect(typeof body.rounding_adjustment_satang).toBe('number');
   });
 
   it('emits every line satang as a string too', () => {
