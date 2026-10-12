@@ -427,9 +427,23 @@ export function OfflineOrdersView(props: OfflineOrdersViewProps): JSX.Element {
       {state.kind === 'loaded' && visibleOrders.length > 0 && (
         <ul className="offline-orders__list">
           {visibleOrders.map((order) => (
-            <li key={order.id} className="offline-orders__row" data-testid="offline-order-row">
+            <li
+              key={order.id}
+              className={`offline-orders__row${order.status === 'voided' ? ' offline-orders__row--voided' : ''}`}
+              data-testid="offline-order-row"
+            >
               <span className="offline-orders__row-receipt">{order.localReceiptNumber}</span>
-              <span className="offline-orders__row-status">{THAI_STATUS_LABELS[order.status]}</span>
+              <span
+                className={`offline-orders__row-status${
+                  order.status === 'void_requested'
+                    ? ' offline-orders__status-badge--alert'
+                    : order.status === 'voided'
+                      ? ' offline-orders__status-badge--muted'
+                      : ''
+                }`}
+              >
+                {THAI_STATUS_LABELS[order.status]}
+              </span>
               {/* The sync state keeps its own badge and its own `data-sync-state`
                   hook: the two ladders answer different questions, and a test
                   that could not tell them apart could not catch a screen that

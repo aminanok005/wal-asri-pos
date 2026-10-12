@@ -48,6 +48,36 @@
   line-height: 1.5;
 }
 
+/* ── Status badge variants ───────────────────────────────────────────────── */
+
+.offline-orders__status-badge--alert {
+  background: var(--warning);
+  color: var(--ink);
+  border-radius: 999px;
+  padding: 4px 12px;
+  font-weight: 600;
+  font-size: 12px;
+  min-height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.offline-orders__status-badge--muted {
+  background: var(--mut);
+  color: var(--ink);
+  border-radius: 999px;
+  padding: 4px 12px;
+  font-weight: 500;
+  font-size: 12px;
+  min-height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  filter: saturate(0.6) opacity(0.8);
+}
+
+
 /* ── Sync summary ───────────────────────────────────────────────────────── */
 
 .offline-orders__sync-summary {
@@ -422,6 +452,35 @@
  * middot separators between receipt/status/sync keep doing their job on one line.
  *
  * `flex: 1 0 100%` on the total claims its own line rather than sitting beside a
+.offline-orders__row--voided {
+  filter: grayscale(0.8) opacity(0.7);
+  background: var(--mut);
+}
+
+.offline-orders__refund-btn {
+  margin-top: 6px;
+  min-height: 48px;
+  min-width: 48px;
+  padding: 10px 20px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--card);
+  color: var(--ink);
+  font: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.offline-orders__refund-btn:hover:not(:disabled) {
+  border-color: var(--ink);
+}
+
+.offline-orders__refund-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
  * truncated ฿amount — the figure is the point of the row.
  */
 @media (max-width: 560px) {
