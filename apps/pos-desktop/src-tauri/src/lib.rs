@@ -188,6 +188,7 @@ pub fn run() {
             commands::list_recent_orders,
             commands::apply_stock_balances,
             commands::apply_recipes,
+            commands::request_order_void,
             commands::get_terminal_identity,
             printer_commands::print_receipt,
         ])

@@ -51,12 +51,17 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
         "local recipes — the terminal's local Recipe cache, in milli-units",
         include_str!("../migrations/0004_local_recipes.sql"),
     ),
+    (
+        5,
+        "offline refunds — local void request state tracking",
+        include_str!("../migrations/0005_offline_refunds.sql"),
+    ),
 ];
 
 /// The highest migration this build knows about. Used to refuse a database
 /// written by a NEWER terminal, which is a downgrade the current code cannot
 /// reason about.
-pub const LATEST_VERSION: i64 = 4;
+pub const LATEST_VERSION: i64 = 5;
 
 /// Read the schema version recorded in the database header.
 pub fn current_version(conn: &Connection) -> Result<i64, rusqlite::Error> {

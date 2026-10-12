@@ -783,6 +783,160 @@ pub async fn apply_recipes(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Offline refund: request_order_void
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Wire input for an offline void request.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VoidRequestInput {
+    pub order_id: String,
+    /// Raw receipt token string, transferred verbatim across the bridge.
+    pub receipt_token: String,
+    pub idempotency_key: String,
+    #[serde(default = "default_next_attempt_at")]
+    pub next_attempt_at: String,
+    #[serde(default = "default_now_iso")]
+    pub created_at: String,
+}
+
+fn default_now_iso() -> String {
+    crate::sync_outbox::now_iso()
+}
+
+/// Wire output for an offline void request.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoidRequestOutput {
+    pub order_id: String,
+    pub outbox_id: String,
+}
+
+/// One reversal line for the void payload.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VoidLine {
+    variant_id: String,
+    quantity: i64,
+}
+
+/// Commit a void request: update order status and queue a reversal outbox event.
+fn write_void_request(
+    conn: &mut Connection,
+    input: &VoidRequestInput,
+) -> Result<VoidRequestOutput, CommandError> {
+    if input.order_id.is_empty() {
+        return Err(CommandError::invalid("order_id", "must not be empty"));
+    }
+    if input.receipt_token.is_empty() {
+        return Err(CommandError::invalid("receipt_token", "must not be empty"));
+    }
+    if input.idempotency_key.is_empty() {
+        return Err(CommandError::invalid("idempotency_key", "must not be empty"));
+    }
+
+    let outbox_id = format!("void:{}", input.idempotency_key);
+
+    let tx = conn
+        .transaction()
+        .map_err(|e| CommandError::storage("begin transaction", e))?;
+
+    // Load current status to prevent double void.
+    let current_status: String = tx
+        .query_row(
+            "SELECT status FROM local_orders WHERE id = ?1",
+            [input.order_id.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => CommandError::invalid(
+                "order_id",
+                "no such order; a void request must reference a committed sale",
+            ),
+            other => CommandError::storage("read order status", other),
+        })?;
+
+    if current_status == "void_requested" || current_status == "voided" {
+        return Err(CommandError::invalid(
+            "order_id",
+            "order is already void_requested or voided; a second void request is not allowed",
+        ));
+    }
+
+    // Fetch reversal lines for the payload.
+    let mut stmt = tx
+        .prepare(
+            "SELECT variant_id, quantity FROM local_order_lines WHERE order_id = ?1 ORDER BY id",
+        )
+        .map_err(|e| CommandError::storage("prepare line query", e))?;
+
+    let lines: Vec<VoidLine> = stmt
+        .query_map([input.order_id.as_str()], |row| {
+            Ok(VoidLine {
+                variant_id: row.get(0)?,
+                quantity: row.get(1)?,
+            })
+        })
+        .map_err(|e| CommandError::storage("read lines", e))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| CommandError::storage("read line row", e))?;
+
+    drop(stmt);
+
+    // Update order status to void_requested.
+    tx.execute(
+        "UPDATE local_orders SET status = 'void_requested', updated_at = ?1 WHERE id = ?2",
+        [input.created_at.as_str(), input.order_id.as_str()],
+    )
+    .map_err(|e| CommandError::storage("update order status", e))?;
+
+    // Build payload: raw receipt token + reversal lines.
+    let payload = serde_json::json!({
+        "order_id": input.order_id,
+        "local_receipt_number": input.order_id,
+        "receipt_token": input.receipt_token,
+        "lines": lines,
+    })
+    .to_string();
+
+    tx.execute(
+        "INSERT INTO sync_outbox (
+            id, aggregate_type, aggregate_id, event_type, action, payload,
+            idempotency_key, status, attempt_count, next_attempt_at, last_error,
+            created_at, processed_at
+        ) VALUES (?1, 'void_request', ?2, 'void_approved', 'push_order', ?3,
+                  ?4, 'pending', 0, ?5, NULL, ?6, NULL)",
+        [
+            outbox_id.as_str(),
+            input.order_id.as_str(),
+            payload.as_str(),
+            input.idempotency_key.as_str(),
+            input.next_attempt_at.as_str(),
+            input.created_at.as_str(),
+        ],
+    )
+    .map_err(|e| CommandError::storage("insert outbox", e))?;
+
+    tx.commit()
+        .map_err(|e| CommandError::storage("commit void request", e))?;
+
+    Ok(VoidRequestOutput {
+        order_id: input.order_id.clone(),
+        outbox_id,
+    })
+}
+
+/// Request an offline refund: mark the order void_requested and queue a
+/// reversal outbox event for cloud sync.
+#[tauri::command]
+pub async fn request_order_void(
+    app: AppHandle,
+    input: VoidRequestInput,
+) -> Result<VoidRequestOutput, CommandError> {
+    blocking(app, move |conn| write_void_request(conn, &input)).await
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Terminal identity
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1575,5 +1729,28 @@ mod tests {
         let mut c = conn();
         migrate(&mut c).expect("second migration pass");
         write_order(&mut c, &good_input()).expect("checkout still works");
+    }
+
+    #[test]
+    fn request_order_void_marks_order_as_void_requested_and_queues_outbox_event() {
+        let mut c = conn();
+        write_order(&mut c, &good_input()).expect("checkout");
+        let order_id = "018f3c2a-0000-7000-8000-000000000001";
+        
+        let input = VoidRequestInput {
+            order_id: order_id.into(),
+            receipt_token: "token-1".into(),
+            idempotency_key: "void-idem-1".into(),
+            next_attempt_at: "2026-10-03T10:00:00.000Z".into(),
+            created_at: "2026-10-03T10:00:00.000Z".into(),
+        };
+        
+        write_void_request(&mut c, &input).expect("void request commits");
+        
+        let status: String = c.query_row("SELECT status FROM local_orders WHERE id = ?1", [order_id], |r| r.get(0)).unwrap();
+        assert_eq!(status, "void_requested");
+        
+        let outbox_count: i64 = c.query_row("SELECT COUNT(*) FROM sync_outbox WHERE id = 'void:void-idem-1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(outbox_count, 1);
     }
 }
