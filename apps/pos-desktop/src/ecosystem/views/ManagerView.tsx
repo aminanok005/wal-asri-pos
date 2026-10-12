@@ -1,12 +1,31 @@
 import { useState } from 'react';
-import { ECO_MENU, ECO_STAFF, ecoBaht } from '../data/mockData';
+import { ECO_MENU, ORDER_STATUSES, ecoBaht } from '../data/mockData';
 import type { EcoOrder, OrderStatus } from '../data/mockData';
 import { OrderLineBar } from '../components/shared/OrderLineBar';
+import { PlannedPlaceholder } from '../components/shared/PlannedPlaceholder';
 import { Sidebar } from '../components/shared/Sidebar';
 import { StatusBadge } from '../components/shared/StatusBadge';
 
 type Tab = 'Orders' | 'Menu' | 'Insights' | 'Staff';
 type SF = 'All' | OrderStatus;
+
+/**
+ * Filter pill labels in the contract's own spelling: `Draft`, `Submitted`,
+ * `In Preparation`, `Ready`, `Served`, `Completed`, `Void Requested`, `Voided`
+ * — the eight rungs of `local_orders.status`, lowercased value mapped to a
+ * sentence-case label. Both the count AND the filter run over the rows the
+ * app holds, so a badge can never disagree with the list it opens.
+ */
+const STATUS_LABEL: Record<OrderStatus, string> = {
+  draft: 'Draft',
+  submitted: 'Submitted',
+  in_preparation: 'In Preparation',
+  ready: 'Ready',
+  served: 'Served',
+  completed: 'Completed',
+  void_requested: 'Void Requested',
+  voided: 'Voided',
+};
 
 export function ManagerView({ orders, onViewOrder }: { orders: readonly EcoOrder[]; onViewOrder: (o: EcoOrder) => void }) {
   const [tab, setTab] = useState<Tab>('Orders');
@@ -15,9 +34,8 @@ export function ManagerView({ orders, onViewOrder }: { orders: readonly EcoOrder
   const [q, setQ] = useState('');
   const count = (s: OrderStatus) => orders.filter((o) => o.status === s).length;
   const pills: readonly { k: SF; label: string }[] = [
-    { k: 'All', label: `All (${orders.length})` }, { k: 'new', label: `New (${count('new')})` },
-    { k: 'cooking', label: `Cooking (${count('cooking')})` }, { k: 'ready', label: `Ready (${count('ready')})` },
-    { k: 'completed', label: `Completed (${count('completed')})` }, { k: 'cancelled', label: `Cancelled (${count('cancelled')})` },
+    { k: 'All', label: `All (${orders.length})` },
+    ...ORDER_STATUSES.map((s) => ({ k: s as SF, label: `${STATUS_LABEL[s]} (${count(s)})` })),
   ];
   const shown = orders.filter((o) => (sf === 'All' || o.status === sf) && (!q || o.customer.toLowerCase().includes(q.toLowerCase()) || String(o.num).includes(q)));
   return (
@@ -25,8 +43,8 @@ export function ManagerView({ orders, onViewOrder }: { orders: readonly EcoOrder
       <OrderLineBar orders={orders} role="manager" onAction={onViewOrder} />
       <div className="eco-mgr">
         <Sidebar items={[
-          { key: 'home', icon: '🏠', label: 'Home' }, { key: 'order', icon: '🧾', label: 'Orders' },
-          { key: 'chart', icon: '📊', label: 'Reports' }, { key: 'staff', icon: '👥', label: 'Staff' }, { key: 'set', icon: '⚙️', label: 'Settings' },
+          { key: 'home', icon: '🏠', label: 'หน้าแรก' }, { key: 'order', icon: '🧾', label: 'ออเดอร์' },
+          { key: 'chart', icon: '📊', label: 'รายงาน' }, { key: 'staff', icon: '👥', label: 'พนักงาน' }, { key: 'set', icon: '⚙️', label: 'ตั้งค่า' },
         ]} activeKey="order" onSelect={() => {}} />
         <div>
           <div className="eco-mgrtabs" role="tablist" aria-label="Manager sections">
@@ -46,11 +64,11 @@ export function ManagerView({ orders, onViewOrder }: { orders: readonly EcoOrder
                   {shown.map((o) => (
                     <button key={o.id} type="button" className="eco-card" style={{ textAlign: 'left', cursor: 'pointer', font: 'inherit', color: 'inherit' }} onClick={() => setSel(o)}>
                       <div style={{ display: 'flex', justifyContent: 'space-between' }}><b>{o.customer}</b><StatusBadge status={o.status} /></div>
-                      <div style={{ color: 'var(--e-mut)', fontSize: 12 }}>#{o.num} · {o.timeAgo} · {o.type} {o.table}</div>
-                      <ul style={{ paddingLeft: 18, fontSize: 13, margin: '6px 0' }}>
+                      <div style={{ color: 'var(--e-mut)', fontSize: 14 }}>#{o.num} · {o.timeAgo} · {o.type} {o.table}</div>
+                      <ul style={{ paddingLeft: 18, fontSize: 14, margin: '6px 0' }}>
                         {o.items.map((i) => <li key={i.name}>{i.name} × {i.qty} — {ecoBaht(i.price * i.qty)}</li>)}
                       </ul>
-                      <span style={{ color: 'var(--e-primary-d)', fontWeight: 700, fontSize: 12 }}>See more →</span>
+                      <span style={{ color: 'var(--e-primary-d)', fontWeight: 700, fontSize: 14 }}>See more →</span>
                     </button>
                   ))}
                 </div>
@@ -60,16 +78,15 @@ export function ManagerView({ orders, onViewOrder }: { orders: readonly EcoOrder
                 <aside className="eco-card" aria-label={`Order ${sel.num} details`}>
                   <div style={{ display: 'flex', justifyContent: 'space-between' }}>
                     <b>Order #{sel.num}</b>
-                    <button type="button" className="eco-iconbtn" aria-label="Close details" onClick={() => setSel(null)}>✕</button>
+                    <button type="button" className="eco-iconbtn" aria-label="ปิดหน้ารายละเอียด" onClick={() => setSel(null)}>✕</button>
                   </div>
-                  <p style={{ fontSize: 13, color: 'var(--e-mut)' }}>{sel.customer} · {sel.type} · {sel.table} · {sel.timeAgo}</p>
+                  <p style={{ fontSize: 14, color: 'var(--e-mut)' }}>{sel.customer} · {sel.type} · {sel.table} · {sel.timeAgo}</p>
                   <StatusBadge status={sel.status} />
                   <hr style={{ border: 0, borderTop: '1px solid var(--e-border)', margin: '10px 0' }} />
-                  {sel.items.map((i) => <div key={i.name} style={{ display: 'flex', justifyContent: 'space-between', fontSize: 13 }}><span>{i.name} × {i.qty}</span><span>{ecoBaht(i.price * i.qty)}</span></div>)}
+                  {sel.items.map((i) => <div key={i.name} style={{ display: 'flex', justifyContent: 'space-between', fontSize: 14 }}><span>{i.name} × {i.qty}</span><span>{ecoBaht(i.price * i.qty)}</span></div>)}
                   <div className="eco-totals">
-                    <div><span>Subtotal</span><span>{ecoBaht(sel.total)}</span></div>
-                    <div><span>Tax 10%</span><span>{ecoBaht(sel.total * 0.1)}</span></div>
-                    <div className="gt"><span>Total · PAID ✅</span><span>{ecoBaht(sel.total * 1.1)}</span></div>
+                    <div><span>Subtotal (incl. VAT)</span><span>{ecoBaht(sel.total)}</span></div>
+                    <div className="gt"><span>Total · PAID ✅</span><span>{ecoBaht(sel.total)}</span></div>
                   </div>
                 </aside>
               )}
@@ -88,22 +105,10 @@ export function ManagerView({ orders, onViewOrder }: { orders: readonly EcoOrder
             </div>
           )}
           {tab === 'Insights' && (
-            <div>
-              <div className="eco-card eco-alert red">🚨 Order #042 delayed 18 min — reassign a chef.</div>
-              <div className="eco-card eco-alert green">📈 Pad Thai trending +23% this week — feature it on the banner.</div>
-              <div className="eco-card eco-alert orange">⚠️ Inventory: chicken breast 2 kg left — reorder today.</div>
-            </div>
+            <PlannedPlaceholder title="Operational Insights" />
           )}
           {tab === 'Staff' && (
-            <div className="eco-ogrid">
-              {ECO_STAFF.map((s) => (
-                <div key={s.id} className="eco-card">
-                  <b>{s.name}</b> <span style={{ color: 'var(--e-mut)', fontSize: 12 }}>{s.role} · Lv.{s.level} · {s.shift}</span>
-                  <div className="eco-bar" style={{ marginTop: 8 }} role="progressbar" aria-valuenow={s.skillPct} aria-valuemin={0} aria-valuemax={100} aria-label={`${s.name} skill`}><i style={{ width: `${s.skillPct}%` }} /></div>
-                  <small style={{ color: 'var(--e-mut)' }}>{s.skillPct}% to next level</small>
-                </div>
-              ))}
-            </div>
+            <PlannedPlaceholder title="Staff Performance" />
           )}
         </div>
       </div>
