@@ -1,0 +1,228 @@
+/*
+ * reconciliation-overlay.css — the modal that settles a stock conflict.
+ *
+ * WHY CLASSES AND NOT INLINE STYLES
+ * `tauri.conf.json` sets `csp: "default-src 'self'"`, and an inline `style=`
+ * has no 'self' source — so a colour written inline would render nothing on a
+ * real till (see tokens.css, the menu-tile gradient note). Every colour here is
+ * a token from `tokens.css`, which is the only file allowed to name one, so
+ * light/dark both work with no per-mode override in this file: the dark blocks
+ * in tokens.css redefine the same variables and these rules follow.
+ *
+ * WHY 48px EVERYWHERE
+ * A till is touched, not clicked, often with a thumb. Every interactive target
+ * is `--tap` (48px) tall so a resolve — an irreversible stock change — is never
+ * one stray pixel away from a mis-tap.
+ */
+
+.recon-overlay__backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  padding: 16px;
+}
+
+.recon-overlay {
+  background: var(--card);
+  color: var(--ink);
+  font-family: var(--font);
+  border-radius: 12px;
+  box-shadow: var(--shadow-2);
+  width: 100%;
+  max-width: 560px;
+  max-height: 90vh;
+  overflow-y: auto;
+  padding: 24px;
+}
+
+.recon-overlay__title {
+  margin: 0 0 16px;
+  font-size: 1.25rem;
+  font-weight: 700;
+}
+
+.recon-overlay__diff {
+  background: var(--bg-2);
+  border-radius: 8px;
+  padding: 12px 16px;
+  margin-bottom: 16px;
+}
+
+.recon-overlay__item {
+  display: block;
+  color: var(--mut-strong);
+  font-size: 0.8125rem;
+  margin-bottom: 8px;
+}
+
+.recon-overlay__figures {
+  display: flex;
+  gap: 24px;
+  flex-wrap: wrap;
+}
+
+.recon-overlay__figure {
+  font-size: 1rem;
+}
+
+/* The live region is visually present but never layout-bearing; it carries the
+   success/failure announcement for a screen reader. */
+.recon-overlay__live {
+  font-size: 0.8125rem;
+  color: var(--mut-strong);
+  min-height: 1.25rem;
+}
+
+.recon-overlay__body {
+  margin-top: 8px;
+}
+
+.recon-overlay__legend,
+.recon-overlay__confirm-lead {
+  font-weight: 600;
+  margin: 0 0 12px;
+}
+
+.recon-fieldset {
+  border: none;
+  margin: 0;
+  padding: 0;
+}
+
+.recon-choice {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: var(--tap);
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  margin-bottom: 8px;
+  cursor: pointer;
+}
+
+.recon-choice--disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.recon-choice__label {
+  font-size: 0.9375rem;
+}
+
+.recon-choice__hint {
+  color: var(--mut-strong);
+  font-size: 0.8125rem;
+}
+
+.recon-choice input[type='radio'] {
+  width: 20px;
+  height: 20px;
+  flex: none;
+}
+
+.recon-custom {
+  margin: 4px 0 12px;
+}
+
+.recon-custom__label,
+.recon-reason__label {
+  display: block;
+  font-size: 0.875rem;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+
+.recon-custom__input,
+.recon-reason__input {
+  width: 100%;
+  box-sizing: border-box;
+  font-family: var(--font);
+  font-size: 1rem;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--card);
+  color: var(--ink);
+}
+
+.recon-reason__input {
+  min-height: 72px;
+  resize: vertical;
+}
+
+.recon-reason {
+  margin-bottom: 12px;
+}
+
+.recon-overlay__error {
+  color: var(--danger);
+  font-size: 0.875rem;
+  margin: 0 0 12px;
+}
+
+.recon-overlay__locked {
+  color: var(--warn);
+  background: var(--warns);
+  border-radius: 8px;
+  padding: 12px;
+  font-size: 0.9375rem;
+  margin: 0 0 12px;
+}
+
+.recon-overlay__confirm-reason {
+  color: var(--mut-strong);
+  font-size: 0.875rem;
+  margin: 0 0 16px;
+}
+
+.recon-overlay__done {
+  text-align: center;
+}
+
+.recon-overlay__done-text {
+  color: var(--ok);
+  font-weight: 600;
+  margin: 0 0 16px;
+}
+
+.recon-overlay__actions {
+  display: flex;
+  gap: 12px;
+  justify-content: flex-end;
+  margin-top: 8px;
+}
+
+.recon-btn {
+  min-height: var(--tap);
+  min-width: var(--tap);
+  padding: 0 20px;
+  border-radius: 8px;
+  font-family: var(--font);
+  font-size: 1rem;
+  font-weight: 600;
+  cursor: pointer;
+  border: 1px solid var(--line);
+  background: var(--card);
+  color: var(--ink);
+}
+
+.recon-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.recon-btn--primary {
+  background: var(--acc-grad);
+  color: var(--on-acc);
+  border-color: transparent;
+  box-shadow: var(--glow-acc);
+}
+
+.recon-btn--ghost {
+  background: transparent;
+}

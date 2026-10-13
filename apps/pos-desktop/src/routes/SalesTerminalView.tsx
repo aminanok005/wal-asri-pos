@@ -51,6 +51,11 @@ import { nextCartLineId } from '../features/sales/domain/lineId';
 import { DEFAULT_VAT_RATE_BP } from '../features/sales/domain/tax';
 import { CartView } from '../features/sales/ui/CartView';
 import type { CartCatalogueItem } from '../features/sales/ui/CartView';
+import { ReconciliationOverlay } from '../features/sales/ui/ReconciliationOverlay';
+import { useStockConflicts } from '../features/sales/ui/hooks/useStockConflicts';
+import { useCanResolveStockConflict } from '../features/sales/access/stockConflictAccess';
+import type { StockConflict } from '../features/sales/api/reconcile';
+import { readStockRequiresReconcile } from '../features/sales/domain/stockRequiresReconcile';
 import { RecentOrdersStrip } from '../features/sales/ui/RecentOrdersStrip';
 import { SegmentedControl } from '../features/sales/ui/SegmentedControl';
 import type { SegmentedControlOption } from '../features/sales/ui/SegmentedControl';
@@ -468,6 +473,20 @@ export function SalesTerminalView({
       });
   }, [getHeldOrdersProp]);
 
+  // ── Stock conflicts (polled) ───────────────────────────────────────────────
+  //
+  // Polls the branch's stock conflicts. Passed the branchId from the resolved
+  // terminal identity, or '' before it loads — the hook no-ops on an empty
+  // branch, so nothing is fetched until identity is known and nothing is
+  // fetched with a guessed branch. `terminalIdentity` is read here rather than
+  // passed down, so the banner and the overlay always agree on which branch's
+  // conflicts they are showing.
+  const {
+    conflicts: stockConflicts,
+    unavailable: stockConflictsUnavailable,
+    refresh: refreshStockConflicts,
+  } = useStockConflicts(terminalIdentity?.branchId ?? '');
+
   // ── Fulfilment ───────────────────────────────────────────────────────────
   //
   // REAL STATE, AND IT DECIDES WHAT IS COMMITTED. `orderType` is written to
@@ -490,6 +509,20 @@ export function SalesTerminalView({
   // report what came back.
 
   const [checkout, setCheckout] = useState<CheckoutResult | null>(null);
+
+  // ── Stock reconciliation ───────────────────────────────────────────────────
+  //
+  // The branch's stock conflicts, polled by the hook. A cashier is TOLD they
+  // exist (a banner) but cannot act on them; a manager gets the overlay. Which
+  // of the two is decided by `canResolveStockConflict`, the narrow access seam
+  // — there is no auth/role system in this app yet, so it defaults to deny and
+  // the resolve path is gated off until a real role is wired in.
+  const canResolveStockConflict = useCanResolveStockConflict();
+  const [selectedConflict, setSelectedConflict] = useState<StockConflict | null>(null);
+  // When a checkout is refused because a basket item's stock is locked for
+  // reconciliation, this holds the locked item ids so the screen can name them
+  // instead of showing a generic failure.
+  const [lockedItemIds, setLockedItemIds] = useState<readonly string[] | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
   // ── Payment method, and what it does to the total ──────────────────────────
@@ -528,6 +561,7 @@ const handleCheckout = useCallback(async () => {
 
     setSubmitting(true);
     setCheckout(null);
+    setLockedItemIds(null);
 
     try {
       const figures: CheckoutFigures = {
@@ -698,10 +732,23 @@ const handleCheckout = useCallback(async () => {
     } catch (error) {
       // The cart is left intact on purpose: nothing was committed, so the
       // cashier still has the sale in front of them to retry.
-      setCheckout({
-        ok: false,
-        message: error instanceof Error ? error.message : String(error),
-      });
+      //
+      // A refused sale because a basket item's stock is LOCKED for
+      // reconciliation is a DIFFERENT failure from a generic one: the money was
+      // never at risk, and the fix is "a manager must reconcile that item", not
+      // "try again". So this reads the `stock_requires_reconcile` signal off the
+      // error and names the locked items; anything else is the ordinary path.
+      const locked = readStockRequiresReconcile(error);
+      if (locked !== null) {
+        setLockedItemIds(locked.inventoryItemIds);
+        setCheckout(null);
+      } else {
+        setLockedItemIds(null);
+        setCheckout({
+          ok: false,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
 
       // The one sound that is deliberately UNPLEASANT. Every other outcome on
       // this screen is recoverable and the cashier already knows about it from
@@ -850,6 +897,51 @@ const handleCheckout = useCallback(async () => {
                 ออเดอร์เหล่านี้จะถูกเปลี่ยนสถานะเป็น <code>failed_permanent</code> และห้ามขายซ้ำ — โปรดติดต่อผู้ดูแลระบบเพื่อ Reconcile
               </p>
             </details>
+          </div>
+        </div>
+      )}
+
+      {/* ── Stock-conflict banner ────────────────────────────────────────────
+          EVERY user sees this when the branch has conflicts awaiting
+          reconciliation — a cashier is TOLD, not left to discover it at
+          checkout. A manager additionally gets a button to open the resolve
+          overlay; a cashier gets the plain "tell a manager" line, because the
+          resolve path is gated by the access seam (default: deny). When the
+          backend reconcile commands are not registered yet (Lane 1, Plan 1.3),
+          this shows nothing rather than a fabricated conflict count. */}
+      {!stockConflictsUnavailable && stockConflicts.length > 0 && (
+        <div
+          className="sales-terminal__held-banner sales-terminal__held-banner--warning"
+          role="status"
+          aria-live="polite"
+          data-testid="stock-conflict-banner"
+        >
+          <svg className="sales-terminal__warning-icon" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M12 2L2 22h20L12 2z" stroke="currentColor" strokeWidth="2" fill="none" />
+            <line x1="12" y1="9" x2="12" y2="13" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+            <line x1="12" y1="17" x2="12.01" y2="17" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+          </svg>
+          <div className="sales-terminal__held-content">
+            <strong>
+              มีสต็อกรอปรับยอด {stockConflicts.length} รายการ
+            </strong>
+            {canResolveStockConflict ? (
+              <ul className="sales-terminal__conflict-list">
+                {stockConflicts.map((conflict) => (
+                  <li key={conflict.inventoryItemId}>
+                    <button
+                      type="button"
+                      className="sales-terminal__conflict-open"
+                      onClick={() => setSelectedConflict(conflict)}
+                    >
+                      ปรับยอด {conflict.inventoryItemId}
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p className="sales-terminal__held-action">ต้องแจ้งผู้จัดการดำเนินการปรับยอด</p>
+            )}
           </div>
         </div>
       )}
@@ -1047,9 +1139,45 @@ const handleCheckout = useCallback(async () => {
                 {`บันทึกไม่สำเร็จ: ${checkout.message}`}
               </p>
             )}
+            {/* A checkout refused because a basket item's stock is locked for
+                reconciliation. Naming the locked items turns "บันทึกไม่สำเร็จ"
+                into an actionable "these items need a manager first" — the
+                money was never at risk and retrying will not help. */}
+            {lockedItemIds !== null && (
+              <div
+                className="sales-terminal__error"
+                data-testid="stock-locked-alert"
+                role="alert"
+              >
+                <strong>มีสต็อกในออเดอร์นี้ต้องปรับยอดก่อน จึงจะขายต่อได้</strong>
+                {lockedItemIds.length > 0 && (
+                  <div>รหัสที่ต้องปรับยอด: {lockedItemIds.join(', ')}</div>
+                )}
+                <div>กรุณาแจ้งผู้จัดการดำเนินการปรับยอดสต็อก</div>
+              </div>
+            )}
           </section>
         </div>
       </div>
+
+      {/* ── Resolve overlay ────────────────────────────────────────────────────
+          Mounted only when a conflict is selected. The overlay itself hides the
+          resolve controls for a cashier (via the access seam), so even if this
+          were opened it could not be used to change a balance without the
+          permission. After a successful resolve the parent refetches; when no
+          conflicts remain, `selectedConflict` is cleared and the overlay closes. */}
+      <ReconciliationOverlay
+        isOpen={selectedConflict !== null}
+        conflict={selectedConflict}
+        actorTerminalId={terminalIdentity?.terminalId}
+        onClose={() => setSelectedConflict(null)}
+        onResolved={() => {
+          refreshStockConflicts();
+          // Close when this was the last conflict; otherwise keep the overlay
+          // so the manager can pick the next one from the banner.
+          if (stockConflicts.length <= 1) setSelectedConflict(null);
+        }}
+      />
     </main>
   );
 }

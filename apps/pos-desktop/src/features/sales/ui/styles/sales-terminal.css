@@ -648,3 +648,30 @@
     animation: none !important;
   }
 }
+
+/* ── Stock-conflict banner list ─────────────────────────────────────────────
+   The manager's per-conflict "ปรับยอด" buttons inside the warning banner. A
+   list rather than inline buttons so a branch with many conflicts stays
+   scannable; each button is `--tap` tall so it is aimable on a touch till.
+   Colours are tokens, so dark mode needs no override here. */
+.sales-terminal__conflict-list {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.sales-terminal__conflict-open {
+  min-height: var(--tap);
+  padding: 0 16px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--card);
+  color: var(--ink);
+  font-family: var(--font);
+  font-size: 0.9375rem;
+  font-weight: 600;
+  cursor: pointer;
+}

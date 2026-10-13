@@ -30,6 +30,11 @@
 @import './segmented-control.css';
 @import './sales-terminal.css';
 @import './offline-orders.css';
+/* The stock-conflict modal. Loaded last of the components: it is an overlay
+   that paints over the terminal, so its rules should not be reachable by — or
+   reach into — anything below. Colours are tokens, so dark mode needs nothing
+   extra here. */
+@import './reconciliation-overlay.css';
 
 body {
   margin: 0;
