@@ -55,6 +55,12 @@ use crate::stock_balances::{StockBalanceInput, StockBalanceWriteResult};
 pub struct CommandError {
     pub kind: CommandErrorKind,
     pub message: String,
+    /// Stable error code for client handling (e.g. "stock_balance_not_found").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    /// Context‑specific details (field name, list of IDs, etc.).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<CommandErrorDetails>,
 }
 
 /// Why a command failed. `camelCase` on the wire so TypeScript discriminants read
@@ -70,6 +76,18 @@ pub enum CommandErrorKind {
     Worker,
 }
 
+/// Extended error information for client‑side display.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandErrorDetails {
+    /// For "stock_requires_reconcile": list of inventory item IDs that are blocked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inventory_item_ids: Option<Vec<String>>,
+    /// For validation errors: name of the field that failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
+}
+
 impl CommandError {
     /// `pub(crate)`: this module is an adapter like `commands` is, and it must be
     /// able to shape its own rejections the same way — a stock quantity that
@@ -79,6 +97,8 @@ impl CommandError {
         CommandError {
             kind: CommandErrorKind::InvalidPayload,
             message: format!("{field}: {why}"),
+            code: None,
+            details: None,
         }
     }
 
@@ -86,6 +106,8 @@ impl CommandError {
         CommandError {
             kind: CommandErrorKind::Storage,
             message: format!("{what}: {e}"),
+            code: None,
+            details: None,
         }
     }
 
@@ -93,6 +115,53 @@ impl CommandError {
         CommandError {
             kind: CommandErrorKind::Worker,
             message: format!("database worker did not finish: {e}"),
+            code: None,
+            details: None,
+        }
+    }
+
+    /// Stock balance not found error with optional list of inventory item IDs.
+    pub(crate) fn stock_balance_not_found(
+        ids: Vec<String>,
+        message: String,
+    ) -> Self {
+        CommandError {
+            kind: CommandErrorKind::Storage,
+            message,
+            code: Some("stock_balance_not_found".to_string()),
+            details: Some(CommandErrorDetails {
+                inventory_item_ids: Some(ids),
+                field: None,
+            }),
+        }
+    }
+
+    /// Stock requires reconciliation error for the given inventory items.
+    pub(crate) fn stock_requires_reconcile(
+        ids: Vec<String>,
+        message: String,
+    ) -> Self {
+        CommandError {
+            kind: CommandErrorKind::Storage,
+            message,
+            code: Some("stock_requires_reconcile".to_string()),
+            details: Some(CommandErrorDetails {
+                inventory_item_ids: Some(ids),
+                field: None,
+            }),
+        }
+    }
+
+    /// Validation error on a specific field.
+    pub(crate) fn validation_error(field: &str, message: String) -> Self {
+        CommandError {
+            kind: CommandErrorKind::InvalidPayload,
+            message: format!("{field}: {message}"),
+            code: Some("validation_error".to_string()),
+            details: Some(CommandErrorDetails {
+                inventory_item_ids: None,
+                field: Some(field.to_string()),
+            }),
         }
     }
 }
@@ -977,6 +1046,43 @@ pub fn get_terminal_identity() -> Result<TerminalIdentity, CommandError> {
         std::env::var(TERMINAL_ID_ENV).ok().as_deref(),
         std::env::var(BRANCH_ID_ENV).ok().as_deref(),
     )
+}
+
+#[tauri::command]
+pub async fn sync_stock_balances(
+    app: AppHandle,
+    balances: Vec<crate::stock_balances::StockBalanceInput>,
+) -> Result<crate::stock_balances::StockBalanceWriteResult, CommandError> {
+    // To be implemented in Phase 1.2
+    // For now, a placeholder that returns an error to indicate not yet implemented.
+    Err(CommandError::invalid(
+        "sync_stock_balances",
+        "command not yet implemented",
+    ))
+}
+
+#[tauri::command]
+pub async fn list_stock_conflicts(
+    app: AppHandle,
+    branch_id: String,
+) -> Result<Vec<crate::stock_balances::StockBalanceRecord>, CommandError> {
+    // To be implemented in Phase 1.2
+    Err(CommandError::invalid(
+        "list_stock_conflicts",
+        "command not yet implemented",
+    ))
+}
+
+#[tauri::command]
+pub async fn resolve_stock_conflict(
+    app: AppHandle,
+    args: crate::stock_balances::ResolveStockConflictArgs,
+) -> Result<crate::stock_balances::ResolveStockConflictResult, CommandError> {
+    // To be implemented in Phase 1.2
+    Err(CommandError::invalid(
+        "resolve_stock_conflict",
+        "command not yet implemented",
+    ))
 }
 
 /// The environment values, validated.

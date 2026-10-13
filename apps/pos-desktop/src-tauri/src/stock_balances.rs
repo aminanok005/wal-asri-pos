@@ -61,7 +61,30 @@
 use rusqlite::types::Value;
 use rusqlite::Connection;
 
-use crate::commands::{CommandError, CommandErrorKind};
+use crate::commands::CommandError;
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolveStockConflictArgs {
+    pub inventory_item_id: String,
+    pub branch_id: String,
+    pub resolved_quantity_milli: i64,
+    pub reason: String,
+    pub actor_terminal_id: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolveStockConflictResult {
+    pub inventory_item_id: String,
+    pub branch_id: String,
+    pub old_quantity_milli: i64,
+    pub new_quantity_milli: i64,
+    pub requires_reconcile: i32,
+    pub updated_at: String,
+    pub audit_log_id: String,
+}
+
 
 /// Milli-units per whole unit. Fixed by `decimal(12,3)`, not a choice made here.
 pub const MILLI_PER_UNIT: i64 = 1_000;
@@ -533,9 +556,75 @@ pub fn stock_balance_for(
   }))
 }
 
-/// The kind a malformed quantity reports under. Re-exported so a caller
-/// pattern-matching on the wire does not need to reach into `commands`.
-pub const INVALID_QUANTITY_KIND: CommandErrorKind = CommandErrorKind::InvalidPayload;
+/// Ensure the given stock balance is not in reconciliation state.
+/// Returns CommandError with code "stock_requires_reconcile" if locked.
+pub fn ensure_not_reconciling(
+    conn: &Connection,
+    inventory_item_id: &str,
+    branch_id: &str,
+) -> Result<(), CommandError> {
+    let requires_reconcile: i32 = conn
+        .query_row(
+            "SELECT COALESCE(requires_reconcile,0) FROM stock_balances WHERE inventory_item_id=?1 AND branch_id=?2",
+            rusqlite::params![inventory_item_id, branch_id],
+            |x| x.get(0),
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => CommandError::stock_balance_not_found(
+                vec![inventory_item_id.to_string()],
+                format!("stock balance not found for item {}", inventory_item_id),
+            ),
+            _ => CommandError::storage("read requires_reconcile", e),
+        })?;
+    if requires_reconcile == 1 {
+        return Err(CommandError::stock_requires_reconcile(
+            vec![inventory_item_id.to_string()],
+            "stock reconciliation required for item".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Transactional variant of ensure_not_reconciling
+pub fn ensure_not_reconciling_tx(
+    tx: &rusqlite::Transaction,
+    inventory_item_id: &str,
+    branch_id: &str,
+) -> Result<(), CommandError> {
+    let requires_reconcile: i32 = tx
+        .query_row(
+            "SELECT COALESCE(requires_reconcile,0) FROM stock_balances WHERE inventory_item_id=?1 AND branch_id=?2",
+            rusqlite::params![inventory_item_id, branch_id],
+            |x| x.get(0),
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => CommandError::stock_balance_not_found(
+                vec![inventory_item_id.to_string()],
+                format!("stock balance not found for item {}", inventory_item_id),
+            ),
+            _ => CommandError::storage("read requires_reconcile", e),
+        })?;
+    if requires_reconcile == 1 {
+        return Err(CommandError::stock_requires_reconcile(
+            vec![inventory_item_id.to_string()],
+            "stock reconciliation required for item".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Read the latest cloud_updated_at from stock_balances, serving as the cursor for incremental pulls.
+pub fn last_cloud_updated_at(conn: &Connection) -> Result<Option<String>, CommandError> {
+    let res: Result<Option<String>, rusqlite::Error> = conn.query_row(
+        "SELECT MAX(cloud_updated_at) FROM stock_balances",
+        [],
+        |row| row.get(0),
+    );
+    match res {
+        Ok(v) => Ok(v),
+        Err(e) => Err(CommandError::storage("read last cloud updated at", e)),
+    }
+}
 
 #[cfg(test)]
 mod tests {

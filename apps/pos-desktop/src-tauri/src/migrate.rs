@@ -56,12 +56,22 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
         "offline refunds — local void request state tracking",
         include_str!("../migrations/0005_offline_refunds.sql"),
     ),
+    (
+        6,
+        "reconciliation — audit logs and conflict flag",
+        include_str!("../migrations/0006_local_reconciliation.sql"),
+    ),
+    (
+        7,
+        "reconciliation cursor — add cloud_updated_at and conflict_cloud_quantity_milli",
+        include_str!("../migrations/0007_reconciliation_cursor.sql"),
+    ),
 ];
 
 /// The highest migration this build knows about. Used to refuse a database
 /// written by a NEWER terminal, which is a downgrade the current code cannot
 /// reason about.
-pub const LATEST_VERSION: i64 = 5;
+pub const LATEST_VERSION: i64 = 7;
 
 /// Read the schema version recorded in the database header.
 pub fn current_version(conn: &Connection) -> Result<i64, rusqlite::Error> {
