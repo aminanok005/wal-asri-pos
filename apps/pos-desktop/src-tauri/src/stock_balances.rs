@@ -629,6 +629,7 @@ pub fn last_cloud_updated_at(conn: &Connection) -> Result<Option<String>, Comman
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::commands::CommandErrorKind;
   use crate::migrate;
 
   const BRANCH: &str = "0199b1a0-0000-7000-8000-000000000001";
@@ -708,7 +709,7 @@ mod tests {
   #[test]
   fn a_fourth_fraction_digit_is_refused_rather_than_truncated() {
     let error = parse_milli_quantity("q", "2.5001").expect_err("decimal(12,3) cannot hold a 4th digit");
-    assert_eq!(error.kind, CommandErrorKind::InvalidPayload);
+    assert_eq!(error.kind, crate::commands::CommandErrorKind::InvalidPayload);
     assert!(error.message.contains("q:"), "message should name the field: {}", error.message);
   }
 
@@ -724,7 +725,7 @@ mod tests {
         rejected.map(|v| v.to_string())
       );
       if let Err(err) = rejected {
-        assert_eq!(err.kind, CommandErrorKind::InvalidPayload, "{bad:?}");
+        assert_eq!(err.kind, crate::commands::CommandErrorKind::InvalidPayload, "{bad:?}");
       }
     }
   }
@@ -769,7 +770,7 @@ mod tests {
     )
     .expect_err("a malformed quantity must abort the whole pull");
 
-    assert_eq!(error.kind, CommandErrorKind::InvalidPayload);
+    assert_eq!(error.kind, crate::commands::CommandErrorKind::InvalidPayload);
     assert_eq!(
       count(&c, "stock_balances"),
       before,
@@ -817,7 +818,7 @@ mod tests {
     let error = apply_stock_balances(&mut c, &[balance(FLOUR, "2.500", "-1.000", 1)])
       .expect_err("a negative reservation is a bookkeeping error");
 
-    assert_eq!(error.kind, CommandErrorKind::InvalidPayload);
+    assert_eq!(error.kind, crate::commands::CommandErrorKind::InvalidPayload);
     assert!(error.message.contains("balances[0].reserved"), "got: {}", error.message);
     assert_eq!(count(&c, "stock_balances"), 0);
   }

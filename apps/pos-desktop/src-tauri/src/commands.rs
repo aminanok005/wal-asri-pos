@@ -152,18 +152,7 @@ impl CommandError {
         }
     }
 
-    /// Validation error on a specific field.
-    pub(crate) fn validation_error(field: &str, message: String) -> Self {
-        CommandError {
-            kind: CommandErrorKind::InvalidPayload,
-            message: format!("{field}: {message}"),
-            code: Some("validation_error".to_string()),
-            details: Some(CommandErrorDetails {
-                inventory_item_ids: None,
-                field: Some(field.to_string()),
-            }),
-        }
-    }
+
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1050,8 +1039,8 @@ pub fn get_terminal_identity() -> Result<TerminalIdentity, CommandError> {
 
 #[tauri::command]
 pub async fn sync_stock_balances(
-    app: AppHandle,
-    balances: Vec<crate::stock_balances::StockBalanceInput>,
+    _app: AppHandle,
+    _balances: Vec<crate::stock_balances::StockBalanceInput>,
 ) -> Result<crate::stock_balances::StockBalanceWriteResult, CommandError> {
     // To be implemented in Phase 1.2
     // For now, a placeholder that returns an error to indicate not yet implemented.
@@ -1063,8 +1052,8 @@ pub async fn sync_stock_balances(
 
 #[tauri::command]
 pub async fn list_stock_conflicts(
-    app: AppHandle,
-    branch_id: String,
+    _app: AppHandle,
+    _branch_id: String,
 ) -> Result<Vec<crate::stock_balances::StockBalanceRecord>, CommandError> {
     // To be implemented in Phase 1.2
     Err(CommandError::invalid(
@@ -1075,8 +1064,8 @@ pub async fn list_stock_conflicts(
 
 #[tauri::command]
 pub async fn resolve_stock_conflict(
-    app: AppHandle,
-    args: crate::stock_balances::ResolveStockConflictArgs,
+    _app: AppHandle,
+    _args: crate::stock_balances::ResolveStockConflictArgs,
 ) -> Result<crate::stock_balances::ResolveStockConflictResult, CommandError> {
     // To be implemented in Phase 1.2
     Err(CommandError::invalid(
