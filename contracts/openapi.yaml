@@ -104,6 +104,10 @@ tags:
     description: |
       The offline drain. A terminal records events locally and pushes them when the
       network returns; this is the endpoint that makes an offline sale real.
+  - name: Recipes
+    description: |
+      Recipe-driven ingredient consumption. Returns the recipe and its components
+      for a branch so the terminal can compute ingredient costs offline.
 
 paths:
   # ==========================================================================
@@ -142,6 +146,44 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/CatalogResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /catalog/recipes:
+    get:
+      tags: [Recipes]
+      operationId: getRecipes
+      summary: Get recipes and their components for a branch
+      description: |
+        Returns every active recipe and its components for a branch.
+        This allows the terminal to compute ingredient costs and track
+        theoretical stock consumption offline.
+
+        **Incremental pull.** Pass `since` (an RFC 3339 timestamp) to receive
+        only rows changed after that instant, plus a new `cursor`. A terminal
+        that has never synced omits `since` and receives the full recipes list.
+
+        **Recipe deduction.** When a product with a recipe is sold, the server
+        deducts stock from each component's inventory item, scaled by the
+        quantity sold. The deduction is atomic with the order ingestion.
+      parameters:
+        - $ref: '#/components/parameters/BranchId'
+        - $ref: '#/components/parameters/Since'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: The recipes snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecipesResponse'
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
@@ -293,6 +335,134 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /sync/reconcile:
+    post:
+      tags: [Sync]
+      operationId: reconcileStockBalances
+      summary: Reconcile stock balances atomically
+      description: |
+        Performs an atomic balance realignment for a branch's stock.
+
+        This endpoint reads the `stock_movements` ledger and re-derives each
+        `stock_balances.on_hand_milli` from scratch, then writes the corrected
+        values back in a single transaction. It is intended for operator use
+        after a physical stock count, or as a recovery path after a suspected
+        ledger/balance drift.
+
+        **Atomicity:** All balance corrections execute inside one database
+        transaction. If any statement fails, the entire reconciliation rolls
+        back — no partial corrections are persisted.
+
+        **Pessimistic locking:** Each affected `stock_balances` row is locked
+        with `SELECT ... FOR UPDATE` before being written, so concurrent
+        terminal pushes cannot interleave and produce a dirty read.
+
+        **Auth stub (Phase 1):** `RECONCILE_ADMIN_TOKEN` environment variable
+        required, `X-Reconcile-Token` header must match, and the caller must be
+        localhost. Fails closed with `auth_stub_required` when the env var is
+        unset, so a misconfiguration cannot silently open the door.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReconcileRequest'
+      responses:
+        '200':
+          description: |
+            The reconciliation completed. `corrected_count` is the number of
+            balances that were changed; `items` lists every balance that was
+            examined with its value before and after. A balance that already
+            agreed appears with `before_quantity_milli` equal to
+            `after_quantity_milli`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReconcileResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '503':
+          description: |
+            Authentication stub failed: `RECONCILE_ADMIN_TOKEN` is unset, the
+            header did not match, or the caller is not localhost.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /sync/stock-adjustments:
+    post:
+      tags: [Sync]
+      operationId: adjustStockBalance
+      summary: Apply a terminal's resolved stock-quantity claim
+      description: |
+        A terminal that has physically counted an article sends its claim about
+        what the shelf should hold, along with an `audit_log_id` it minted while
+        offline. The server records the claim in the audit trail and, if the
+        ledger already agrees with the balance, applies the delta as a movement.
+
+        **Idempotency is the audit id.** The terminal cannot distinguish a lost
+        response from a crash, so it re-sends the same claim on retry. The
+        `audit_log_id` is the primary key of both the audit row and the
+        movement, so a retry is a no-op at both levels: the audit INSERT is
+        skipped with `ON CONFLICT (id) DO NOTHING`, and the response reports
+        `applied: false` with the original delta and balance.
+
+        **The delta is computed against the LEDGER, not the terminal's claim.**
+        The terminal sends `old_quantity_milli` as its recollection of the
+        balance, but the server re-derives the balance from
+        `stock_movements` inside a `SELECT ... FOR UPDATE` lock and uses THAT
+        as the baseline. A terminal whose recollection is stale cannot move the
+        shelf by the difference between its memory and its claim — only by the
+        difference between the ledger and its claim. This is what stops a
+        concurrent sale from being silently overwritten by an adjustment built
+        on a stale read.
+
+        **409 when the ledger has drifted.** If the locked balance does not
+        agree with the sum of the movements, the adjustment is refused: the
+        projection is no longer derivable from its history, and writing a
+        delta on top would compound the corruption. The terminal must reconcile
+        (`POST /sync/reconcile`) before retrying.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StockAdjustmentRequest'
+      responses:
+        '200':
+          description: |
+            The claim was processed. `applied` is `true` when the delta was
+            written and `false` when the audit id was already seen (idempotent
+            retry). `delta_milli` and `balance_after_milli` describe the
+            movement that was — or would have been — applied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StockAdjustmentResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          description: |
+            The branch or the inventory item does not exist, or the article is
+            not stock-tracked.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: |
+            The balance disagrees with the ledger sum. The adjustment cannot
+            be applied safely until the branch is reconciled.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -1157,53 +1327,151 @@ components:
           description: RFC 3339, UTC. Doubles as the sync cursor for this row.
       additionalProperties: false
 
-    # ── Envelopes ───────────────────────────────────────────────────────────
-
-    CatalogResponse:
+    ReconcileRequest:
       type: object
-      description: |
-        A catalog snapshot plus the cursor needed to ask for the next delta.
       required:
         - branch_id
-        - categories
-        - products
-        - variants
-        - price_list_entries
-        - cursor
-        - pulled_at
       properties:
         branch_id:
           $ref: '#/components/schemas/UuidV7'
-        categories:
+      additionalProperties: false
+
+    ReconcileResponse:
+      type: object
+      description: |
+        The result of a stock reconciliation. `branch_id` names the branch that
+        was reconciled, `corrected_count` is the number of balances that were
+        realigned to match the ledger, and `items` lists every balance that was
+        examined with its value before and after the correction. A balance that
+        already agreed appears with `before_quantity_milli` equal to
+        `after_quantity_milli` — the response is a complete audit of the run,
+        not only the changes.
+      required:
+        - branch_id
+        - corrected_count
+        - items
+      properties:
+        branch_id:
+          $ref: '#/components/schemas/UuidV7'
+        corrected_count:
+          type: integer
+          description: Number of stock balances that were realigned to match the ledger.
+        items:
           type: array
           items:
-            $ref: '#/components/schemas/Category'
-        products:
-          type: array
-          items:
-            $ref: '#/components/schemas/Product'
-        variants:
-          type: array
-          items:
-            $ref: '#/components/schemas/ProductVariant'
-        price_list_entries:
-          type: array
-          items:
-            $ref: '#/components/schemas/PriceListEntry'
-        cursor:
+            $ref: '#/components/schemas/ReconcileItem'
+      additionalProperties: false
+
+    ReconcileItem:
+      type: object
+      description: |
+        One article's balance as examined during a reconcile, with the value
+        before and after the correction. Quantities are raw milli-units (the
+        `stock_balances.on_hand_milli` BIGINT column), NOT the wire `Quantity`
+        decimal string — this object travels inside the response body, not the
+        audit JSONB, and the milli-unit is the unit the ledger sums in.
+      required:
+        - inventory_item_id
+        - before_quantity_milli
+        - after_quantity_milli
+      properties:
+        inventory_item_id:
+          $ref: '#/components/schemas/UuidV7'
+        before_quantity_milli:
+          type: integer
+          format: int64
+          description: The balance as it stood before the reconcile ran.
+        after_quantity_milli:
+          type: integer
+          format: int64
+          description: The balance after the reconcile ran; equal to before when unchanged.
+      additionalProperties: false
+
+    StockAdjustmentRequest:
+      type: object
+      description: |
+        A terminal's claim about what a stock article's quantity should be.
+
+        `resolved_quantity_milli` is what the terminal counted on the shelf, and
+        `old_quantity_milli` is what the terminal *believes* the balance was —
+        it is advisory only. The server re-derives the true balance from the
+        ledger and computes the delta against that, so a stale
+        `old_quantity_milli` cannot move the shelf by the difference between
+        memory and claim.
+      required:
+        - inventory_item_id
+        - branch_id
+        - resolved_quantity_milli
+        - reason
+        - audit_log_id
+      properties:
+        inventory_item_id:
+          $ref: '#/components/schemas/UuidV7'
+        branch_id:
+          $ref: '#/components/schemas/UuidV7'
+        resolved_quantity_milli:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            The quantity the terminal claims is on hand, in milli-units. Must be
+            non-negative: a physical count cannot be negative.
+        old_quantity_milli:
+          type: integer
+          format: int64
+          description: |
+            The balance the terminal remembered, in milli-units. Advisory — the
+            server uses the ledger, not this value, as the baseline.
+        reason:
           type: string
           description: |
-            **Sync cursor.** Pass back as `since` to receive only what changed
-            after this snapshot. Equal to the `pulled_at` of this response.
-          example: '2026-10-02T09:15:00Z'
-        pulled_at:
+            Why the shelf was recounted. Required: an audit row with no reason
+            is not a record anyone can interpret later.
+        actor_terminal_id:
           type: string
-          format: date-time
-          description: Server time this snapshot was taken, RFC 3339 UTC.
-        next_cursor:
-          type: string
-          nullable: true
-          description: Pagination cursor when the response is partial. `null` when complete.
+          description: |
+            The terminal that performed the count. Opaque string — a terminal's
+            device id is not a UUID, and the audit trail stores it as-is rather
+            than rejecting a legal identifier or minting a fake one.
+        audit_log_id:
+          $ref: '#/components/schemas/UuidV7'
+          description: |
+            The id the terminal minted for this claim while offline. It is the
+            primary key of both the audit row and the adjustment movement, so a
+            retry of the same claim is a no-op at both levels.
+      additionalProperties: false
+
+    StockAdjustmentResponse:
+      type: object
+      description: |
+        The outcome of a stock adjustment claim. `applied` is `true` when the
+        delta was written and `false` when the `audit_log_id` was already seen
+        — the latter is an idempotent retry, not an error.
+      required:
+        - audit_log_id
+        - applied
+        - delta_milli
+        - balance_after_milli
+      properties:
+        audit_log_id:
+          $ref: '#/components/schemas/UuidV7'
+        applied:
+          type: boolean
+          description: |
+            `true` when the delta was written to the ledger, `false` when the
+            audit id was already present and nothing changed.
+        delta_milli:
+          type: integer
+          format: int64
+          description: |
+            The quantity added to (positive) or removed from (negative) the
+            balance, in milli-units. Zero when `applied` is `false` on a retry.
+        balance_after_milli:
+          type: integer
+          format: int64
+          description: |
+            The balance after the adjustment, in milli-units. On a retry this
+            is the balance as it currently stands.
       additionalProperties: false
 
     InventoryBalancesResponse:
@@ -1976,4 +2244,113 @@ components:
         order_count:
           type: integer
           minimum: 0
+      additionalProperties: false
+
+    # ── Recipes (Phase 4.2) ───────────────────────────────────────────────────
+
+    Recipe:
+      type: object
+      description: |
+        A recipe that drives ingredient consumption for a product.
+        Each product may have at most one recipe; a recipe has one or more components.
+      required:
+        - id
+        - branch_id
+        - product_id
+        - is_active
+        - version
+        - updated_at
+      properties:
+        id:
+          $ref: '#/components/schemas/UuidV7'
+        branch_id:
+          $ref: '#/components/schemas/UuidV7'
+        product_id:
+          $ref: '#/components/schemas/UuidV7'
+        is_active:
+          type: boolean
+          description: Whether this recipe is currently used for ingredient deduction.
+        version:
+          $ref: '#/components/schemas/Version'
+        created_at:
+          type: string
+          format: date-time
+          description: RFC 3339, UTC.
+        updated_at:
+          type: string
+          format: date-time
+          description: RFC 3339, UTC. Doubles as the sync cursor for this row.
+      additionalProperties: false
+
+    RecipeComponent:
+      type: object
+      description: |
+        One ingredient in a recipe. The quantity is the amount consumed per unit
+        of the finished product (e.g., 0.018 kg of coffee beans per shot).
+      required:
+        - id
+        - recipe_id
+        - inventory_item_id
+        - quantity
+        - version
+        - updated_at
+      properties:
+        id:
+          $ref: '#/components/schemas/UuidV7'
+        recipe_id:
+          $ref: '#/components/schemas/UuidV7'
+        inventory_item_id:
+          $ref: '#/components/schemas/UuidV7'
+        quantity:
+          $ref: '#/components/schemas/Quantity'
+          description: |
+            Amount of this ingredient consumed per ONE unit of the finished product.
+            Exact decimal string, up to 3 decimal places. `0.018` means 18 milli-units.
+        version:
+          $ref: '#/components/schemas/Version'
+        created_at:
+          type: string
+          format: date-time
+          description: RFC 3339, UTC.
+        updated_at:
+          type: string
+          format: date-time
+          description: RFC 3339, UTC. Doubles as the sync cursor for this row.
+      additionalProperties: false
+
+    RecipesResponse:
+      type: object
+      description: |
+        A recipes snapshot plus the cursor needed to ask for the next delta.
+      required:
+        - branch_id
+        - recipes
+        - components
+        - cursor
+        - pulled_at
+      properties:
+        branch_id:
+          $ref: '#/components/schemas/UuidV7'
+        recipes:
+          type: array
+          items:
+            $ref: '#/components/schemas/Recipe'
+        components:
+          type: array
+          items:
+            $ref: '#/components/schemas/RecipeComponent'
+        cursor:
+          type: string
+          description: |
+            Sync cursor. Pass back as `since` to receive only what changed after
+            this snapshot. Equal to the `pulled_at` of this response.
+          example: '2026-10-02T09:15:00Z'
+        pulled_at:
+          type: string
+          format: date-time
+          description: Server time this snapshot was taken, RFC 3339 UTC.
+        next_cursor:
+          type: string
+          nullable: true
+          description: Pagination cursor when the response is partial. `null` when complete.
       additionalProperties: false

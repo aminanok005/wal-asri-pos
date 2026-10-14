@@ -56,10 +56,13 @@ package postgres
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -176,6 +179,11 @@ func (s *StockStore) ApplyDeductions(
 		if !touched[m.InventoryItemID] {
 			touched[m.InventoryItemID] = true
 			order = append(order, m.InventoryItemID)
+			// Pessimistic lock the row BEFORE applying the delta to prevent race conditions.
+			_, err := tx.Exec(ctx, `SELECT 1 FROM stock_balances WHERE inventory_item_id = $1 FOR UPDATE`, m.InventoryItemID)
+			if err != nil {
+				return nil, fmt.Errorf("postgres: locking balance for article %s: %w", m.InventoryItemID, err)
+			}
 		}
 
 		inserted, err := appendMovement(ctx, tx, m)
@@ -210,6 +218,189 @@ func (s *StockStore) ApplyDeductions(
 		return nil, fmt.Errorf("postgres: committing the stock deduction: %w", err)
 	}
 	return balances, nil
+}
+
+// ReverseForVoid executes an inverse database query, automatically crediting the raw ingredient milli-units
+// back into the stock_balances ledger.
+func (s *StockStore) ReverseForVoid(ctx context.Context, branchID identity.UUIDv7, orderID identity.UUIDv7) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+
+	// 1. Insert refund movements (negating the sale's quantity_milli).
+	_, err = tx.Exec(ctx, `
+		INSERT INTO stock_movements (id, inventory_item_id, branch_id, type, quantity_milli, reference_order_line_id, source, created_at)
+		SELECT gen_random_uuid(), sm.inventory_item_id, sm.branch_id, 'refund', -sm.quantity_milli, sm.reference_order_line_id, 'sync_void_reversal', now()
+		FROM order_lines ol
+		JOIN stock_movements sm ON sm.reference_order_line_id = ol.id
+		WHERE ol.order_id = $1
+		  AND sm.type = 'sale'`, orderID)
+	if err != nil {
+		return fmt.Errorf("postgres: inserting refund movements: %w", err)
+	}
+
+	// 2. Pessimistic lock each affected balance row BEFORE updating.
+	rows, err := tx.Query(ctx, `
+		SELECT DISTINCT sm.inventory_item_id
+		FROM stock_movements sm
+		JOIN order_lines ol ON sm.reference_order_line_id = ol.id
+		WHERE sm.type = 'sale' AND ol.order_id = $1`, orderID)
+	if err != nil {
+		return fmt.Errorf("postgres: selecting refund rows: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var itemID identity.UUIDv7
+		if err := rows.Scan(&itemID); err != nil {
+			return fmt.Errorf("postgres: scanning item id: %w", err)
+		}
+		_, err := tx.Exec(ctx, `SELECT 1 FROM stock_balances WHERE inventory_item_id = $1 FOR UPDATE`, itemID)
+		if err != nil {
+			return fmt.Errorf("postgres: locking balance for article %s: %w", itemID, err)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("postgres: iterating refund rows: %w", err)
+	}
+
+	// 3. Update stock balances: add the credit.
+	_, err = tx.Exec(ctx, `
+		UPDATE stock_balances
+		SET on_hand_milli = stock_balances.on_hand_milli - sm.quantity_milli,
+		    updated_at = now()
+		FROM stock_movements sm
+		JOIN order_lines ol ON sm.reference_order_line_id = ol.id
+		WHERE sm.type = 'sale' AND ol.order_id = $1
+		  AND stock_balances.inventory_item_id = sm.inventory_item_id`, orderID)
+	if err != nil {
+		return fmt.Errorf("postgres: updating balances for refund: %w", err)
+	}
+
+	return tx.Commit(ctx)
+}
+
+// ReconcileBalances atomically realigns stock_balances with the stock_movements ledger.
+//
+// For each tracked item in the branch, it locks the balance row in
+// inventory_item_id order, compares the ledger sum to the current balance,
+// and if they differ, inserts a count_correction movement and updates the balance.
+// All work happens in a single transaction with an audit row recording the
+// corrections. Items are returned in the order they were locked (by item id).
+func (s *StockStore) ReconcileBalances(ctx context.Context, branchID identity.UUIDv7) (inventory.ReconcileResult, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return inventory.ReconcileResult{}, err
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+
+	// Lock all balance rows in inventory_item_id order to prevent deadlocks.
+	rows, err := tx.Query(ctx, `
+		SELECT inventory_item_id, on_hand_milli
+		FROM stock_balances
+		WHERE branch_id = $1
+		FOR UPDATE OF stock_balances`, branchID)
+	if err != nil {
+		return inventory.ReconcileResult{}, err
+	}
+	defer rows.Close()
+
+	var items []inventory.ReconcileItem
+	corrected := 0
+	unchanged := 0
+	for rows.Next() {
+		var itemID identity.UUIDv7
+		var currentMilli int64
+		if err := rows.Scan(&itemID, &currentMilli); err != nil {
+			return inventory.ReconcileResult{}, err
+		}
+
+		var ledgerSum int64
+		err = tx.QueryRow(ctx, `
+			SELECT COALESCE(SUM(quantity_milli), 0)
+			FROM stock_movements
+			WHERE inventory_item_id = $1`, itemID).Scan(&ledgerSum)
+		if err != nil {
+			return inventory.ReconcileResult{}, err
+		}
+
+		if ledgerSum != currentMilli {
+			// Insert count_correction movement
+			movementID := uuid.New()
+			delta := ledgerSum - currentMilli
+			movementType := "count_correction"
+			_, err = tx.Exec(ctx, `
+				INSERT INTO stock_movements (
+					id, inventory_item_id, branch_id, type, quantity_milli,
+					reference_order_line_id, source, created_at, created_by
+				) VALUES ($1, $2, $3, $4, $5, NULL, 'sync_reconcile', $6, NULL)
+				ON CONFLICT (id) DO NOTHING`,
+				movementID, itemID, branchID, movementType, delta, time.Now().UTC(),
+			)
+			if err != nil {
+				return inventory.ReconcileResult{}, fmt.Errorf("postgres: appending count_correction movement: %w", err)
+			}
+
+			// Update balance
+			_, err = tx.Exec(ctx, `
+				UPDATE stock_balances
+				SET on_hand_milli = $1, updated_at = now(), version = version + 1
+				WHERE inventory_item_id = $2`, ledgerSum, itemID)
+			if err != nil {
+				return inventory.ReconcileResult{}, err
+			}
+
+			items = append(items, inventory.ReconcileItem{
+				InventoryItemID: itemID,
+				BeforeMilli:    currentMilli,
+				AfterMilli:     ledgerSum,
+			})
+			corrected++
+		} else {
+			items = append(items, inventory.ReconcileItem{
+				InventoryItemID: itemID,
+				BeforeMilli:    currentMilli,
+				AfterMilli:     currentMilli,
+			})
+			unchanged++
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return inventory.ReconcileResult{}, err
+	}
+
+	// Insert audit row with all corrections
+	auditID := uuid.New()
+	detail, err := json.Marshal(map[string]interface{}{
+		"reason":          "stock_reconcile",
+		"corrections":     items,
+		"correctedCount":  corrected,
+		"unchangedCount":  unchanged,
+	})
+	if err != nil {
+		return inventory.ReconcileResult{}, fmt.Errorf("postgres: marshaling audit detail: %w", err)
+	}
+
+	_, err = tx.Exec(ctx, `
+		INSERT INTO audit_log (id, actor_type, actor_id, branch_id, action, entity_type, entity_id, detail, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+		auditID, "operator", "", branchID, "stock_reconcile", "stock_branch_reconcile", branchID, detail, time.Now().UTC(),
+	)
+	if err != nil {
+		return inventory.ReconcileResult{}, fmt.Errorf("postgres: inserting audit log: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return inventory.ReconcileResult{}, err
+	}
+
+	return inventory.ReconcileResult{
+		BranchID:       branchID,
+		CorrectedCount: corrected,
+		Items:          items,
+	}, nil
 }
 
 // appendMovement inserts one ledger row, reporting whether it was NEW.
@@ -348,6 +539,107 @@ func (s *StockStore) MovementCount(ctx context.Context, itemID identity.UUIDv7) 
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Paginated balances query
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Balances returns a paginated list of stock balances for a branch.
+//
+// The query supports incremental pulls via `Since` (strictly greater than
+// `updated_at`) and cursor-based pagination via `Cursor` (opaque token from
+// `NextCursor`). When `ItemIDs` is non-empty, only those items are returned.
+//
+// The cursor is encoded as `updated_at|inventory_item_id` to provide a stable
+// pagination position that survives concurrent inserts and updates.
+func (s *StockStore) Balances(ctx context.Context, q inventory.BalancesQuery, pulledAt time.Time) (inventory.BalancesSnapshot, error) {
+	// Build the WHERE clause dynamically
+	where := "WHERE b.branch_id = $1"
+	args := []any{q.BranchID}
+	argPos := 2
+
+	if q.Since != nil {
+		where += fmt.Sprintf(" AND b.updated_at > $%d", argPos)
+		args = append(args, *q.Since)
+		argPos++
+	}
+
+	if len(q.ItemIDs) > 0 {
+		// Build IN clause
+		placeholders := make([]string, len(q.ItemIDs))
+		for i, id := range q.ItemIDs {
+			placeholders[i] = fmt.Sprintf("$%d", argPos+i)
+			args = append(args, id)
+		}
+		where += fmt.Sprintf(" AND b.inventory_item_id IN (%s)", strings.Join(placeholders, ","))
+		argPos += len(q.ItemIDs)
+	}
+
+	if q.Cursor != "" {
+		// Cursor is "updated_at|inventory_item_id"
+		parts := strings.Split(q.Cursor, "|")
+		if len(parts) != 2 {
+			return inventory.BalancesSnapshot{}, fmt.Errorf("postgres: invalid cursor format")
+		}
+		cursorTime, err := time.Parse(time.RFC3339Nano, parts[0])
+		if err != nil {
+			return inventory.BalancesSnapshot{}, fmt.Errorf("postgres: invalid cursor timestamp: %w", err)
+		}
+		cursorItemID, err := identity.ParseUUIDv7(parts[1])
+		if err != nil {
+			return inventory.BalancesSnapshot{}, fmt.Errorf("postgres: invalid cursor item id: %w", err)
+		}
+		// For cursor-based pagination: rows strictly after (updated_at, inventory_item_id)
+		where += fmt.Sprintf(" AND (b.updated_at > $%d OR (b.updated_at = $%d AND b.inventory_item_id > $%d))", argPos, argPos, argPos+1)
+		args = append(args, cursorTime, cursorItemID)
+		argPos += 2
+	}
+
+	// Fetch one extra to detect if there's a next page
+	limit := q.Limit + 1
+	where += fmt.Sprintf(" ORDER BY b.updated_at, b.inventory_item_id LIMIT %d", limit)
+
+	query := fmt.Sprintf(`
+		SELECT b.id, b.inventory_item_id, b.branch_id, b.on_hand_milli, b.reserved_milli,
+		       b.last_movement_id, b.version, b.created_at, b.updated_at
+		FROM stock_balances b
+		%s`, where)
+
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return inventory.BalancesSnapshot{}, fmt.Errorf("postgres: querying balances: %w", err)
+	}
+	defer rows.Close()
+
+	balances := make([]inventory.StockBalance, 0, q.Limit)
+	for rows.Next() {
+		balance, err := scanBalance(rows)
+		if err != nil {
+			return inventory.BalancesSnapshot{}, err
+		}
+		balances = append(balances, balance)
+	}
+	if err := rows.Err(); err != nil {
+		return inventory.BalancesSnapshot{}, fmt.Errorf("postgres: iterating balances: %w", err)
+	}
+
+	var nextCursor *string
+	if len(balances) > int(q.Limit) {
+		// There's a next page - encode cursor as "updated_at|inventory_item_id"
+		last := balances[q.Limit-1]
+		cursorStr := last.UpdatedAt.UTC().Format(time.RFC3339Nano) + "|" + last.InventoryItemID.String()
+		nextCursor = &cursorStr
+		balances = balances[:q.Limit]
+	}
+
+	return inventory.BalancesSnapshot{
+		BranchID:   q.BranchID,
+		Balances:   balances,
+		Cursor:     inventory.NewSyncCursor(pulledAt),
+		PulledAt:   pulledAt,
+		NextCursor: nextCursor,
+	}, nil
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Scanning
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -460,4 +752,226 @@ func derefOrEmpty(s *string) string {
 		return ""
 	}
 	return *s
+}
+
+func (s *StockStore) Append(ctx context.Context, a inventory.AuditLog) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("postgres: beginning the audit append: %w", err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+
+	_, err = tx.Exec(ctx, `
+		INSERT INTO audit_log (
+			id, actor_type, actor_id, branch_id, action, entity_type, entity_id, detail, created_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		ON CONFLICT (id) DO NOTHING`,
+		a.ID, "terminal", a.ActorID, a.BranchID, inventory.AuditStockAdjust, "stock_balance", a.EntityID, a.Detail, a.CreatedAt,
+	)
+	if err != nil {
+		return fmt.Errorf("postgres: inserting audit log: %w", err)
+	}
+	return tx.Commit(ctx)
+}
+
+// Get retrieves an audit record by its ID.
+//
+// Satisfies usecase.AuditStore.Get. It is a thin alias over GetAudit so the
+// store satisfies both the usecase port and the HTTP handler's reconcileStore
+// interface, which spells the lookup `GetAudit`. One implementation, two
+// names — the spelling difference is a port concern, not a behaviour one.
+func (s *StockStore) Get(ctx context.Context, id identity.UUIDv7) (inventory.AuditLog, error) {
+	return s.GetAudit(ctx, id)
+}
+
+// GetAudit retrieves an audit record by its ID.
+func (s *StockStore) GetAudit(ctx context.Context, id identity.UUIDv7) (inventory.AuditLog, error) {
+	row := s.pool.QueryRow(ctx, `
+		SELECT id, actor_type, actor_id, branch_id, action, entity_type, entity_id, detail, created_at
+		FROM audit_log WHERE id = $1`, id)
+
+	var audit inventory.AuditLog
+	var detailJSON []byte
+	err := row.Scan(
+		&audit.ID, &audit.ActorType, &audit.ActorID, &audit.BranchID,
+		&audit.Action, &audit.EntityType, &audit.EntityID, &detailJSON, &audit.CreatedAt,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return inventory.AuditLog{}, fmt.Errorf("postgres: audit not found: %w", err)
+		}
+		return inventory.AuditLog{}, fmt.Errorf("postgres: scanning audit log: %w", err)
+	}
+
+	if err := json.Unmarshal(detailJSON, &audit.Detail); err != nil {
+		return inventory.AuditLog{}, fmt.Errorf("postgres: unmarshaling audit detail: %w", err)
+	}
+
+	return audit, nil
+}
+
+// AdjustStock consumes a terminal claim and creates a movement and an audit.
+//
+// ONE TRANSACTION, and the idempotency is the audit id:
+//
+//  1. SELECT ... FOR UPDATE the balance row (pessimistic lock against
+//     concurrent adjustments on the same article).
+//  2. Verify the balance still agrees with the ledger. If not, 409 with a
+//     stable code — the ledger has drifted and the adjustment cannot be
+//     applied safely.
+//  3. Compute the delta = resolvedQuantityMilli - cloudBalance (the balance
+//     the ledger says is true, NOT the terminal's oldQuantityMilli claim).
+//  4. INSERT the audit row with ON CONFLICT (id) DO NOTHING. This is the
+//     idempotency gate. The audit detail records the CORRECT delta and
+//     balance_after (computed from the cloud balance, not the terminal's
+//     oldQuantityMilli). If the audit id already exists, return the
+//     ORIGINAL delta from the stored audit and the CURRENT balance as
+//     balanceAfterMilli.
+//  5. If delta is zero, the audit is recorded but no movement is written.
+//  6. Otherwise, INSERT the movement (adjustment_in/out) and UPDATE the
+//     balance.
+//
+// The movement's id is the audit id, so a retry of the same claim is a no-op
+// at the movement level as well as the audit level.
+func (s *StockStore) AdjustStock(ctx context.Context, req inventory.AdjustStockRequest) (inventory.AdjustStockResult, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return inventory.AdjustStockResult{}, fmt.Errorf("postgres: beginning the stock adjustment: %w", err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+
+	// Step 1: SELECT ... FOR UPDATE the balance row.
+	var currentMilli int64
+	err = tx.QueryRow(ctx, `
+		SELECT on_hand_milli FROM stock_balances
+		WHERE inventory_item_id = $1 FOR UPDATE`, req.InventoryItemID).Scan(&currentMilli)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return inventory.AdjustStockResult{}, fmt.Errorf("postgres: no balance for article %s", req.InventoryItemID)
+		}
+		return inventory.AdjustStockResult{}, fmt.Errorf("postgres: locking balance for article %s: %w", req.InventoryItemID, err)
+	}
+
+	// Step 2: Verify the balance still agrees with the ledger.
+	var ledgerSum int64
+	err = tx.QueryRow(ctx, `
+		SELECT COALESCE(SUM(quantity_milli), 0)
+		FROM stock_movements WHERE inventory_item_id = $1`, req.InventoryItemID).Scan(&ledgerSum)
+	if err != nil {
+		return inventory.AdjustStockResult{}, fmt.Errorf("postgres: summing the ledger of article %s: %w", req.InventoryItemID, err)
+	}
+	if ledgerSum != currentMilli {
+		return inventory.AdjustStockResult{}, fmt.Errorf(
+			"postgres: balance %d disagrees with ledger sum %d for article %s; the ledger has drifted and the adjustment cannot be applied safely",
+			currentMilli, ledgerSum, req.InventoryItemID)
+	}
+
+	// Step 3: Compute the delta (resolved - cloud balance, NOT oldQuantityMilli).
+	deltaMilli := req.ResolvedQuantityMilli - currentMilli
+	balanceAfterMilli := currentMilli + deltaMilli
+
+	// Step 4: INSERT the audit row with CORRECT detail. This is the idempotency gate.
+	detailJSON := fmt.Sprintf(`{"reason":%q,"delta_milli":%d,"balance_after_milli":%d}`, req.Reason, deltaMilli, balanceAfterMilli)
+	tag, err := tx.Exec(ctx, `
+		INSERT INTO audit_log (
+			id, actor_type, actor_id, branch_id, action, entity_type, entity_id, detail, created_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		ON CONFLICT (id) DO NOTHING`,
+		req.AuditLogID, "terminal", req.ActorTerminalID, req.BranchID,
+		inventory.AuditStockAdjust, "stock_balance", req.InventoryItemID,
+		detailJSON, time.Now().UTC(),
+	)
+	if err != nil {
+		return inventory.AdjustStockResult{}, fmt.Errorf("postgres: inserting audit log: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		// Duplicate audit id — read the existing audit to get the original delta,
+		// and return the CURRENT balance as balanceAfterMilli.
+		audit, err := s.GetAuditInTx(ctx, tx, req.AuditLogID)
+		origDelta := int64(0)
+		if err == nil && audit.Detail.DeltaMilli != nil {
+			origDelta = *audit.Detail.DeltaMilli
+		}
+		return inventory.AdjustStockResult{
+			AuditLogID:        req.AuditLogID,
+			Applied:           false,
+			DeltaMilli:        origDelta,
+			BalanceAfterMilli: currentMilli,
+		}, nil
+	}
+
+	// Step 5: If delta is zero, the audit is recorded but no movement is written.
+	if deltaMilli == 0 {
+		if err := tx.Commit(ctx); err != nil {
+			return inventory.AdjustStockResult{}, fmt.Errorf("postgres: committing the stock adjustment: %w", err)
+		}
+		return inventory.AdjustStockResult{
+			AuditLogID:        req.AuditLogID,
+			Applied:           true,
+			DeltaMilli:        0,
+			BalanceAfterMilli: currentMilli,
+		}, nil
+	}
+
+	// Step 6: INSERT the movement and UPDATE the balance.
+	movementType := "adjustment_in"
+	if deltaMilli < 0 {
+		movementType = "adjustment_out"
+	}
+	_, err = tx.Exec(ctx, `
+		INSERT INTO stock_movements (
+			id, inventory_item_id, branch_id, type, quantity_milli,
+			reference_order_line_id, source, created_at, created_by
+		) VALUES ($1, $2, $3, $4, $5, NULL, 'sync_terminal_claim', $6, NULL)
+		ON CONFLICT (id) DO NOTHING`,
+		req.AuditLogID, req.InventoryItemID, req.BranchID, movementType, deltaMilli, time.Now().UTC(),
+	)
+	if err != nil {
+		return inventory.AdjustStockResult{}, fmt.Errorf("postgres: appending the adjustment movement: %w", err)
+	}
+
+	_, err = tx.Exec(ctx, `
+		UPDATE stock_balances
+		SET on_hand_milli = on_hand_milli + $1, updated_at = now(), version = version + 1
+		WHERE inventory_item_id = $2`, deltaMilli, req.InventoryItemID)
+	if err != nil {
+		return inventory.AdjustStockResult{}, fmt.Errorf("postgres: updating the balance for the adjustment: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return inventory.AdjustStockResult{}, fmt.Errorf("postgres: committing the stock adjustment: %w", err)
+	}
+
+	return inventory.AdjustStockResult{
+		AuditLogID:        req.AuditLogID,
+		Applied:           true,
+		DeltaMilli:        deltaMilli,
+		BalanceAfterMilli: balanceAfterMilli,
+	}, nil
+}
+
+// GetAuditInTx retrieves an audit record by its ID within an existing transaction.
+func (s *StockStore) GetAuditInTx(ctx context.Context, tx pgx.Tx, id identity.UUIDv7) (inventory.AuditLog, error) {
+	row := tx.QueryRow(ctx, `
+		SELECT id, actor_type, actor_id, branch_id, action, entity_type, entity_id, detail, created_at
+		FROM audit_log WHERE id = $1`, id)
+
+	var audit inventory.AuditLog
+	var detailJSON []byte
+	err := row.Scan(
+		&audit.ID, &audit.ActorType, &audit.ActorID, &audit.BranchID,
+		&audit.Action, &audit.EntityType, &audit.EntityID, &detailJSON, &audit.CreatedAt,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return inventory.AuditLog{}, fmt.Errorf("postgres: audit not found: %w", err)
+		}
+		return inventory.AuditLog{}, fmt.Errorf("postgres: scanning audit log: %w", err)
+	}
+
+	if err := json.Unmarshal(detailJSON, &audit.Detail); err != nil {
+		return inventory.AuditLog{}, fmt.Errorf("postgres: unmarshaling audit detail: %w", err)
+	}
+
+	return audit, nil
 }

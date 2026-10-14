@@ -41,9 +41,6 @@ func (f *fakeOrders) Append(_ context.Context, o order.Order) error {
 	if f.err != nil {
 		return f.err
 	}
-	// Mirror the repository contract: refuse a second write of the same id rather
-	// than overwrite, because the id is a client-generated UUIDv7 and the order is
-	// a record of a sale that happened.
 	for _, existing := range f.appended {
 		if existing.ID.Compare(o.ID) == 0 {
 			return fmt.Errorf("order %s already exists; append-only", o.ID)
@@ -51,6 +48,25 @@ func (f *fakeOrders) Append(_ context.Context, o order.Order) error {
 	}
 	f.appended = append(f.appended, o)
 	return nil
+}
+
+func (f *fakeOrders) Get(_ context.Context, id identity.UUIDv7) (order.Order, error) {
+	for _, o := range f.appended {
+		if o.ID.Compare(id) == 0 {
+			return o, nil
+		}
+	}
+	return order.Order{}, fmt.Errorf("order %s not found", id)
+}
+
+func (f *fakeOrders) UpdateStatus(_ context.Context, id identity.UUIDv7, _, to order.OrderStatus, _ time.Time) error {
+	for i, o := range f.appended {
+		if o.ID.Compare(id) == 0 {
+			f.appended[i].Status = to
+			return nil
+		}
+	}
+	return fmt.Errorf("order %s not found", id)
 }
 
 type fakeRates struct {
@@ -128,6 +144,10 @@ func (f *fakeStock) DeductForSale(_ context.Context, sale SaleStock) ([]StockWar
 		return nil, f.err
 	}
 	return f.warnings, nil
+}
+
+func (f *fakeStock) ReverseForVoid(_ context.Context, _ SaleStock) error {
+	return f.err
 }
 
 var _ StockLedger = (*fakeStock)(nil)
@@ -558,6 +578,10 @@ func (s *orderingStock) DeductForSale(ctx context.Context, sale SaleStock) ([]St
 		s.onDeduct()
 	}
 	return s.inner.DeductForSale(ctx, sale)
+}
+
+func (s *orderingStock) ReverseForVoid(ctx context.Context, sale SaleStock) error {
+	return s.inner.ReverseForVoid(ctx, sale)
 }
 
 // TestIngestOrder_AFailedDeductionFailsTheSubmission is the promise this whole

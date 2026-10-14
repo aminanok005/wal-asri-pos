@@ -118,6 +118,26 @@ func (s *fakeStore) ApplyDeductions(_ context.Context, deductions []inventory.De
 // balanceOf reads the fake's current figure for an article.
 func (s *fakeStore) balanceOf(itemID identity.UUIDv7) int64 { return s.byItem[itemID] }
 
+// ReverseForVoid is a no-op for the fake store.
+func (s *fakeStore) ReverseForVoid(ctx context.Context, branchID identity.UUIDv7, orderID identity.UUIDv7) error {
+	return nil
+}
+
+// AdjustStock is a no-op for the fake store.
+func (s *fakeStore) AdjustStock(_ context.Context, req inventory.AdjustStockRequest) (inventory.AdjustStockResult, error) {
+	return inventory.AdjustStockResult{AuditLogID: req.AuditLogID, Applied: true}, nil
+}
+
+// ReconcileBalances is a no-op for the fake store.
+func (s *fakeStore) ReconcileBalances(_ context.Context, branchID identity.UUIDv7) (inventory.ReconcileResult, error) {
+	return inventory.ReconcileResult{BranchID: branchID, CorrectedCount: 0, Items: []inventory.ReconcileItem{}}, nil
+}
+
+// GetAudit retrieves an audit record by its ID (fake implementation).
+func (s *fakeStore) GetAudit(_ context.Context, id identity.UUIDv7) (inventory.AuditLog, error) {
+	return inventory.AuditLog{}, fmt.Errorf("fake: audit not found")
+}
+
 var _ ItemLookup = (*fakeItems)(nil)
 var _ StockStore = (*fakeStore)(nil)
 

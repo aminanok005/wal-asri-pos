@@ -213,8 +213,8 @@ func TestPushSync_AcceptsAnOfflineOrderAndAcknowledgesIt(t *testing.T) {
 	}
 
 	// The re-priced figures are the SERVER's, and they must be the ones stored.
-	stored, ok := w.orders.Get(mustUUID(orderID(1)))
-	if !ok {
+	stored, err := w.orders.Get(context.Background(), mustUUID(orderID(1)))
+	if err != nil {
 		t.Fatal("the order was not stored under its client-generated id")
 	}
 	if stored.Totals.TaxSatang() != 298 {
@@ -431,8 +431,8 @@ func TestPushSync_AcceptsNegativeCashRounding(t *testing.T) {
 		t.Fatalf("applied=%d rejected=%d, want 1/0 — rounding down must be acknowledged", applied, rejected)
 	}
 
-	stored, ok := w.orders.Get(mustUUID(orderID(1)))
-	if !ok {
+	stored, err := w.orders.Get(context.Background(), mustUUID(orderID(1)))
+	if err != nil {
 		t.Fatal("the order was not stored")
 	}
 	if stored.Totals.RoundingAdjustmentSatang != -3 {

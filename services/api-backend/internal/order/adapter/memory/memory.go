@@ -100,11 +100,37 @@ func (o *Orders) Appends() int {
 }
 
 // Get returns one stored order.
-func (o *Orders) Get(id identity.UUIDv7) (order.Order, bool) {
+func (o *Orders) Get(_ context.Context, id identity.UUIDv7) (order.Order, error) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o2, ok := o.byID[id]
-	return o2, ok
+	if !ok {
+		return order.Order{}, fmt.Errorf("memory: order %s not found", id)
+	}
+	return o2, nil
+}
+
+// UpdateStatus transitions one stored order's status, enforcing the FROM state.
+//
+// The `from` parameter is the caller's expectation, and a mismatch is an error
+// rather than a silent no-op: the ingest pipeline passes the status it just
+// read, so a mismatch here means two workers are racing to void the same order
+// and the second one must not clobber the first.
+func (o *Orders) UpdateStatus(_ context.Context, id identity.UUIDv7, from, to order.OrderStatus, _ time.Time) error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	x, ok := o.byID[id]
+	if !ok {
+		return fmt.Errorf("memory: no order %s found", id)
+	}
+	if x.Status != from {
+		return fmt.Errorf("memory: order %s has status %s, not %s", id, x.Status, from)
+	}
+
+	x.Status = to
+	o.byID[id] = x
+	return nil
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -388,7 +414,7 @@ func (s *Stock) Calls() int {
 // DEDUCTS NOTHING when the sale has no lines, and opens no work when every line has
 // already been consumed — matching the real adapter's shape, so a test that passes
 // here is exercising the same call pattern the driver will.
-func (s *Stock) DeductForSale(_ context.Context, sale orderuc.SaleStock) ([]orderuc.StockWarning, error) {
+func (s *Stock) DeductForSale(ctx context.Context, sale orderuc.SaleStock) ([]orderuc.StockWarning, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -403,7 +429,31 @@ func (s *Stock) DeductForSale(_ context.Context, sale orderuc.SaleStock) ([]orde
 			continue
 		}
 		s.deductedLines[line.OrderLineID] = true
+		s.byItem[line.ProductVariantID] -= line.Quantity.Milli()
+		if s.byItem[line.ProductVariantID] < 0 {
+			s.warnings = append(s.warnings, orderuc.StockWarning{InventoryItemID: line.ProductVariantID, OnHandMilli: s.byItem[line.ProductVariantID]})
+		}
 	}
 
 	return append([]orderuc.StockWarning(nil), s.warnings...), nil
+}
+
+// ReverseForVoid credits stock back for an order being voided.
+//
+// The reversal is NOT idempotent on the order line id the way DeductForSale is,
+// because a void is a deliberate operator action that the terminal sends once
+// with its own idempotency key — the ingest pipeline's idempotency store covers
+// it. The movement itself has no primary key here; the real ledger keys it on
+// (order_id, direction) so a retry of the void command is a no-op at the store.
+func (s *Stock) ReverseForVoid(ctx context.Context, sale orderuc.SaleStock) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.failWith != nil {
+		return s.failWith
+	}
+
+	for _, l := range sale.Lines {
+		s.byItem[l.ProductVariantID] += l.Quantity.Milli()
+	}
+	return nil
 }

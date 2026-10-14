@@ -104,6 +104,53 @@ type StockStore interface {
 	// deduction idempotent per order line, and it is why the adapter can be retried
 	// safely after a lost connection.
 	ApplyDeductions(ctx context.Context, deductions []inventory.Deduction) ([]inventory.StockBalance, error)
+	// ReverseForVoid credits stock back for an entire order.
+	ReverseForVoid(ctx context.Context, branchID identity.UUIDv7, orderID identity.UUIDv7) error
+	// ReconcileBalances atomically realigns stock_balances with the stock_movements ledger.
+	// Returns the per-article corrections and the total count of corrected items.
+	ReconcileBalances(ctx context.Context, branchID identity.UUIDv7) (inventory.ReconcileResult, error)
+	// AdjustStock consumes a terminal claim and creates a movement and an audit.
+	AdjustStock(ctx context.Context, req inventory.AdjustStockRequest) (inventory.AdjustStockResult, error)
+}
+
+// AuditStore persists audit rows, and the ONLY way to create one.
+//
+// Append-only by trigger, and audit rows never change a balance — they are a
+// side-effect record of an action, not the balance itself. Because the audit
+// row and the movement are written in ONE transaction, the correlation is
+// enforced by the application rather than a foreign key.
+type AuditStore interface {
+	// Append creates a new audit record.
+	Append(ctx context.Context, a inventory.AuditLog) error
+	// Get retrieves an audit record by its ID.
+	Get(ctx context.Context, id identity.UUIDv7) (inventory.AuditLog, error)
+}
+
+// RecipeLookup resolves a sold product variant to its recipe components.
+//
+// It is a READ-ONLY port, separate from ItemLookup, so a sale that has no
+// recipe is a normal skip rather than an error. The recipe module implements
+// this port over the recipes and recipe_components tables.
+type RecipeLookup interface {
+	// RecipeComponentsFor returns the active recipe components for a sold
+	// product variant, or (nil, false) if the variant has no active recipe.
+	//
+	// The boolean is false when NO recipe deduction applies, which is a NORMAL
+	// case (most products have no recipe).
+	//
+	// An error is reserved for the store genuinely being unavailable.
+	RecipeComponentsFor(ctx context.Context, branchID, productVariantID identity.UUIDv7) ([]RecipeComponent, bool, error)
+}
+
+// RecipeComponent is one ingredient in a recipe, in this module's vocabulary.
+//
+// It carries only what the deduction needs: the target inventory item and the
+// quantity per finished unit. The arithmetic (quantity_sold * qty_per_unit)
+// happens in domain.NewSaleDeduction via the recipe domain's DeductionForSale
+// — this module just builds the inventory deductions from the recipe components.
+type RecipeComponent struct {
+	InventoryItemID identity.UUIDv7
+	QuantityMilli   money.Quantity
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -177,16 +224,18 @@ func (w StockWarning) Oversold() bool { return w.OnHandMilli < 0 }
 
 // DeductSale consumes stock for an accepted sale.
 type DeductSale struct {
-	items ItemLookup
-	store StockStore
-	now   func() time.Time
+	items   ItemLookup
+	recipes RecipeLookup
+	store   StockStore
+	now     func() time.Time
 }
 
 // DeductSaleDeps is the constructor's argument bundle, so adding a port does not
 // change every call site's arity.
 type DeductSaleDeps struct {
-	Items ItemLookup
-	Store StockStore
+	Items   ItemLookup
+	Recipes RecipeLookup
+	Store   StockStore
 	// Now is injected rather than called, so a movement's created_at is
 	// reproducible in a test. Every other interactor in this service takes its
 	// clock the same way, and for the same reason: an assertion that has to
@@ -200,7 +249,7 @@ func NewDeductSale(d DeductSaleDeps) *DeductSale {
 	if nowFn == nil {
 		nowFn = time.Now
 	}
-	return &DeductSale{items: d.Items, store: d.Store, now: nowFn}
+	return &DeductSale{items: d.Items, recipes: d.Recipes, store: d.Store, now: nowFn}
 }
 
 // Execute consumes stock for one sale and reports any shortage.
@@ -211,8 +260,11 @@ func NewDeductSale(d DeductSaleDeps) *DeductSale {
 //     nothing. All of this is a READ, so doing it first means a sale with no
 //     tracked lines never opens a write transaction at all.
 //
-//  2. BUILD the deductions. domain.NewSaleDeduction owns the sign, and it
-//     validates as it builds — a malformed line fails here, before any write.
+//  2. BUILD the deductions. domain.NewSaleDeduction owns the sign for direct
+//     sales. For recipe components, the arithmetic is quantity_sold *
+//     qty_per_unit, with the sign convention (negative = consumption) applied
+//     here. Both validate as they build — a malformed line fails here, before
+//     any write.
 //
 //  3. APPLY them all, in ONE transaction.
 //
@@ -246,7 +298,7 @@ func NewDeductSale(d DeductSaleDeps) *DeductSale {
 func (d *DeductSale) Execute(ctx context.Context, req SaleRequest) ([]StockWarning, error) {
 	now := d.now().UTC()
 
-	// ── Step 1: resolve, then skip ───────────────────────────────────────────
+	// ── Step 1: resolve direct sale items, then skip ───────────────────────────
 	items := make([]inventory.InventoryItem, 0, len(req.Lines))
 	for i, line := range req.Lines {
 		item, tracked, err := d.items.TrackedItemFor(ctx, req.BranchID, line.ProductVariantID)
@@ -274,7 +326,32 @@ func (d *DeductSale) Execute(ctx context.Context, req SaleRequest) ([]StockWarni
 		items = append(items, item)
 	}
 
-	// ── Step 2: build, validating as we go ────────────────────────────────────
+	// ── Step 1b: resolve recipe components for each line ───────────────────────
+	//
+	// This is a separate read so a missing recipe is a normal skip, not an error.
+	// The recipe lookup is optional — if the port is nil, we simply don't do
+	// recipe deductions (backward compatible).
+	var recipeComponents []recipeComponentsForLine
+	if d.recipes != nil {
+		for i, line := range req.Lines {
+			comps, hasRecipe, err := d.recipes.RecipeComponentsFor(ctx, req.BranchID, line.ProductVariantID)
+			if err != nil {
+				return nil, fmt.Errorf(
+					"inventory: resolving recipe for line %d (variant %s): %w",
+					i, line.ProductVariantID, err)
+			}
+			if hasRecipe && len(comps) > 0 {
+				recipeComponents = append(recipeComponents, recipeComponentsForLine{
+					LineIndex:    i,
+					OrderLineID:  line.OrderLineID,
+					Quantity:     line.Quantity,
+					Components:   comps,
+				})
+			}
+		}
+	}
+
+	// ── Step 2: build direct sale deductions ────────────────────────────────────
 	deductions := make([]inventory.Deduction, 0, len(req.Lines))
 	for i, line := range req.Lines {
 		item, ok := itemForVariant(items, line.ProductVariantID)
@@ -288,12 +365,52 @@ func (d *DeductSale) Execute(ctx context.Context, req SaleRequest) ([]StockWarni
 		deductions = append(deductions, deduction)
 	}
 
+	// ── Step 2b: build recipe deductions ───────────────────────────────────────
+	//
+	// For each recipe component: deduction = quantity_sold * qty_per_unit (milli-units)
+	// The sign is negative (consumption). The movement id is the order line's id,
+	// same as a direct sale — this makes recipe deductions idempotent per order line.
+	for _, rc := range recipeComponents {
+		for _, comp := range rc.Components {
+			// Multiply: quantity_sold (milli-units) * qty_per_unit (milli-units) / 1000
+			// Both are scaled by 1000, so product is scaled by 1,000,000.
+			// Divide by 1000 to get back to milli-units.
+			totalMilli := (comp.QuantityMilli.Milli() * rc.Quantity.Milli()) / 1000
+			if totalMilli <= 0 {
+				continue
+			}
+			if totalMilli > 999999999999 {
+				return nil, fmt.Errorf(
+					"inventory: recipe deduction %d milli-units exceeds decimal(12,3)", totalMilli)
+			}
+
+			consumed, err := money.NewQuantityFromMilli(-totalMilli)
+			if err != nil {
+				return nil, fmt.Errorf("inventory: building recipe deduction: %w", err)
+			}
+
+			deduction := inventory.Deduction{
+				Movement: inventory.StockMovement{
+					ID:                   rc.OrderLineID,
+					InventoryItemID:      comp.InventoryItemID,
+					BranchID:             req.BranchID,
+					Type:                 inventory.MovementSale,
+					QuantityMilli:        consumed,
+					ReferenceOrderLineID: &rc.OrderLineID,
+					Source:               "sync_ingest_recipe",
+					CreatedAt:            now,
+				},
+			}
+			deductions = append(deductions, deduction)
+		}
+	}
+
 	// ── Step 3: one transaction, all of it ────────────────────────────────────
 	//
-	// An order whose every line is untracked never opens a transaction. That is
-	// not an optimisation — it is the difference between "there was nothing to
-	// deduct" and "we wrote something and it happened to change nothing", and
-	// only the first is true.
+	// An order whose every line is untracked and has no recipe never opens a
+	// transaction. That is not an optimisation — it is the difference between
+	// "there was nothing to deduct" and "we wrote something and it happened to
+	// change nothing", and only the first is true.
 	if len(deductions) == 0 {
 		return nil, nil
 	}
@@ -304,8 +421,21 @@ func (d *DeductSale) Execute(ctx context.Context, req SaleRequest) ([]StockWarni
 			len(deductions), req.BranchID, err)
 	}
 
-	// ── Step 4: warn, from what was stored ────────────────────────────────────
+	// Step 4: warn, from what was stored
 	return warningsFrom(items, committed), nil
+}
+
+// ReverseForVoid credits stock back for a voided order.
+func (d *DeductSale) ReverseForVoid(ctx context.Context, branchID identity.UUIDv7, orderID identity.UUIDv7) error {
+	return d.store.ReverseForVoid(ctx, branchID, orderID)
+}
+
+// recipeComponentsForLine holds the resolved recipe components for one order line.
+type recipeComponentsForLine struct {
+	LineIndex   int
+	OrderLineID identity.UUIDv7
+	Quantity    Quantity
+	Components  []RecipeComponent
 }
 
 // itemForVariant finds the resolved article for a sold variant.

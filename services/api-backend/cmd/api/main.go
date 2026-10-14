@@ -55,6 +55,7 @@ import (
 	cataloguc "wal-asri-pos/services/api-backend/internal/catalog/usecase"
 	identity "wal-asri-pos/services/api-backend/internal/identity/domain"
 	inventorypostgres "wal-asri-pos/services/api-backend/internal/inventory/adapter/postgres"
+	inventoryhttp "wal-asri-pos/services/api-backend/internal/inventory/adapter/http"
 	inventoryuc "wal-asri-pos/services/api-backend/internal/inventory/usecase"
 	money "wal-asri-pos/services/api-backend/internal/money/domain"
 	orderhttp "wal-asri-pos/services/api-backend/internal/order/adapter/http"
@@ -62,6 +63,9 @@ import (
 	postgres "wal-asri-pos/services/api-backend/internal/order/adapter/postgres"
 	order "wal-asri-pos/services/api-backend/internal/order/domain"
 	orderuc "wal-asri-pos/services/api-backend/internal/order/usecase"
+	recipepostgres "wal-asri-pos/services/api-backend/internal/recipe/adapter/postgres"
+	recipehttp "wal-asri-pos/services/api-backend/internal/recipe/adapter/http"
+	recipeuc "wal-asri-pos/services/api-backend/internal/recipe/usecase"
 	syncorder "wal-asri-pos/services/api-backend/internal/sync/adapter/order"
 	syncdomain "wal-asri-pos/services/api-backend/internal/sync/domain"
 	syncuc "wal-asri-pos/services/api-backend/internal/sync/usecase"
@@ -134,6 +138,48 @@ func run() error {
 	}
 	if closePersistence != nil {
 		defer closePersistence()
+	}
+
+	// ── inventory ──────────────────────────────────────────────────────────────
+	//
+	// Stock balances are read-only and served directly from the StockStore adapter.
+	// When DATABASE_URL is set, the real Postgres store is used. When unset, the
+	// endpoint returns 503 with a stable error code — a terminal receiving it
+	// keeps its cache stale and retries, rather than serving empty counts.
+	if pool != nil {
+		stockStore := inventorypostgres.NewStockStore(pool)
+		adjust := inventoryuc.NewAdjustStock(inventoryuc.AdjustStockDeps{
+			ItemLookup: stockStore,
+			AuditStore: stockStore,
+			StockStore: stockStore,
+			Now:        clock,
+		})
+		reconcile := inventoryuc.NewReconcileStock(inventoryuc.ReconcileStockDeps{
+			StockStore: stockStore,
+			Now:        clock,
+		})
+		inventoryhttp.NewHandler(adjust, reconcile, stockStore, clock).Route(mux)
+	} else {
+		// Refuse to serve an empty balance snapshot. An empty 200 would make a
+		// terminal cache zero stock for everything, which is worse than an error.
+		refusal := inventoryhttp.NewHandler(nil, nil, nil, clock)
+		refusal.Route(mux)
+	}
+
+	// ── recipes ──────────────────────────────────────────────────────────────
+	//
+	// Recipes and their components are read-only and served from the RecipeStore.
+	if pool != nil {
+		recipeStore := recipepostgres.NewRecipeStore(pool)
+		getRecipes := recipeuc.NewGetRecipes(recipeuc.GetRecipesDeps{
+			Reader: recipeStore,
+			Now:    clock,
+		})
+		recipehttp.NewHandler(getRecipes, clock).Route(mux)
+	} else {
+		// Return 503 with stable error code.
+		refusal := recipehttp.NewHandler(nil, clock)
+		refusal.Route(mux)
 	}
 
 	drain := syncuc.NewDrainOutbox(syncuc.DrainDeps{
@@ -301,11 +347,13 @@ func buildPersistence(
 	store := postgres.NewIdempotencyStore(pool)
 
 	stockStore := inventorypostgres.NewStockStore(pool)
+	recipeStore := recipepostgres.NewRecipeStore(pool)
 	logger.Info("the sync endpoint is wired to Postgres",
 		"schema", "applied from the embedded db/migrations at startup",
 		"driver", "github.com/jackc/pgx/v5",
 		"stock", "quantities are BIGINT milli-units; a negative balance commits and is reported "+
-			"as a warning rather than refused")
+			"as a warning rather than refused",
+		"recipes", "recipe deductions enabled for tracked ingredients")
 
 	ingest := orderuc.NewIngestOrder(orderuc.IngestOrderDeps{
 		Orders: postgres.NewOrderRepository(pool),
@@ -313,9 +361,10 @@ func buildPersistence(
 		Idem:   store,
 		Outbox: postgres.NewOutboxLedger(pool),
 		Stock: orderinventory.NewStockLedger(inventoryuc.NewDeductSale(inventoryuc.DeductSaleDeps{
-			Items: stockStore,
-			Store: stockStore,
-			Now:   clock,
+			Items:   stockStore,
+			Recipes: recipeStore,
+			Store:   stockStore,
+			Now:     clock,
 		})),
 		Now: clock,
 	})
@@ -372,6 +421,12 @@ func wireReporting(mux *http.ServeMux, pool *pgxpool.Pool, now func() time.Time,
 type unwiredOrderRepository struct{}
 
 func (unwiredOrderRepository) Append(context.Context, order.Order) error { return errUnwired }
+func (unwiredOrderRepository) Get(context.Context, identity.UUIDv7) (order.Order, error) {
+	return order.Order{}, errUnwired
+}
+func (unwiredOrderRepository) UpdateStatus(context.Context, identity.UUIDv7, order.OrderStatus, order.OrderStatus, time.Time) error {
+	return errUnwired
+}
 
 type unwiredBranchRates struct{}
 
@@ -421,6 +476,9 @@ type unwiredStockLedger struct{}
 
 func (unwiredStockLedger) DeductForSale(context.Context, orderuc.SaleStock) ([]orderuc.StockWarning, error) {
 	return nil, errUnwired
+}
+func (unwiredStockLedger) ReverseForVoid(context.Context, orderuc.SaleStock) error {
+	return errUnwired
 }
 
 var (

@@ -26,6 +26,7 @@ import (
 	"time"
 
 	identity "wal-asri-pos/services/api-backend/internal/identity/domain"
+	inventoryuc "wal-asri-pos/services/api-backend/internal/inventory/usecase"
 	money "wal-asri-pos/services/api-backend/internal/money/domain"
 	order "wal-asri-pos/services/api-backend/internal/order/domain"
 	sync "wal-asri-pos/services/api-backend/internal/sync/domain"
@@ -38,10 +39,9 @@ import (
 // OrderRepository stores orders. Append-only: there is no Update that rewrites
 // what was sold, and no Delete.
 type OrderRepository interface {
-	// Append stores a NEW order. An implementation MUST refuse a second write of
-	// the same id rather than overwrite, because the primary key is a
-	// client-generated UUIDv7 and the order is a record of a sale that happened.
 	Append(ctx context.Context, o order.Order) error
+	Get(ctx context.Context, id identity.UUIDv7) (order.Order, error)
+	UpdateStatus(ctx context.Context, id identity.UUIDv7, from, to order.OrderStatus, at time.Time) error
 }
 
 // BranchRateSource supplies the branch's VAT rate and currency.
@@ -113,19 +113,25 @@ type OutboxLedger interface {
 type StockLedger interface {
 	// DeductForSale consumes stock for every tracked line of an accepted order and
 	// returns a warning per article that went below zero.
-	//
-	// It NEVER refuses a sale for insufficient stock. An offline terminal can sell
-	// the last of an article before anybody knew there was none; by the time the
-	// batch syncs the shortage has already happened, the customer has paid and the
-	// receipt is printed. The deduction COMMITS the negative balance and reports it,
-	// which is the ratified policy — see the inventory domain's package header and
-	// ARCHITECTURE-DEMO.md §9.
-	//
-	// An ERROR means the stock could not be recorded at all, which is different and
-	// must not be confused with a shortage: the caller fails the submission so the
-	// terminal retries, rather than acknowledging a sale whose stock was never
-	// written.
 	DeductForSale(ctx context.Context, sale SaleStock) ([]StockWarning, error)
+	// ReverseForVoid credits stock back for an order being voided.
+	ReverseForVoid(ctx context.Context, sale SaleStock) error
+}
+
+// RecipeLookup resolves a sold product variant to its recipe components.
+//
+// It is a READ-ONLY port, separate from ItemLookup, so a sale that has no
+// recipe is a normal skip rather than an error. The recipe module implements
+// this port over the recipes and recipe_components tables.
+type RecipeLookup interface {
+	// RecipeComponentsFor returns the active recipe components for a sold
+	// product variant, or (nil, false) if the variant has no active recipe.
+	//
+	// The boolean is false when NO recipe deduction applies, which is a NORMAL
+	// case (most products have no recipe).
+	//
+	// An error is reserved for the store genuinely being unavailable.
+	RecipeComponentsFor(ctx context.Context, branchID, productVariantID identity.UUIDv7) ([]inventoryuc.RecipeComponent, bool, error)
 }
 
 // SaleStock is one accepted order's worth of stock to consume, in this module's
@@ -238,13 +244,12 @@ type IngestRequest struct {
 
 // IngestOrder accepts an offline order and makes it authoritative.
 type IngestOrder struct {
-	orders OrderRepository
-	rates  BranchRateSource
-	idem   IdempotencyStore
-	outbox OutboxLedger
-	// stock consumes stock for the sale. REQUIRED, not optional — see the note at
-	// StockLedger on why a nil port here would be worse than a compile error.
+	orders  OrderRepository
+	rates   BranchRateSource
+	idem    IdempotencyStore
+	outbox  OutboxLedger
 	stock   StockLedger
+	recipes RecipeLookup
 	now     func() time.Time
 	idemTTL time.Duration
 }
@@ -252,22 +257,12 @@ type IngestOrder struct {
 // IngestOrderDeps is the constructor's argument bundle, so adding a port does not
 // change every call site's arity.
 type IngestOrderDeps struct {
-	Orders OrderRepository
-	Rates  BranchRateSource
-	Idem   IdempotencyStore
-	Outbox OutboxLedger
-	// Stock consumes stock for the sale.
-	//
-	// NOT OPTIONAL. An interactor built without one would acknowledge orders whose
-	// stock was never deducted, and nothing downstream would notice — the sale
-	// would look perfectly recorded while the shelves silently drifted. The failure
-	// this module exists to prevent is a sale that is real but incomplete, and an
-	// optional port is precisely how that happens.
-	//
-	// A deployment that genuinely cannot deduct stock wires a REFUSING ledger (see
-	// cmd/api/main.go's unwiredStockLedger), which fails the ingest loudly and
-	// leaves the terminal retrying. That is the safe failure; a silent skip is not.
+	Orders  OrderRepository
+	Rates   BranchRateSource
+	Idem    IdempotencyStore
+	Outbox  OutboxLedger
 	Stock   StockLedger
+	Recipes RecipeLookup
 	Now     func() time.Time
 	IdemTTL time.Duration
 }
@@ -288,6 +283,7 @@ func NewIngestOrder(d IngestOrderDeps) *IngestOrder {
 		idem:    d.Idem,
 		outbox:  d.Outbox,
 		stock:   d.Stock,
+		recipes: d.Recipes,
 		now:     nowFn,
 		idemTTL: ttl,
 	}
@@ -375,9 +371,6 @@ func (i *IngestOrder) Execute(ctx context.Context, req IngestRequest) (Result, e
 	}
 	switch sync.Decide(key, prior, now) {
 	case sync.DecisionReplay:
-		// Return the ORIGINAL response. Not a recomputed one: pricing depends on
-		// the VAT rate at the moment of the original sale, so replaying the maths
-		// today could return a different total for an order already charged.
 		return Result{
 			OrderID:  prior.EntityID,
 			State:    prior.State,
@@ -385,9 +378,14 @@ func (i *IngestOrder) Execute(ctx context.Context, req IngestRequest) (Result, e
 		}, ErrDuplicateSubmission
 
 	case sync.DecisionProceedAfterExpiry:
-		// The prior record is older than the window and protects against nothing.
-		// Proceed and let Save replace it. Not an error: refusing here would reject
-		// a genuine new sale because a key was reused long ago.
+	}
+
+	// ── VOID INGEST ───────────────────────────────────────────────────────────
+	//
+	// Handle void requests and approvals. If the payload carries StatusVoidRequested
+	// or StatusVoided, we transition the existing order and reverse its stock.
+	if req.Order.Status == order.StatusVoidRequested || req.Order.Status == order.StatusVoided {
+		return i.processVoid(ctx, req, key, now)
 	}
 
 	// ── Step 2: re-price at the branch's own rate ─────────────────────────────
@@ -445,13 +443,6 @@ func (i *IngestOrder) Execute(ctx context.Context, req IngestRequest) (Result, e
 
 	// The stock deduction, and it happens HERE — after the order is durable and
 	// before anything tells the terminal the sale is settled.
-	//
-	// A failure is NOT swallowed and NOT converted into a warning. The order is
-	// already committed, so the honest response is to fail the submission: the
-	// terminal keeps its outbox row and retries, and the retry is a no-op for any
-	// deduction that already landed because a movement's id is its order line's id.
-	// Swallowing it would acknowledge a sale whose stock was never recorded, which
-	// is a shelf that silently drifts for as long as nobody notices.
 	warnings, err := i.deductStock(ctx, priced)
 	if err != nil {
 		return Result{}, err
@@ -635,6 +626,56 @@ func (i *IngestOrder) holdForConflict(
 		return Result{}, fmt.Errorf("order %s: saving the idempotency record for a held order: %w", priced.ID, err)
 	}
 	return result, nil
+}
+
+func (i *IngestOrder) processVoid(
+	ctx context.Context,
+	req IngestRequest,
+	key sync.IdempotencyKey,
+	now time.Time,
+) (Result, error) {
+	existing, err := i.orders.Get(ctx, req.Order.ID)
+	if err != nil {
+		return Result{}, fmt.Errorf("order %s: fetching for void: %w", req.Order.ID, err)
+	}
+
+	newStatus := req.Order.Status
+	if err := existing.Status.ValidateTransition(newStatus); err != nil {
+		return Result{}, &ValidationError{Reason: "invalid void transition: " + err.Error(), Err: err}
+	}
+
+	if err := i.orders.UpdateStatus(ctx, existing.ID, existing.Status, newStatus, now); err != nil {
+		return Result{}, fmt.Errorf("order %s: updating status to %s: %w", existing.ID, newStatus, err)
+	}
+
+	if newStatus == order.StatusVoided {
+		lines := make([]SaleStockLine, 0, len(existing.Lines))
+		for _, l := range existing.Lines {
+			lines = append(lines, SaleStockLine{
+				OrderLineID:      l.ID,
+				ProductVariantID: l.ProductVariantID,
+				Quantity:         l.Quantity,
+			})
+		}
+		if err := i.stock.ReverseForVoid(ctx, SaleStock{
+			BranchID: existing.BranchID,
+			OrderID:  existing.ID,
+			Lines:    lines,
+		}); err != nil {
+			return Result{}, fmt.Errorf("order %s: reversing stock: %w", existing.ID, err)
+		}
+	}
+
+	resp := fmt.Sprintf(`{"order_id":"%s","status":"%s"}`, existing.ID, newStatus)
+	rec, err := sync.NewIdempotencyRecord(key, existing.ID, sync.StateAcknowledged, resp, now)
+	if err != nil {
+		return Result{}, err
+	}
+	if err := i.idem.Save(ctx, rec); err != nil {
+		return Result{}, err
+	}
+
+	return Result{OrderID: existing.ID, State: sync.StateAcknowledged, Response: resp}, nil
 }
 
 // renderAcknowledged produces the stored response for an accepted order.

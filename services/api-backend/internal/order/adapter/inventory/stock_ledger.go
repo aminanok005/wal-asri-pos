@@ -105,3 +105,8 @@ func (l *StockLedger) DeductForSale(ctx context.Context, sale orderuc.SaleStock)
 	}
 	return out, nil
 }
+
+// ReverseForVoid credits stock back for an order being voided.
+func (l *StockLedger) ReverseForVoid(ctx context.Context, sale orderuc.SaleStock) error {
+	return l.deduct.ReverseForVoid(ctx, sale.BranchID, sale.OrderID)
+}

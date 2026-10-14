@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
@@ -84,24 +85,98 @@ type StockBalance struct {
 // "below zero" is not a phrase any of them should spell differently.
 func (b StockBalance) IsOversold() bool { return b.OnHand.IsNegative() }
 
-// Available is the quantity free to sell: on_hand minus reserved.
-//
-// The contract states it as "Available-to-sell is `on_hand - reserved`", so this
-// is that line and no more.
-//
-// It may be negative for the same reason OnHand may, and the subtraction is done
-// by the money kernel rather than by arithmetic on `.Milli()` here — `Quantity.Sub`
-// is range-checked, and a raw subtraction would bypass the `decimal(12,3)` bound
-// that the schema and the wire both enforce.
 func (b StockBalance) Available() (money.Quantity, error) {
 	available, err := b.OnHand.Sub(b.Reserved)
 	if err != nil {
 		return money.Quantity{}, fmt.Errorf(
-			"inventory: balance %s of article %s has an available-to-sell that leaves decimal(12,3): %w",
-			b.ID, b.InventoryItemID, err)
+			"inventory: balance %s of article %s has an available-to-sell that leaves decimal(12,3): %w", b.ID, b.InventoryItemID, err)
 	}
 	return available, nil
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Stock adjustment — the terminal claim and the server response
+// ─────────────────────────────────────────────────────────────────────────────
+
+// AdjustStockRequest is one terminal's claim about a stock article's quantity.
+//
+// The claim carries an `auditLogId` that becomes the movement's id, so the
+// adjustment is idempotent by audit id: a retry that arrives with an audit id
+// that already exists is a no-op. The terminal generates the audit id
+// alongside the claim, offline, so it survives a lost response.
+//
+// `resolvedQuantityMilli` is the quantity the terminal counted, in milli-units.
+// `oldQuantityMilli` is the balance the terminal believes the server holds.
+// The server computes the DELTA between the claim and the ledger's current
+// balance, and stores that delta as a movement — it does NOT write the claim
+// directly into the balance, because the ledger must remain self-checking.
+type AdjustStockRequest struct {
+	InventoryItemID    identity.UUIDv7
+	BranchID           identity.UUIDv7
+	ResolvedQuantityMilli int64
+	OldQuantityMilli   int64
+	Reason             string
+	ActorTerminalID    string
+	AuditLogID         identity.UUIDv7
+}
+
+// AdjustStockResult is the server's response to a stock adjustment claim.
+//
+// `applied` is false when the audit id was already present: the claim was
+// received but did not change the ledger. The terminal treats that as a
+// success and does not retry.
+//
+// `deltaMilli` is the signed difference the server applied, in milli-units.
+// `balanceAfterMilli` is the balance as it stands after the adjustment.
+type AdjustStockResult struct {
+	AuditLogID        identity.UUIDv7
+	Applied           bool
+	DeltaMilli        int64
+	BalanceAfterMilli int64
+}
+
+// ErrDuplicateAudit is returned when an adjustment's audit id already exists.
+//
+// It is a NAMED error so the interactor can distinguish "already applied" from
+// "the database is unavailable" by `errors.Is`, and the HTTP adapter maps it
+// to a 200 with `applied: false` rather than a 500.
+var ErrDuplicateAudit = errors.New("inventory: the audit id already exists; this adjustment was already applied")
+
+// ErrUntrackedItem is returned when a claim names an article that is not
+// stock-tracked.
+//
+// The adjustment is silently skipped rather than failing: an untracked article
+// has no balance to adjust, and inventing one would be a fiction.
+var ErrUntrackedItem = errors.New("inventory: the claimed article is not stock-tracked; nothing to adjust")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Reconcile result
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ReconcileItem is one article a reconcile realigned.
+//
+// `before` and `after` are the balance as it stood and as it was written, in
+// milli-units. They are raw int64 rather than `money.Quantity` because the
+// contract specifies integer milli-units on the wire for these fields.
+type ReconcileItem struct {
+	InventoryItemID identity.UUIDv7 `json:"inventoryItemId"`
+	BeforeMilli    int64            `json:"beforeQuantityMilli"`
+	AfterMilli     int64            `json:"afterQuantityMilli"`
+}
+
+// ReconcileResult is the server's response to a reconciliation request.
+//
+// `items` lists the articles that were corrected, with their before/after
+// quantities in milli-units.
+type ReconcileResult struct {
+	BranchID       identity.UUIDv7   `json:"branchId"`
+	CorrectedCount int               `json:"correctedCount"`
+	Items          []ReconcileItem   `json:"items"`
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Validate
+// ─────────────────────────────────────────────────────────────────────────────
 
 // Validate re-derives the invariants this balance must satisfy.
 //

@@ -169,6 +169,22 @@ func (r *OrderRepository) Append(ctx context.Context, o order.Order) error {
 	return nil
 }
 
+// UpdateStatus transitions an order's status, enforcing the ladder.
+func (r *OrderRepository) UpdateStatus(ctx context.Context, id identity.UUIDv7, from, to order.OrderStatus, at time.Time) error {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE orders
+		SET status = $1, status_at = $2, updated_at = $2
+		WHERE id = $3 AND status = $4`,
+		string(to), at, id, string(from))
+	if err != nil {
+		return fmt.Errorf("postgres: updating status of order %s: %w", id, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("postgres: no order %s found with status %s", id, from)
+	}
+	return nil
+}
+
 // Get returns one order with its lines.
 //
 // Read-only counterpart to Append, used by reconciliation and by the tests that need
