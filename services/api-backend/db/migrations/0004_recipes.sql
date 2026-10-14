@@ -23,7 +23,7 @@
 -- product has at most one active recipe; a recipe has multiple components.
 -- The product's `recipe_id` (catalog table) points at this table.
 --
--- ── WHY recipe_components.quantity_milli IS PER FINISHED UNIT ──────────────────
+-- ── WHY recipe_components.quantity_milli IS PER FINISHED UNIT ─────────────────
 --
 -- The deduction is: quantity_sold * component.quantity_milli.
 -- A coffee recipe uses 0.018 kg beans per shot. A customer buys 2 shots.
@@ -56,10 +56,12 @@ CREATE TABLE IF NOT EXISTS recipes (
   updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
 
   -- One active recipe per product per branch.
-  CONSTRAINT recipes_one_active_per_product
-    UNIQUE (branch_id, product_id)
-    WHERE is_active
 );
+
+-- Partial unique index: One active recipe per product per branch.
+CREATE UNIQUE INDEX IF NOT EXISTS recipes_one_active_per_product
+  ON recipes (branch_id, product_id)
+  WHERE is_active;
 
 COMMENT ON TABLE recipes IS
   'One recipe per product. The product.recipe_id (catalog) points here. '
@@ -109,22 +111,11 @@ COMMENT ON TABLE recipe_components IS
   'One ingredient per recipe. quantity_milli is per finished unit. '
   'When 2 units of the product are sold, the deduction is 2 * quantity_milli.';
 
-COMMENT ON COLUMN recipe_components.quantity_milli IS
-  'Amount of this ingredient consumed per ONE unit of the finished product, '
-  'in milli-units. 0.018 kg = 18. Bounded to decimal(12,3) to match the '
-  'contract Quantity pattern.';
-
-CREATE INDEX IF NOT EXISTS idx_recipe_components_recipe
-  ON recipe_components (recipe_id);
-
-CREATE INDEX IF NOT EXISTS idx_recipe_components_item
-  ON recipe_components (inventory_item_id);
-
 -- ===========================================================================
--- Trigger: recipe_components must reference a raw ingredient
+-- Triggers
 -- ===========================================================================
--- The contract says an ingredient consumed through a recipe has is_raw = true.
--- Enforce it at the database level so a bad write fails loud.
+
+-- Ensure that all raw ingredients used in recipe_components have is_raw = true.
 CREATE OR REPLACE FUNCTION recipe_components_must_be_raw() RETURNS TRIGGER AS $$
 BEGIN
   IF NOT EXISTS (
