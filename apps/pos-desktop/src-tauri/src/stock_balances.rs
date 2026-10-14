@@ -469,6 +469,18 @@ pub fn apply_stock_balances(
   Ok(StockBalanceWriteResult { inserted, updated })
 }
 
+/// Stock conflict item for listing conflicts.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StockConflictItem {
+    pub inventory_item_id: String,
+    pub branch_id: String,
+    pub local_quantity_milli: i64,
+    pub cloud_quantity_milli: Option<i64>,
+    pub requires_reconcile: bool,
+    pub updated_at: String,
+}
+
 /// One balance as the UI reads it back. Quantities are **strings**, both
 /// directions, for the reason at the module header.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -624,6 +636,46 @@ pub fn last_cloud_updated_at(conn: &Connection) -> Result<Option<String>, Comman
         Ok(v) => Ok(v),
         Err(e) => Err(CommandError::storage("read last cloud updated at", e)),
     }
+}
+
+/// List all stock balances that have `requires_reconcile = 1`.
+/// If `branch_id` is empty, return conflicts from all branches.
+pub fn list_stock_conflicts(
+    conn: &Connection,
+    branch_id: &str,
+) -> Result<Vec<StockConflictItem>, CommandError> {
+    let mut query = String::from(
+        "SELECT inventory_item_id, branch_id, on_hand_milli, conflict_cloud_quantity_milli, requires_reconcile, updated_at
+         FROM stock_balances
+        WHERE requires_reconcile = 1",
+    );
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    if !branch_id.is_empty() {
+        query.push_str(" AND branch_id = ?");
+        params.push(Box::new(branch_id.to_string()));
+    }
+    query.push_str(" ORDER BY updated_at DESC");
+
+    let mut stmt = conn.prepare(&query).map_err(|e| CommandError::storage("prepare list stock conflicts", e))?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(params.iter().map(|p| p.as_ref())), |row| {
+            let requires_reconcile: i32 = row.get(4)?;
+            Ok(StockConflictItem {
+                inventory_item_id: row.get(0)?,
+                branch_id: row.get(1)?,
+                local_quantity_milli: row.get(2)?,
+                cloud_quantity_milli: row.get(3)?,
+                requires_reconcile: requires_reconcile == 1,
+                updated_at: row.get(5)?,
+            })
+        })
+        .map_err(|e| CommandError::storage("query stock conflicts", e))?;
+
+    let mut conflicts = Vec::new();
+    for row in rows {
+        conflicts.push(row.map_err(|e| CommandError::storage("read stock conflict row", e))?);
+    }
+    Ok(conflicts)
 }
 
 #[cfg(test)]

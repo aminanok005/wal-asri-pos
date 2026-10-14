@@ -1052,14 +1052,10 @@ pub async fn sync_stock_balances(
 
 #[tauri::command]
 pub async fn list_stock_conflicts(
-    _app: AppHandle,
-    _branch_id: String,
-) -> Result<Vec<crate::stock_balances::StockBalanceRecord>, CommandError> {
-    // To be implemented in Phase 1.2
-    Err(CommandError::invalid(
-        "list_stock_conflicts",
-        "command not yet implemented",
-    ))
+    app: AppHandle,
+    branch_id: String,
+) -> Result<Vec<crate::stock_balances::StockConflictItem>, CommandError> {
+    blocking(app, move |conn| crate::stock_balances::list_stock_conflicts(conn, &branch_id)).await
 }
 
 #[tauri::command]

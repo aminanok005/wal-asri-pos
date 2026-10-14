@@ -190,6 +190,7 @@ pub fn run() {
             commands::apply_recipes,
             commands::request_order_void,
             commands::get_terminal_identity,
+            commands::list_stock_conflicts,
             printer_commands::print_receipt,
         ])
         .run(tauri::generate_context!())
